@@ -208,6 +208,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "wsldrive: --wsl-root is required with --distro\n");
         return 2;
       }
+      // At logon after a reboot the distro may not be up yet (WSL2 starts
+      // lazily). Wait for it before launching the agent so the auto-start mount
+      // does not lose a cold-boot race; a hard failure returns non-zero so the
+      // scheduled task's retry can take over.
+      std::printf("waiting for WSL (%s) to be ready...\n", distro.empty() ? "default distro" : distro.c_str());
+      std::fflush(stdout);
+      if (!wsld::platform::wait_wsl_ready(distro, std::chrono::seconds(90))) {
+        std::fprintf(stderr, "wsldrive: WSL did not become ready within 90s\n");
+        return 1;
+      }
       // WSL2 routes hvsocket host->guest: the agent listens on vsock and this
       // client connects to the guest VM over AF_HYPERV. Needs a registered vsock
       // port (scripts/register-hvsocket.ps1) and the VM's GUID.
@@ -333,7 +343,8 @@ int main(int argc, char** argv) {
       }
       source = ep->to_string();
       // Poll for the agent to accept (auto-launch needs a moment; --connect is instant).
-      const int attempts = have_distro ? 100 : 1;
+      // Generous window for a cold-boot distro that is still finishing startup.
+      const int attempts = have_distro ? 300 : 1;
       for (int i = 0; i < attempts; ++i) {
         sock = wsld::net::connect(*ep);
         if (sock) break;

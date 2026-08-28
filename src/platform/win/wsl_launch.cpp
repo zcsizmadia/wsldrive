@@ -4,9 +4,11 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace wsld::platform {
 
@@ -85,6 +87,30 @@ std::string build_wsl_command(const WslAgentSpec& spec) {
   cmd += " --listen " + listen;
   cmd += " --exit-when-idle";  // agent terminates when this client's socket closes
   return cmd;
+}
+
+bool wait_wsl_ready(const std::string& distro, std::chrono::milliseconds timeout) {
+  std::string cmd = "wsl.exe";
+  if (!distro.empty()) cmd += " -d " + distro;
+  cmd += " -e true";  // succeeds (exit 0) only once the distro is actually up
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    std::wstring wcmd = win::to_wide(cmd);
+    wcmd.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    DWORD code = 1;
+    if (::CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+      ::WaitForSingleObject(pi.hProcess, 20000);
+      ::GetExitCodeProcess(pi.hProcess, &code);
+      ::CloseHandle(pi.hProcess);
+      ::CloseHandle(pi.hThread);
+    }
+    if (code == 0) return true;
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
 }
 
 WslAgent::~WslAgent() { stop(); }
