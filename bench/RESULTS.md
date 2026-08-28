@@ -27,7 +27,13 @@ in-RAM cache.
 | native (on Windows, ref)     |          10 ms   |         118 ms   |
 | `/mnt/c` (9P)                |         119 ms   |        5853 ms   |
 | `/mnt/c` (**virtiofs=true**) |         406 ms   |        7686 ms   |
-| **wsldrive FUSE mount**      | metadata from RAM (see below) | cold: latency-bound; warm: from cache |
+| wsldrive over TCP relay      |          12 ms   |  minutes (transport-bound) |
+| **wsldrive over hvsocket**   |       **12 ms**  |  **cold 621 / warm 383 ms** |
+
+With the **Hyper-V socket transport** (ping **0.114 ms**, vs seconds/round-trip
+over the localhost relay), read-ahead and the cache make wsldrive **~10× faster
+than both 9P and virtiofs** on reads and near-native on metadata — well past the
+2× gate. This is the configuration to use for Direction B.
 
 `/mnt/c` reads are ~50-65× slower than native — the well-known WSL pain.
 Notably, on this machine **`virtiofs=true` did not beat 9P** for these
@@ -39,20 +45,29 @@ wsldrive FUSE mount is functional (mounts, reads, writes; verified end-to-end)
 and serves **all metadata from the client's in-RAM mirror**, so `walk`/`stat`
 workloads avoid the per-op boundary cost the same way Direction A does.
 
-**Transport is the Direction B bottleneck.** Reads now use directory read-ahead
-(one bulk `ReadMany` request per directory instead of one per file) — verified
-to work on Direction A, where the same code path reads 3000 files cold in
-574 ms. But over the **WSL→Windows** path, each request/response round-trip
-costs on the order of *seconds* through the WSL2 localhost-forwarding relay
-(this machine runs `networkingMode=mirrored`), so even a handful of bulk
-round-trips is slow. Read-ahead cuts the round-trip *count*; it cannot fix a
-multi-second-per-trip transport.
+**The Direction B bottleneck was the transport, and Hyper-V sockets fix it.**
+Reads use directory read-ahead (one bulk `ReadMany` request per directory), but
+over the localhost-forwarding relay each guest→host round-trip cost seconds
+(this machine runs `networkingMode=mirrored`), so bulk reads were still slow.
+Switching the transport to `AF_VSOCK`/`AF_HYPERV` drops the round-trip to
+~0.1 ms and makes Direction B fast (table above).
 
-The fix is the **Hyper-V socket transport** (`AF_VSOCK`/`AF_HYPERV`, already
-scaffolded in `net/socket`), which bypasses the TCP/relay path and talks
-guest↔host directly. That is the next work for Direction B; until it lands, use
-`virtiofs=true` for `/mnt/c`. Direction A is unaffected — its transport
-(Windows→WSL loopback) is already sub-millisecond, which is why it is fast today.
+### Enabling the Hyper-V socket transport
+
+WSL2 routes hvsocket **host→guest**, so wsldrive uses: the **WSL side listens**
+on `vsock://any:<port>` and the **Windows side connects** to
+`hv://{<wsl-vm-guid>}:<port>` — for both directions (in Direction B the Windows
+agent dials the WSL client; in Direction A the Windows client dials the WSL
+agent). Setup:
+
+1. Register the vsock service GUIDs once, elevated (see
+   `scripts/register-hvsocket.ps1`) — WSL2 only routes registered services.
+2. Restart WSL (`wsl --shutdown`) so the VM picks up the registered services.
+3. Find the WSL VM GUID (elevated / Hyper-V admin): `hcsdiag list`.
+
+Auto-discovering the VM GUID and a one-flag `--hvsocket` UX (so the manual GUID
+and port aren't needed) is the remaining productionization step. Direction A is
+already fast over plain loopback TCP and does not require this.
 
 ## Performance work landed
 
