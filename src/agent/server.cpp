@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <system_error>
 
 namespace wsld::agent {
 
@@ -138,7 +139,143 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch) {
     case proto::MsgType::Ping: return ch.send(proto::MsgType::Pong, f.header.request_id, {});
     case proto::MsgType::SnapshotRequest: return send_snapshot(f.header.request_id, ch);
     case proto::MsgType::ReadRequest: return send_read(f, ch);
+    case proto::MsgType::WriteRequest:
+    case proto::MsgType::CreateRequest:
+    case proto::MsgType::MkdirRequest:
+    case proto::MsgType::UnlinkRequest:
+    case proto::MsgType::RmdirRequest:
+    case proto::MsgType::RenameRequest:
+    case proto::MsgType::TruncateRequest:
+      return handle_mutation(f, ch);
     default: return send_error(f.header.request_id, Errc::ProtocolError, "unexpected message type", ch);
+  }
+}
+
+Result<std::filesystem::path> RootServer::resolve(std::string_view rel) const {
+  const std::string norm = normalize_path(rel);
+  if (norm.find("..") != std::string::npos) return fail(Errc::InvalidPath);
+  return join_relative(opts_.root, norm);
+}
+
+namespace {
+Errc map_fs_error(const std::error_code& ec) {
+  // Compare against std::errc conditions (not error_codes): this uses the
+  // category's equivalence, so it works whether ec is generic (POSIX) or
+  // system_category (Win32) as std::filesystem produces on Windows.
+  if (ec == std::errc::no_such_file_or_directory) return Errc::NotFound;
+  if (ec == std::errc::file_exists) return Errc::AlreadyExists;
+  if (ec == std::errc::not_a_directory) return Errc::NotADirectory;
+  if (ec == std::errc::is_a_directory) return Errc::IsADirectory;
+  if (ec == std::errc::directory_not_empty) return Errc::AlreadyExists;
+  if (ec == std::errc::invalid_argument) return Errc::InvalidArgument;
+  return Errc::IoError;
+}
+}  // namespace
+
+Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel& ch) {
+  namespace fs = std::filesystem;
+  const std::uint64_t id = f.header.request_id;
+  proto::Reader r(f.payload);
+  auto reject = [&](Errc e, std::string_view d) { return send_error(id, e, d, ch); };
+
+  switch (f.header.type) {
+    case proto::MsgType::CreateRequest: {
+      auto q = proto::read_create_request(r);
+      if (!q) return fail(q.error());
+      auto full = resolve(q->path);
+      if (!full) return reject(full.error(), q->path);
+      {
+        std::FILE* fp =
+#ifdef _WIN32
+            _wfopen(full->c_str(), L"wb");
+#else
+            std::fopen(full->c_str(), "wb");
+#endif
+        if (fp == nullptr) return reject(Errc::IoError, q->path);
+        std::fclose(fp);
+      }
+      auto attr = read_attributes(*full);
+      if (!attr) return reject(attr.error(), q->path);
+      return ch.send_with(proto::MsgType::CreateResponse, id, [&](proto::Writer& w) { proto::write_attributes(w, *attr); });
+    }
+    case proto::MsgType::WriteRequest: {
+      auto q = proto::read_write_request(r);
+      if (!q) return fail(q.error());
+      auto full = resolve(q->path);
+      if (!full) return reject(full.error(), q->path);
+      std::FILE* fp =
+#ifdef _WIN32
+          _wfopen(full->c_str(), L"r+b");
+      if (fp == nullptr) fp = _wfopen(full->c_str(), L"w+b");
+#else
+          std::fopen(full->c_str(), "r+b");
+      if (fp == nullptr) fp = std::fopen(full->c_str(), "w+b");
+#endif
+      if (fp == nullptr) return reject(Errc::IoError, q->path);
+#ifdef _WIN32
+      _fseeki64(fp, static_cast<long long>(q->offset), SEEK_SET);
+#else
+      fseeko(fp, static_cast<off_t>(q->offset), SEEK_SET);
+#endif
+      const std::size_t n = q->data.empty() ? 0 : std::fwrite(q->data.data(), 1, q->data.size(), fp);
+      std::fclose(fp);
+      if (n != q->data.size()) return reject(Errc::IoError, q->path);
+      return ch.send_with(proto::MsgType::WriteResponse, id,
+                          [&](proto::Writer& w) { proto::write_write_response(w, proto::WriteResponse{n}); });
+    }
+    case proto::MsgType::TruncateRequest: {
+      auto q = proto::read_truncate_request(r);
+      if (!q) return fail(q.error());
+      auto full = resolve(q->path);
+      if (!full) return reject(full.error(), q->path);
+      std::error_code ec;
+      fs::resize_file(*full, q->size, ec);
+      if (ec) return reject(map_fs_error(ec), q->path);
+      return ch.send(proto::MsgType::Ok, id, {});
+    }
+    case proto::MsgType::MkdirRequest: {
+      auto q = proto::read_mkdir_request(r);
+      if (!q) return fail(q.error());
+      auto full = resolve(q->path);
+      if (!full) return reject(full.error(), q->path);
+      std::error_code ec;
+      if (!fs::create_directory(*full, ec) || ec) return reject(ec ? map_fs_error(ec) : Errc::AlreadyExists, q->path);
+      return ch.send(proto::MsgType::Ok, id, {});
+    }
+    case proto::MsgType::UnlinkRequest: {
+      auto q = proto::read_path_request(r);
+      if (!q) return fail(q.error());
+      auto full = resolve(q->path);
+      if (!full) return reject(full.error(), q->path);
+      std::error_code ec;
+      if (fs::is_directory(*full, ec)) return reject(Errc::IsADirectory, q->path);
+      if (!fs::remove(*full, ec) || ec) return reject(ec ? map_fs_error(ec) : Errc::NotFound, q->path);
+      return ch.send(proto::MsgType::Ok, id, {});
+    }
+    case proto::MsgType::RmdirRequest: {
+      auto q = proto::read_path_request(r);
+      if (!q) return fail(q.error());
+      auto full = resolve(q->path);
+      if (!full) return reject(full.error(), q->path);
+      std::error_code ec;
+      if (!fs::is_directory(*full, ec)) return reject(Errc::NotADirectory, q->path);
+      if (!fs::remove(*full, ec) || ec) return reject(ec ? map_fs_error(ec) : Errc::NotFound, q->path);
+      return ch.send(proto::MsgType::Ok, id, {});
+    }
+    case proto::MsgType::RenameRequest: {
+      auto q = proto::read_rename_request(r);
+      if (!q) return fail(q.error());
+      auto from = resolve(q->from);
+      auto to = resolve(q->to);
+      if (!from) return reject(from.error(), q->from);
+      if (!to) return reject(to.error(), q->to);
+      std::error_code ec;
+      fs::rename(*from, *to, ec);
+      if (ec) return reject(map_fs_error(ec), q->to);
+      return ch.send(proto::MsgType::Ok, id, {});
+    }
+    default:
+      return reject(Errc::ProtocolError, "not a mutation");
   }
 }
 

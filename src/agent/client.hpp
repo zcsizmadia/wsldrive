@@ -53,6 +53,26 @@ class RemoteRoot {
 
   [[nodiscard]] Result<std::chrono::nanoseconds> ping(std::chrono::milliseconds timeout = std::chrono::seconds(5));
 
+  // --- write-through mutations (Phase 3) -------------------------------------
+  // Each performs the operation on the far side, then optimistically updates the
+  // local mirror so an immediate stat/read is consistent; the server's watcher
+  // also pushes an invalidation that reconciles any drift.
+  [[nodiscard]] Result<void> create_file(std::string_view path, std::uint32_t mode = 0644,
+                                         std::chrono::milliseconds timeout = std::chrono::seconds(30));
+  [[nodiscard]] Result<std::uint64_t> write(std::string_view path, std::uint64_t offset,
+                                            std::span<const std::byte> data,
+                                            std::chrono::milliseconds timeout = std::chrono::seconds(30));
+  [[nodiscard]] Result<void> truncate(std::string_view path, std::uint64_t size,
+                                      std::chrono::milliseconds timeout = std::chrono::seconds(30));
+  [[nodiscard]] Result<void> mkdir(std::string_view path, std::uint32_t mode = 0755,
+                                   std::chrono::milliseconds timeout = std::chrono::seconds(30));
+  [[nodiscard]] Result<void> unlink(std::string_view path,
+                                    std::chrono::milliseconds timeout = std::chrono::seconds(30));
+  [[nodiscard]] Result<void> rmdir(std::string_view path,
+                                   std::chrono::milliseconds timeout = std::chrono::seconds(30));
+  [[nodiscard]] Result<void> rename(std::string_view from, std::string_view to,
+                                    std::chrono::milliseconds timeout = std::chrono::seconds(30));
+
   /// Read access to the mirrored tree. Hold the lock only briefly.
   template <class F>
   auto with_tree(F&& f) const -> decltype(f(std::declval<const MetadataTree&>())) {

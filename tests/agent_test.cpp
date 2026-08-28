@@ -9,7 +9,9 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -169,6 +171,82 @@ TEST_F(AgentTest, EndToEndSnapshotAndRead) {
   client->close();
   EXPECT_FALSE(client->connected());
   EXPECT_EQ(client->ping().error(), Errc::ConnectionClosed);
+}
+
+std::string read_disk(const fs::path& p) {
+  std::ifstream in(p, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+std::span<const std::byte> as_bytes(std::string_view s) { return std::as_bytes(std::span{s.data(), s.size()}); }
+
+TEST_F(AgentTest, WriteThroughMutations) {
+  LoopbackServer srv(root_, /*watch=*/false);  // isolate the optimistic-update path
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  auto size_in_tree = [&](std::string_view path) -> std::int64_t {
+    return c->with_tree([&](const MetadataTree& t) -> std::int64_t {
+      const auto id = t.lookup(path, LookupMode::Exact);
+      return id ? static_cast<std::int64_t>(t.node(*id).attr.size) : -1;
+    });
+  };
+
+  // create + write + read back, verifying disk, mirror, and the read path.
+  ASSERT_TRUE(c->create_file("top.txt").has_value());
+  EXPECT_TRUE(fs::exists(root_ / "top.txt"));
+  auto wrote = c->write("top.txt", 0, as_bytes("hello world"));
+  ASSERT_TRUE(wrote.has_value());
+  EXPECT_EQ(*wrote, 11u);
+  EXPECT_EQ(read_disk(root_ / "top.txt"), "hello world");
+  EXPECT_EQ(size_in_tree("top.txt"), 11);
+  auto back = c->read("top.txt", 0, 100);
+  ASSERT_TRUE(back.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(back->data()), back->size()), "hello world");
+
+  // write at an offset extends the file.
+  ASSERT_TRUE(c->write("top.txt", 11, as_bytes("!!!")).has_value());
+  EXPECT_EQ(read_disk(root_ / "top.txt"), "hello world!!!");
+  EXPECT_EQ(size_in_tree("top.txt"), 14);
+
+  // truncate.
+  ASSERT_TRUE(c->truncate("top.txt", 5).has_value());
+  EXPECT_EQ(read_disk(root_ / "top.txt"), "hello");
+  EXPECT_EQ(size_in_tree("top.txt"), 5);
+
+  // mkdir + nested create/write.
+  ASSERT_TRUE(c->mkdir("sub2").has_value());
+  EXPECT_TRUE(fs::is_directory(root_ / "sub2"));
+  ASSERT_TRUE(c->create_file("sub2/x.txt").has_value());
+  ASSERT_TRUE(c->write("sub2/x.txt", 0, as_bytes("data")).has_value());
+  EXPECT_EQ(read_disk(root_ / "sub2" / "x.txt"), "data");
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) { return t.lookup("sub2/x.txt").has_value(); }));
+
+  // rename.
+  ASSERT_TRUE(c->rename("top.txt", "top2.txt").has_value());
+  EXPECT_FALSE(fs::exists(root_ / "top.txt"));
+  EXPECT_EQ(read_disk(root_ / "top2.txt"), "hello");
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) {
+    return !t.lookup("top.txt").has_value() && t.lookup("top2.txt").has_value();
+  }));
+
+  // unlink + rmdir (rmdir refuses non-empty).
+  EXPECT_EQ(c->rmdir("sub2").error(), Errc::AlreadyExists);  // directory_not_empty
+  ASSERT_TRUE(c->unlink("sub2/x.txt").has_value());
+  ASSERT_TRUE(c->rmdir("sub2").has_value());
+  EXPECT_FALSE(fs::exists(root_ / "sub2"));
+  ASSERT_TRUE(c->unlink("top2.txt").has_value());
+  EXPECT_FALSE(fs::exists(root_ / "top2.txt"));
+
+  // error cases.
+  EXPECT_EQ(c->unlink("nope.txt").error(), Errc::NotFound);
+  EXPECT_EQ(c->rmdir("README.md").error(), Errc::NotADirectory);
+  EXPECT_EQ(c->unlink("src").error(), Errc::IsADirectory);
+  EXPECT_EQ(c->rename("nope.txt", "whatever.txt").error(), Errc::NotFound);
+  EXPECT_EQ(c->create_file("../escape.txt").error(), Errc::InvalidPath);
+  EXPECT_EQ(c->write("../escape.txt", 0, as_bytes("x")).error(), Errc::InvalidPath);
 }
 
 TEST_F(AgentTest, ServerDisconnectFailsPendingRequests) {

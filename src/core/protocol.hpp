@@ -37,6 +37,17 @@ enum class MsgType : std::uint16_t {
   Error = 8,
   Ping = 9,
   Pong = 10,
+  // Write-through mutations (Phase 3).
+  WriteRequest = 11,
+  WriteResponse = 12,
+  CreateRequest = 13,   // create/replace an empty file
+  CreateResponse = 14,  // carries the new file's attributes
+  MkdirRequest = 15,
+  UnlinkRequest = 16,
+  RmdirRequest = 17,
+  RenameRequest = 18,
+  TruncateRequest = 19,
+  Ok = 20,  // generic success for mutations with no payload
 };
 
 struct FrameHeader {
@@ -134,6 +145,34 @@ struct ErrorMessage {
   std::string_view detail;
 };
 
+struct WriteRequest {
+  std::string_view path;
+  std::uint64_t offset = 0;
+  std::span<const std::byte> data;
+};
+struct WriteResponse {
+  std::uint64_t written = 0;
+};
+struct CreateRequest {
+  std::string_view path;
+  std::uint32_t mode = 0644;
+};
+struct MkdirRequest {
+  std::string_view path;
+  std::uint32_t mode = 0755;
+};
+struct PathRequest {  // UnlinkRequest / RmdirRequest
+  std::string_view path;
+};
+struct TruncateRequest {
+  std::string_view path;
+  std::uint64_t size = 0;
+};
+struct RenameRequest {
+  std::string_view from;
+  std::string_view to;
+};
+
 void write_attributes(Writer& w, const Attributes& a);
 [[nodiscard]] Result<Attributes> read_attributes(Reader& r) noexcept;
 
@@ -176,6 +215,26 @@ void write_read_response(Writer& w, const ReadResponse& p);
 
 void write_error(Writer& w, const ErrorMessage& e);
 [[nodiscard]] Result<ErrorMessage> read_error(Reader& r) noexcept;
+
+void write_write_request(Writer& w, const WriteRequest& q);
+[[nodiscard]] Result<WriteRequest> read_write_request(Reader& r) noexcept;
+void write_write_response(Writer& w, const WriteResponse& p);
+[[nodiscard]] Result<WriteResponse> read_write_response(Reader& r) noexcept;
+
+void write_create_request(Writer& w, const CreateRequest& q);
+[[nodiscard]] Result<CreateRequest> read_create_request(Reader& r) noexcept;
+
+void write_mkdir_request(Writer& w, const MkdirRequest& q);
+[[nodiscard]] Result<MkdirRequest> read_mkdir_request(Reader& r) noexcept;
+
+void write_path_request(Writer& w, const PathRequest& q);
+[[nodiscard]] Result<PathRequest> read_path_request(Reader& r) noexcept;
+
+void write_truncate_request(Writer& w, const TruncateRequest& q);
+[[nodiscard]] Result<TruncateRequest> read_truncate_request(Reader& r) noexcept;
+
+void write_rename_request(Writer& w, const RenameRequest& q);
+[[nodiscard]] Result<RenameRequest> read_rename_request(Reader& r) noexcept;
 
 /// Reserves a frame header at the end of `buf`, lets `body(Writer&)` append the
 /// payload, then fills in the header with the actual payload length.

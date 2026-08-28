@@ -8,6 +8,8 @@
 #include <windows.h>
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -111,17 +113,65 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, fuse_off_t, 
   });
 }
 
-int op_open(const char* path, struct fuse_file_info* fi) {
+int op_open(const char* path, struct fuse_file_info*) {
   const std::string rel = to_rel(path);
-  const int rc = ctx()->root->with_tree([&](const MetadataTree& t) -> int {
+  return ctx()->root->with_tree([&](const MetadataTree& t) -> int {
     const auto id = t.lookup(rel, LookupMode::CaseInsensitive);
     if (!id) return -ENOENT;
     if (t.node(*id).is_dir()) return -EISDIR;
     return 0;
   });
-  if (rc != 0) return rc;
-  if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EROFS;  // Phase 1 is read-only
-  return 0;
+}
+
+int err_to_errno(Errc e) {
+  switch (e) {
+    case Errc::NotFound: return -ENOENT;
+    case Errc::AlreadyExists: return -EEXIST;
+    case Errc::NotADirectory: return -ENOTDIR;
+    case Errc::IsADirectory: return -EISDIR;
+    case Errc::InvalidPath:
+    case Errc::InvalidArgument: return -EINVAL;
+    case Errc::Timeout: return -ETIMEDOUT;
+    case Errc::ConnectionClosed: return -EIO;
+    default: return -EIO;
+  }
+}
+
+int op_create(const char* path, fuse_mode_t mode, struct fuse_file_info*) {
+  auto r = ctx()->root->create_file(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
+  return r ? 0 : err_to_errno(r.error());
+}
+
+int op_write(const char* path, const char* buf, size_t size, fuse_off_t offset, struct fuse_file_info*) {
+  auto r = ctx()->root->write(to_rel(path), static_cast<std::uint64_t>(offset),
+                              std::as_bytes(std::span<const char>(buf, size)));
+  if (!r) return err_to_errno(r.error());
+  return static_cast<int>(*r);
+}
+
+int op_truncate(const char* path, fuse_off_t size, struct fuse_file_info*) {
+  auto r = ctx()->root->truncate(to_rel(path), static_cast<std::uint64_t>(size));
+  return r ? 0 : err_to_errno(r.error());
+}
+
+int op_mkdir(const char* path, fuse_mode_t mode) {
+  auto r = ctx()->root->mkdir(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
+  return r ? 0 : err_to_errno(r.error());
+}
+
+int op_unlink(const char* path) {
+  auto r = ctx()->root->unlink(to_rel(path));
+  return r ? 0 : err_to_errno(r.error());
+}
+
+int op_rmdir(const char* path) {
+  auto r = ctx()->root->rmdir(to_rel(path));
+  return r ? 0 : err_to_errno(r.error());
+}
+
+int op_rename(const char* from, const char* to, unsigned int) {
+  auto r = ctx()->root->rename(to_rel(from), to_rel(to));
+  return r ? 0 : err_to_errno(r.error());
 }
 
 int op_read(const char* path, char* buf, size_t size, fuse_off_t offset, struct fuse_file_info*) {
@@ -140,6 +190,23 @@ int op_read(const char* path, char* buf, size_t size, fuse_off_t offset, struct 
   return static_cast<int>(data->size());
 }
 
+int op_statfs(const char*, struct fuse_statvfs* st) {
+  // WinFsp refuses writes ("device error") if the volume reports no free space,
+  // so advertise a large backing store. The real limit is the WSL ext4 volume.
+  std::memset(st, 0, sizeof(*st));
+  st->f_bsize = 4096;
+  st->f_frsize = 4096;
+  st->f_blocks = std::uint64_t{1} << 32;  // ~16 TiB
+  st->f_bfree = std::uint64_t{1} << 31;
+  st->f_bavail = std::uint64_t{1} << 31;
+  st->f_files = std::uint64_t{1} << 20;
+  st->f_ffree = std::uint64_t{1} << 19;
+  st->f_namemax = 255;
+  return 0;
+}
+
+int op_fsync(const char*, int, struct fuse_file_info*) { return 0; }
+
 void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
   // Serve metadata from our mirror; short kernel caches keep it snappy while
   // still reflecting pushed invalidations within the timeout.
@@ -157,6 +224,15 @@ fuse_operations make_ops() {
   ops.readdir = op_readdir;
   ops.open = op_open;
   ops.read = op_read;
+  ops.create = op_create;
+  ops.write = op_write;
+  ops.truncate = op_truncate;
+  ops.mkdir = op_mkdir;
+  ops.unlink = op_unlink;
+  ops.rmdir = op_rmdir;
+  ops.rename = op_rename;
+  ops.statfs = op_statfs;
+  ops.fsync = op_fsync;
   return ops;
 }
 
@@ -175,6 +251,7 @@ Result<void> FuseMount::mount(const std::string& mountpoint) {
   fuse_opt_add_arg(&args, "wsldrive");
   // uid/gid = -1 maps ownership to the caller; rellinks keeps symlinks relative.
   fuse_opt_add_arg(&args, "-ouid=-1,gid=-1,rellinks,FileSystemName=wsldrive,volname=wsldrive");
+  if (std::getenv("WSLDRIVE_FUSE_DEBUG") != nullptr) fuse_opt_add_arg(&args, "-d");
 
   struct fuse* f = fuse_new(&args, &ops, sizeof(ops), &context);
   fuse_opt_free_args(&args);
