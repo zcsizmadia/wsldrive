@@ -30,12 +30,20 @@ With [WinFsp](https://winfsp.dev) installed (runtime **and** the Developer/SDK f
 ext4 tree can be mounted as a Windows drive letter:
 
 ```powershell
-# in WSL: serve a tree
-wsldrived --root ~/project --listen tcp://0.0.0.0:7788
+# One command: wsldrive launches the agent inside the distro and mounts it.
+wsldrive mount W: --distro Ubuntu --wsl-root ~/project
 
-# on Windows: mount it
-wsldrive mount W: --connect tcp://127.0.0.1:7788
+# Check the environment first (WinFsp + WSL):
+wsldrive doctor
+
+# Or attach to an already-running agent:
+#   in WSL:      wsldrived --root ~/project --listen tcp://0.0.0.0:7788
+#   on Windows:  wsldrive mount W: --connect tcp://127.0.0.1:7788
 ```
+
+With `--distro`, `wsldrive` starts `wsldrived` in the distro over `wsl.exe`, waits for it to
+listen, mounts, and tears the agent down on exit (the agent also self-terminates if the Windows
+side goes away). Ctrl+C unmounts cleanly.
 
 Metadata (`dir`, `stat`, directory listing) is served from the client's in-RAM mirror with no
 round-trips; file contents are fetched over the socket on demand; live edits in WSL propagate via

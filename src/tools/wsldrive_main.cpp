@@ -7,8 +7,13 @@
 #include "net/frame_channel.hpp"
 #include "net/socket.hpp"
 
+#ifdef _WIN32
+#include <atomic>
+#include <windows.h>
+#endif
 #ifdef WSLDRIVE_HAVE_WINFSP
 #include "mount/fuse_mount.hpp"
+#include "platform/win/wsl_launch.hpp"
 #endif
 
 #include <chrono>
@@ -25,8 +30,13 @@ void usage() {
   std::fputs(
       "usage:\n"
       "  wsldrive fetch (--connect <endpoint> | --listen <endpoint>) [--watch] [--read <path>] [--lookups N]\n"
+#ifdef _WIN32
+      "  wsldrive doctor                                      (check WinFsp + WSL environment)\n"
+#endif
 #ifdef WSLDRIVE_HAVE_WINFSP
-      "  wsldrive mount <mountpoint> --connect <endpoint>      (e.g. mountpoint = Z:)\n"
+      "  wsldrive mount <mountpoint> --connect <endpoint>      (attach to a running agent)\n"
+      "  wsldrive mount <mountpoint> --distro <name> --wsl-root <path> [--agent <path>] [--port N]\n"
+      "                                                       (auto-launch the agent in the distro)\n"
 #endif
       ,
       stderr);
@@ -34,10 +44,87 @@ void usage() {
 
 double ms(std::chrono::nanoseconds d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
+#ifdef WSLDRIVE_HAVE_WINFSP
+std::atomic<bool> g_mount_stop{false};
+BOOL WINAPI mount_ctrl_handler(DWORD type) {
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+    g_mount_stop.store(true);
+    return TRUE;  // handled: don't let the default handler kill us before cleanup
+  }
+  return FALSE;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::string_view command = argc >= 2 ? std::string_view(argv[1]) : std::string_view{};
+
+#ifdef _WIN32
+  if (command == "doctor") {
+    int problems = 0;
+    // WinFsp: present at build time?
+#ifdef WSLDRIVE_HAVE_WINFSP
+    std::printf("[ok]   wsldrive was built with WinFsp support (mount available)\n");
+#else
+    std::printf("[warn] wsldrive was built without WinFsp; the mount command is unavailable\n");
+    ++problems;
+#endif
+    // WinFsp runtime: registry InstallDir.
+    {
+      HKEY key{};
+      wchar_t dir[MAX_PATH]{};
+      DWORD size = sizeof(dir);
+      bool found = false;
+      if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\WinFsp", 0, KEY_READ | KEY_WOW64_32KEY, &key) ==
+          ERROR_SUCCESS) {
+        found = ::RegQueryValueExW(key, L"InstallDir", nullptr, nullptr, reinterpret_cast<LPBYTE>(dir), &size) ==
+                ERROR_SUCCESS;
+        ::RegCloseKey(key);
+      }
+      if (found)
+        std::printf("[ok]   WinFsp runtime installed\n");
+      else {
+        std::printf("[fail] WinFsp runtime not found (install from https://winfsp.dev)\n");
+        ++problems;
+      }
+    }
+    // wsl.exe on PATH.
+    {
+      wchar_t path[MAX_PATH]{};
+      if (::SearchPathW(nullptr, L"wsl.exe", nullptr, MAX_PATH, path, nullptr) > 0)
+        std::printf("[ok]   wsl.exe found on PATH\n");
+      else {
+        std::printf("[fail] wsl.exe not found on PATH\n");
+        ++problems;
+      }
+    }
+    // WSL actually runs: `wsl.exe -e true`.
+    {
+      std::wstring cmd = L"wsl.exe -e true";
+      cmd.push_back(L'\0');
+      STARTUPINFOW si{};
+      si.cb = sizeof(si);
+      PROCESS_INFORMATION pi{};
+      DWORD code = 1;
+      if (::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        ::WaitForSingleObject(pi.hProcess, 10000);
+        ::GetExitCodeProcess(pi.hProcess, &code);
+        ::CloseHandle(pi.hProcess);
+        ::CloseHandle(pi.hThread);
+      }
+      if (code == 0)
+        std::printf("[ok]   WSL is functional (ran a command in the default distro)\n");
+      else {
+        std::printf("[fail] could not run a command via WSL (exit %lu)\n", code);
+        ++problems;
+      }
+    }
+    std::printf("\n%s\n", problems == 0 ? "All checks passed. Mount with: wsldrive mount W: --distro <name> --wsl-root <path>"
+                                        : "Some checks failed; resolve the items above before mounting.");
+    return problems == 0 ? 0 : 1;
+  }
+#endif
 
 #ifdef WSLDRIVE_HAVE_WINFSP
   if (command == "mount") {
@@ -46,26 +133,61 @@ int main(int argc, char** argv) {
       return 2;
     }
     const std::string mountpoint = argv[2];
-    std::string connect;
+    std::string connect, distro, wsl_root, agent_path;
+    std::uint32_t port = 51789;
+    bool have_distro = false;
     for (int i = 3; i < argc; ++i) {
       const std::string_view a = argv[i];
-      if (a == "--connect" && i + 1 < argc)
-        connect = argv[++i];
+      auto val = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
+      if (a == "--connect")
+        connect = val();
+      else if (a == "--distro") {
+        distro = val();
+        have_distro = true;
+      } else if (a == "--wsl-root")
+        wsl_root = val();
+      else if (a == "--agent")
+        agent_path = val();
+      else if (a == "--port")
+        port = static_cast<std::uint32_t>(std::stoul(val()));
       else {
         usage();
         return 2;
       }
     }
-    if (connect.empty()) {
+
+    // Auto-launch mode: start wsldrived in the distro, then connect to it.
+    wsld::platform::WslAgent agent;
+    if (have_distro) {
+      if (wsl_root.empty()) {
+        std::fprintf(stderr, "wsldrive: --wsl-root is required with --distro\n");
+        return 2;
+      }
+      if (auto r = agent.start({.distro = distro, .agent_path = agent_path, .wsl_root = wsl_root, .port = port}); !r) {
+        std::fprintf(stderr, "wsldrive: failed to launch agent in distro '%s'\n", distro.c_str());
+        return 1;
+      }
+      connect = "tcp://127.0.0.1:" + std::to_string(port);
+      std::printf("launched agent in %s, waiting for it to listen...\n", distro.empty() ? "(default distro)" : distro.c_str());
+    } else if (connect.empty()) {
       usage();
       return 2;
     }
+
     auto ep = wsld::net::Endpoint::parse(connect);
     if (!ep) {
       std::fprintf(stderr, "wsldrive: bad endpoint '%s'\n", connect.c_str());
       return 2;
     }
-    auto sock = wsld::net::connect(*ep);
+    // Poll for the agent to accept connections (auto-launch needs a moment;
+    // a direct --connect succeeds on the first try).
+    wsld::Result<wsld::net::Socket> sock = wsld::fail(wsld::Errc::ConnectionClosed);
+    const int attempts = have_distro ? 100 : 1;  // ~10 s when auto-launching
+    for (int i = 0; i < attempts; ++i) {
+      sock = wsld::net::connect(*ep);
+      if (sock) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     if (!sock) {
       std::fprintf(stderr, "wsldrive: connect failed: %s (os error %d)\n", wsld::to_string(sock.error()),
                    wsld::net::last_socket_error());
@@ -87,10 +209,14 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));
       return 1;
     }
+    ::SetConsoleCtrlHandler(mount_ctrl_handler, TRUE);
     std::printf("mounted. Ctrl+C to unmount.\n");
     std::fflush(stdout);
-    while (fm.mounted() && root.connected()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    fm.unmount();
+    while (fm.mounted() && root.connected() && !g_mount_stop.load())
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::printf("unmounting...\n");
+    std::fflush(stdout);
+    fm.unmount();  // agent (if auto-launched) is stopped by its destructor on return
     return 0;
   }
 #endif

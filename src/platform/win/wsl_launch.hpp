@@ -1,0 +1,43 @@
+#pragma once
+
+#include "core/error.hpp"
+
+#include <cstdint>
+#include <string>
+
+namespace wsld::platform {
+
+/// How to launch the Linux agent inside a WSL2 distro.
+struct WslAgentSpec {
+  std::string distro;      // e.g. "Ubuntu"; empty = the default distro
+  std::string agent_path;  // path to wsldrived inside the distro (default: "wsldrived" on PATH)
+  std::string wsl_root;    // the ext4 directory to serve
+  std::uint32_t port = 0;  // loopback TCP port the agent listens on
+};
+
+/// Builds the `wsl.exe ...` command line that launches the agent. Pure, so the
+/// argument construction can be unit-tested without spawning anything.
+[[nodiscard]] std::string build_wsl_command(const WslAgentSpec& spec);
+
+/// Launches and supervises `wsldrived` inside a distro via wsl.exe. Destruction
+/// (or stop()) terminates the agent and the wsl.exe client.
+class WslAgent {
+ public:
+  WslAgent() = default;
+  ~WslAgent();
+  WslAgent(const WslAgent&) = delete;
+  WslAgent& operator=(const WslAgent&) = delete;
+
+  /// Spawns the agent. Does not wait for it to be listening — the caller polls
+  /// the port (the agent binds loopback, reachable from Windows via WSL
+  /// localhost forwarding).
+  [[nodiscard]] Result<void> start(const WslAgentSpec& spec);
+  void stop();
+  [[nodiscard]] bool running() const noexcept { return proc_ != nullptr; }
+
+ private:
+  void* proc_ = nullptr;  // HANDLE to the wsl.exe process
+  WslAgentSpec spec_;
+};
+
+}  // namespace wsld::platform
