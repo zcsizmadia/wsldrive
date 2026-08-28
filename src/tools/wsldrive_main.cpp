@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     const std::string mountpoint = argv[2];
-    std::string connect, distro, wsl_root, agent_path;
+    std::string connect, listen, distro, wsl_root, agent_path;
     std::uint32_t port = 51789;
     bool have_distro = false;
     bool writeback = false;
@@ -162,6 +162,8 @@ int main(int argc, char** argv) {
       auto val = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
       if (a == "--connect")
         connect = val();
+      else if (a == "--listen")
+        listen = val();
       else if (a == "--writeback")
         writeback = true;
       else if (a == "--distro") {
@@ -195,7 +197,7 @@ int main(int argc, char** argv) {
       std::printf("launched agent in %s, waiting for it to listen...\n", distro.empty() ? "(default distro)" : distro.c_str());
     } else
 #endif
-        if (connect.empty()) {
+        if (connect.empty() && listen.empty()) {
       usage();
       return 2;
     }
@@ -208,27 +210,55 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    auto ep = wsld::net::Endpoint::parse(connect);
-    if (!ep) {
-      std::fprintf(stderr, "wsldrive: bad endpoint '%s'\n", connect.c_str());
-      return 2;
-    }
-    // Poll for the agent to accept connections (auto-launch needs a moment;
-    // a direct --connect succeeds on the first try).
     (void)distro;
     (void)wsl_root;
     (void)agent_path;
     (void)port;
-    wsld::Result<wsld::net::Socket> sock = wsld::fail(wsld::Errc::ConnectionClosed);
-    const int attempts = have_distro ? 100 : 1;  // ~10 s when auto-launching
     (void)have_distro;
-    for (int i = 0; i < attempts; ++i) {
-      sock = wsld::net::connect(*ep);
-      if (sock) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::string source;
+    wsld::Result<wsld::net::Socket> sock = wsld::fail(wsld::Errc::ConnectionClosed);
+    if (!listen.empty()) {
+      // Wait for the agent to dial in (used when the agent cannot accept inbound
+      // connections, e.g. a Windows agent reaching a WSL client past the firewall).
+      auto lep = wsld::net::Endpoint::parse(listen);
+      if (!lep) {
+        std::fprintf(stderr, "wsldrive: bad endpoint '%s'\n", listen.c_str());
+        return 2;
+      }
+      auto l = wsld::net::Listener::bind(*lep);
+      if (!l) {
+        std::fprintf(stderr, "wsldrive: listen on %s failed: %s\n", lep->to_string().c_str(),
+                     wsld::to_string(l.error()));
+        return 1;
+      }
+      source = l->local().to_string();
+      std::printf("waiting for agent on %s ...\n", source.c_str());
+      std::fflush(stdout);
+      while (!g_mount_stop.load()) {
+        auto s = l->accept(std::chrono::milliseconds(200));
+        if (s) {
+          sock = std::move(*s);
+          break;
+        }
+        if (s.error() != wsld::Errc::Timeout) break;
+      }
+    } else {
+      auto ep = wsld::net::Endpoint::parse(connect);
+      if (!ep) {
+        std::fprintf(stderr, "wsldrive: bad endpoint '%s'\n", connect.c_str());
+        return 2;
+      }
+      source = ep->to_string();
+      // Poll for the agent to accept (auto-launch needs a moment; --connect is instant).
+      const int attempts = have_distro ? 100 : 1;
+      for (int i = 0; i < attempts; ++i) {
+        sock = wsld::net::connect(*ep);
+        if (sock) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
     }
     if (!sock) {
-      std::fprintf(stderr, "wsldrive: connect failed: %s (os error %d)\n", wsld::to_string(sock.error()),
+      std::fprintf(stderr, "wsldrive: connect/accept failed: %s (os error %d)\n", wsld::to_string(sock.error()),
                    wsld::net::last_socket_error());
       return 1;
     }
@@ -242,7 +272,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     const auto ts = root.with_tree([](const wsld::MetadataTree& t) { return t.stats(); });
-    std::printf("mounting %s (%zu nodes) at %s ...\n", ep->to_string().c_str(), ts.nodes, mountpoint.c_str());
+    std::printf("mounting %s (%zu nodes) at %s ...\n", source.c_str(), ts.nodes, mountpoint.c_str());
     wsld::mount::FuseMount fm(root);
     if (auto r = fm.mount(mountpoint, writeback); !r) {
       std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));

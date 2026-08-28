@@ -32,6 +32,9 @@ class RemoteRoot {
     std::uint64_t generation = 0;
     std::size_t snapshot_bytes = 0;
     std::chrono::nanoseconds last_snapshot_time{0};
+    std::uint64_t read_cache_hits = 0;
+    std::uint64_t read_cache_misses = 0;
+    std::uint64_t read_cache_bytes = 0;
   };
 
   using InvalidationHook = std::function<void(const proto::InvalidationBatch&)>;
@@ -47,9 +50,14 @@ class RemoteRoot {
   /// Requests a full snapshot and replaces the tree with it.
   [[nodiscard]] Result<void> fetch_snapshot(std::chrono::milliseconds timeout = std::chrono::minutes(5));
 
-  /// Reads `length` bytes at `offset` of `path`; returns fewer at EOF.
+  /// Reads `length` bytes at `offset` of `path`; returns fewer at EOF. Small
+  /// files are cached in RAM and served locally on repeat reads until an
+  /// invalidation (or a size/mtime change) supersedes them.
   [[nodiscard]] Result<std::vector<std::byte>> read(std::string_view path, std::uint64_t offset, std::uint32_t length,
                                                     std::chrono::milliseconds timeout = std::chrono::seconds(30));
+
+  /// Largest file the read cache will hold whole; larger reads stream uncached.
+  static constexpr std::uint64_t kMaxCacheableFile = 8u << 20;
 
   [[nodiscard]] Result<std::chrono::nanoseconds> ping(std::chrono::milliseconds timeout = std::chrono::seconds(5));
 
@@ -103,9 +111,12 @@ class RemoteRoot {
 
   [[nodiscard]] Result<std::shared_ptr<Pending>> request(proto::MsgType type, std::span<const std::byte> payload,
                                                          std::chrono::milliseconds timeout, bool streaming = false);
+  [[nodiscard]] Result<std::vector<std::byte>> read_remote(std::string_view path, std::uint64_t offset,
+                                                           std::uint32_t length, std::chrono::milliseconds timeout);
   void reader_loop();
   void apply_invalidation(std::span<const std::byte> payload);
   void fail_all_pending();
+  void drop_cached(std::string_view path);  // evict one read-cache entry
 
   std::unique_ptr<net::FrameChannel> ch_;
   std::thread reader_;
@@ -122,6 +133,20 @@ class RemoteRoot {
   mutable std::mutex stats_mu_;
   Stats stats_;
   InvalidationHook hook_;
+
+  // In-RAM read cache: path -> whole-file contents, validated against the tree's
+  // (mtime, size) and dropped on invalidation. LRU-evicted to a byte budget.
+  struct CacheEntry {
+    std::int64_t mtime_ns = 0;
+    std::uint64_t size = 0;
+    std::uint64_t last_use = 0;
+    std::vector<std::byte> data;
+  };
+  mutable std::mutex rcache_mu_;
+  std::unordered_map<std::string, CacheEntry, StringHash, std::equal_to<>> rcache_;
+  std::uint64_t rcache_bytes_ = 0;
+  std::uint64_t rcache_tick_ = 0;
+  std::uint64_t rcache_cap_ = 256u << 20;  // 256 MiB
 };
 
 }  // namespace wsld::agent

@@ -71,8 +71,8 @@ Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
   return {};
 }
 
-Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint64_t offset, std::uint32_t length,
-                                                std::chrono::milliseconds timeout) {
+Result<std::vector<std::byte>> RemoteRoot::read_remote(std::string_view path, std::uint64_t offset,
+                                                       std::uint32_t length, std::chrono::milliseconds timeout) {
   std::vector<std::byte> payload;
   proto::Writer w(payload);
   proto::write_read_request(w, proto::ReadRequest{.path = path, .offset = offset, .length = length});
@@ -85,12 +85,81 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
   return std::vector<std::byte>(resp->data.begin(), resp->data.end());
 }
 
+namespace {
+std::vector<std::byte> slice(const std::vector<std::byte>& data, std::uint64_t offset, std::uint32_t length) {
+  if (offset >= data.size()) return {};
+  const auto end = std::min<std::uint64_t>(offset + length, data.size());
+  return std::vector<std::byte>(data.begin() + static_cast<std::ptrdiff_t>(offset),
+                                data.begin() + static_cast<std::ptrdiff_t>(end));
+}
+}  // namespace
+
+Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint64_t offset, std::uint32_t length,
+                                                std::chrono::milliseconds timeout) {
+  // Version and cacheability come from the in-RAM mirror.
+  std::int64_t mtime = 0;
+  std::uint64_t size = 0;
+  bool is_file = false;
+  {
+    std::shared_lock lock(tree_mu_);
+    if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
+      const auto& n = tree_.node(*id);
+      is_file = n.attr.kind == NodeKind::File;
+      mtime = n.attr.mtime_ns;
+      size = n.attr.size;
+    }
+  }
+  if (!is_file || size > kMaxCacheableFile) return read_remote(path, offset, length, timeout);
+
+  {
+    std::lock_guard lock(rcache_mu_);
+    if (const auto it = rcache_.find(path); it != rcache_.end() && it->second.mtime_ns == mtime &&
+                                            it->second.size == size) {
+      it->second.last_use = ++rcache_tick_;
+      auto out = slice(it->second.data, offset, length);
+      std::lock_guard s(stats_mu_);
+      ++stats_.read_cache_hits;
+      return out;
+    }
+  }
+
+  // Miss: fetch the whole file once, cache it, then serve the requested slice.
+  auto whole = read_remote(path, 0, static_cast<std::uint32_t>(size), timeout);
+  if (!whole) return whole;
+  {
+    std::lock_guard lock(rcache_mu_);
+    if (const auto it = rcache_.find(path); it != rcache_.end()) rcache_bytes_ -= it->second.data.size();
+    rcache_bytes_ += whole->size();
+    rcache_[std::string(path)] = CacheEntry{mtime, size, ++rcache_tick_, *whole};
+    // Evict least-recently-used entries until back under the byte budget.
+    while (rcache_bytes_ > rcache_cap_ && rcache_.size() > 1) {
+      auto victim = rcache_.begin();
+      for (auto i = std::next(rcache_.begin()); i != rcache_.end(); ++i)
+        if (i->second.last_use < victim->second.last_use) victim = i;
+      rcache_bytes_ -= victim->second.data.size();
+      rcache_.erase(victim);
+    }
+    std::lock_guard s(stats_mu_);
+    ++stats_.read_cache_misses;
+    stats_.read_cache_bytes = rcache_bytes_;
+  }
+  return slice(*whole, offset, length);
+}
+
 Result<std::chrono::nanoseconds> RemoteRoot::ping(std::chrono::milliseconds timeout) {
   const auto t0 = std::chrono::steady_clock::now();
   auto p = request(proto::MsgType::Ping, {}, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Pong) return fail(Errc::ProtocolError);
   return std::chrono::steady_clock::now() - t0;
+}
+
+void RemoteRoot::drop_cached(std::string_view path) {
+  std::lock_guard lock(rcache_mu_);
+  if (const auto it = rcache_.find(path); it != rcache_.end()) {
+    rcache_bytes_ -= it->second.data.size();
+    rcache_.erase(it);
+  }
 }
 
 Result<void> RemoteRoot::create_file(std::string_view path, std::uint32_t mode, std::chrono::milliseconds timeout) {
@@ -120,6 +189,7 @@ Result<std::uint64_t> RemoteRoot::write(std::string_view path, std::uint64_t off
   auto resp = proto::read_write_response(r);
   if (!resp) return fail(resp.error());
   const std::uint64_t end = offset + resp->written;
+  drop_cached(path);
   std::unique_lock lock(tree_mu_);
   if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
     Attributes a = tree_.node(*id).attr;
@@ -138,6 +208,7 @@ Result<void> RemoteRoot::truncate(std::string_view path, std::uint64_t size, std
   auto p = request(proto::MsgType::TruncateRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  drop_cached(path);
   std::unique_lock lock(tree_mu_);
   if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
     Attributes a = tree_.node(*id).attr;
@@ -190,6 +261,8 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
   auto p = request(proto::MsgType::RenameRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  drop_cached(from);
+  drop_cached(to);
   std::unique_lock lock(tree_mu_);
   Attributes moved{.size = 0, .mtime_ns = 0, .mode = 0644, .kind = NodeKind::File};
   bool have = false;
@@ -329,6 +402,16 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
         case InvalidationKind::Upsert: (void)tree_.upsert_path(op.path, op.attr); break;
         case InvalidationKind::Remove: (void)tree_.remove_path(op.path); break;
         case InvalidationKind::Rescan: break;  // caller decides when to refetch; see stats()
+      }
+    }
+  }
+  // Drop cached contents for any changed path so the next read refetches.
+  {
+    std::lock_guard lock(rcache_mu_);
+    for (const proto::InvalidationOp& op : batch->ops) {
+      if (const auto it = rcache_.find(op.path); it != rcache_.end()) {
+        rcache_bytes_ -= it->second.data.size();
+        rcache_.erase(it);
       }
     }
   }
