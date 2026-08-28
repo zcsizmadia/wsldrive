@@ -1,0 +1,126 @@
+name: Release
+
+# Build the binaries + GUI installer and attach them to a GitHub Release.
+# Triggered by pushing a version tag (v1.2.3). Can also be run manually
+# (workflow_dispatch) to build the artifacts without publishing a release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for a manual build (e.g. 0.2.0-test); no release is published'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write
+
+jobs:
+  # -- Linux client (Direction B), built on a Linux runner and handed to the
+  #    Windows job so the installer can embed it. --------------------------
+  linux:
+    name: Linux client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev
+      - name: Build
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release --target wsldrive --parallel
+      - name: Upload Linux client
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsldrive-linux
+          path: build/linux-release/src/tools/wsldrive
+          if-no-files-found: error
+
+  # -- Windows binaries + installer, then publish the release. -------------
+  windows:
+    name: Windows binaries + installer
+    runs-on: windows-latest
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = '${{ github.event.inputs.version }}'
+          if (-not $v) { $v = ('${{ github.ref_name }}' -replace '^v','') }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "version = $v"
+
+      - name: Install WinFsp (SDK) and Inno Setup
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }   # 3010 = success, reboot pending
+          if ($LASTEXITCODE -ne 0) { throw "winfsp install failed ($LASTEXITCODE)" }
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }
+          if ($LASTEXITCODE -ne 0) { throw "innosetup install failed ($LASTEXITCODE)" }
+          $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse3\fuse.h'
+          $lib = 'C:\Program Files (x86)\WinFsp\lib\winfsp-x64.lib'
+          if (-not (Test-Path $inc) -or -not (Test-Path $lib)) {
+            throw "WinFsp SDK (inc/lib) not found after install — the built wsldrive.exe would lack mount support. Adjust the WinFsp install step."
+          }
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build binaries
+        shell: pwsh
+        run: |
+          cmake --preset msvc-release
+          cmake --build --preset msvc-release --target wsldrive wsldrived --parallel
+
+      - name: Verify mount support was compiled in
+        shell: pwsh
+        run: |
+          $u = & '.\build\msvc-release\src\tools\wsldrive.exe' 2>&1 | Out-String   # usage exits non-zero
+          if ($u -notmatch 'mount') { throw "wsldrive.exe has no 'mount' command — WinFsp was not linked." }
+          Write-Host "mount support present."
+          exit 0   # ignore wsldrive.exe's usage exit code
+
+      - name: Fetch Linux client
+        uses: actions/download-artifact@v4
+        with:
+          name: wsldrive-linux
+          path: build/linux-release/src/tools
+
+      - name: Build installer
+        shell: pwsh
+        run: .\scripts\build-installer.ps1 -Version ${{ steps.ver.outputs.version }}
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item installer\dist\wsldrive-setup.exe staging\
+          # Zip of raw binaries + the script installer, for the no-build script path.
+          $z = 'staging\wsldrive-windows-x64.zip'
+          Copy-Item build\msvc-release\src\tools\wsldrive.exe,build\msvc-release\src\tools\wsldrived.exe .
+          Compress-Archive -Force -DestinationPath $z -Path `
+            wsldrive.exe,wsldrived.exe,scripts\install.ps1,scripts\register-hvsocket.ps1,README.md
+          Copy-Item build\linux-release\src\tools\wsldrive staging\wsldrive-linux-x64
+
+      - name: Upload build artifacts (always, for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsldrive-release-assets
+          path: staging/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: staging/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
