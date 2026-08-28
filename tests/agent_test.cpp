@@ -2,6 +2,9 @@
 #include "agent/scanner.hpp"
 #include "agent/server.hpp"
 #include "platform/watcher.hpp"
+#ifdef _WIN32
+#include "platform/win/wsl_launch.hpp"
+#endif
 
 #include <gtest/gtest.h>
 
@@ -377,6 +380,25 @@ TEST_F(AgentTest, LiveInvalidationsReachTheClient) {
 }
 
 #ifdef _WIN32
+TEST(WslLaunch, BuildsCommand) {
+  const std::string cmd = platform::build_wsl_command(
+      {.distro = "Ubuntu", .agent_path = "/opt/wsldrived", .wsl_root = "/home/u/proj", .port = 51789});
+  EXPECT_NE(cmd.find("wsl.exe -d Ubuntu -- "), std::string::npos);
+  EXPECT_NE(cmd.find("'/opt/wsldrived'"), std::string::npos);
+  EXPECT_NE(cmd.find("--root '/home/u/proj'"), std::string::npos);
+  EXPECT_NE(cmd.find("--listen tcp://127.0.0.1:51789"), std::string::npos);
+  EXPECT_NE(cmd.find("--exit-when-idle"), std::string::npos);
+
+  // Default distro is omitted; default agent falls back to PATH lookup.
+  const std::string dflt = platform::build_wsl_command({.distro = "", .agent_path = "", .wsl_root = "/x", .port = 1});
+  EXPECT_EQ(dflt.find(" -d "), std::string::npos);
+  EXPECT_NE(dflt.find("-- 'wsldrived'"), std::string::npos);
+
+  // A single quote in a path is escaped so the distro shell keeps it literal.
+  const std::string q = platform::build_wsl_command({.distro = "", .agent_path = "", .wsl_root = "/a'b", .port = 1});
+  EXPECT_NE(q.find("'/a'\\''b'"), std::string::npos);
+}
+
 TEST(Win32Watcher, ReportsEventsAndStopsCleanly) {
   const fs::path root = fs::temp_directory_path() / "wsldrive-watcher-test";
   fs::remove_all(root);

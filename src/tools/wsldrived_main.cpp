@@ -18,8 +18,9 @@ namespace {
 
 void usage() {
   std::fputs(
-      "usage: wsldrived --root <dir> (--listen <endpoint> | --connect <endpoint>) [--no-watch]\n"
-      "  endpoints: tcp://host:port | vsock://cid:port | hv://port\n",
+      "usage: wsldrived --root <dir> (--listen <endpoint> | --connect <endpoint>) [--no-watch] [--exit-when-idle]\n"
+      "  endpoints: tcp://host:port | vsock://cid:port | hv://port\n"
+      "  --exit-when-idle: serve a single client session then exit (used by auto-launch)\n",
       stderr);
 }
 
@@ -29,6 +30,7 @@ int main(int argc, char** argv) {
   std::filesystem::path root;
   std::string listen, connect;
   bool watch = true;
+  bool exit_when_idle = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
     auto next = [&](std::string& out) {
@@ -48,6 +50,8 @@ int main(int argc, char** argv) {
       next(connect);
     } else if (a == "--no-watch") {
       watch = false;
+    } else if (a == "--exit-when-idle") {
+      exit_when_idle = true;
     } else {
       usage();
       return 2;
@@ -95,6 +99,18 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::fprintf(stderr, "wsldrived: listening on %s\n", listener->local().to_string().c_str());
+  if (exit_when_idle) {
+    // 1:1 auto-launch: serve exactly one client session on this thread, then
+    // exit. When the client (and its OS socket) goes away for any reason, the
+    // session ends and this agent terminates on its own — no leak.
+    auto sock = listener->accept();
+    if (!sock) return 0;
+    wsld::net::FrameChannel ch(std::move(*sock));
+    server.serve(ch);
+    std::fprintf(stderr, "wsldrived: client disconnected, exiting (--exit-when-idle)\n");
+    return 0;
+  }
+
   std::vector<std::thread> sessions;
   for (;;) {
     auto sock = listener->accept();
