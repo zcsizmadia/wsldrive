@@ -23,8 +23,10 @@ class FuseMount {
   FuseMount& operator=(const FuseMount&) = delete;
 
   /// Mounts at `mountpoint` (a drive letter like "Z:" or a directory path) and
-  /// starts serving. Returns once the volume is up.
-  [[nodiscard]] Result<void> mount(const std::string& mountpoint);
+  /// starts serving. Returns once the volume is up. With `writeback`, writes to
+  /// a file are buffered and coalesced, flushed on fsync/flush/release — fewer
+  /// round-trips, at the cost of durability only at flush/close (opt-in).
+  [[nodiscard]] Result<void> mount(const std::string& mountpoint, bool writeback = false);
 
   /// Signals the FUSE loop to exit, unmounts, and joins the loop thread.
   void unmount();
