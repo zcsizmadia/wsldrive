@@ -1,8 +1,13 @@
 add_library(wsldrive_mount STATIC fuse_mount.cpp)
 add_library(wsldrive::mount ALIAS wsldrive_mount)
 
-# winfsp::fuse3 is PUBLIC so WSLDRIVE_HAVE_WINFSP and the FUSE headers propagate
-# to whatever links the mount library (the wsldrive CLI).
-target_link_libraries(wsldrive_mount
-  PUBLIC wsldrive::agent winfsp::fuse3
-  PRIVATE wsldrive::options advapi32)
+# WSLDRIVE_HAVE_MOUNT is PUBLIC so the CLI enables the mount subcommand on either
+# platform; the WinFsp target additionally defines WSLDRIVE_HAVE_WINFSP on Windows.
+target_compile_definitions(wsldrive_mount PUBLIC WSLDRIVE_HAVE_MOUNT)
+target_link_libraries(wsldrive_mount PUBLIC wsldrive::agent PRIVATE wsldrive::options)
+
+if(WIN32)
+  target_link_libraries(wsldrive_mount PUBLIC winfsp::fuse3 PRIVATE advapi32)
+else()
+  target_link_libraries(wsldrive_mount PUBLIC wsldrive::fuse3)
+endif()
