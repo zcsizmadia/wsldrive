@@ -497,6 +497,12 @@ TEST(WslLaunch, BuildsCommand) {
   // A single quote in a path is escaped so the distro shell keeps it literal.
   const std::string q = platform::build_wsl_command({.distro = "", .agent_path = "", .wsl_root = "/a'b", .port = 1});
   EXPECT_NE(q.find("'/a'\\''b'"), std::string::npos);
+
+  // An explicit listen endpoint (e.g. vsock for the Hyper-V socket transport) is used verbatim.
+  const std::string v = platform::build_wsl_command(
+      {.distro = "Ubuntu", .agent_path = "", .wsl_root = "/x", .port = 5700, .listen = "vsock://any:5700"});
+  EXPECT_NE(v.find("--listen vsock://any:5700"), std::string::npos);
+  EXPECT_EQ(v.find("tcp://"), std::string::npos);
 }
 
 TEST(Win32Watcher, ReportsEventsAndStopsCleanly) {

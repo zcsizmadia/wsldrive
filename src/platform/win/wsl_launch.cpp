@@ -4,7 +4,9 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <string>
+#include <string_view>
 
 namespace wsld::platform {
 
@@ -25,6 +27,52 @@ std::string sh_quote(std::string_view s) {
 
 }  // namespace
 
+namespace {
+// Extracts the first GUID-shaped token (8-4-4-4-12 hex) from a string.
+std::string first_guid(std::string_view s) {
+  auto is_hex = [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+  };
+  for (std::size_t i = 0; i + 36 <= s.size(); ++i) {
+    bool ok = true;
+    for (std::size_t j = 0; j < 36 && ok; ++j) {
+      const char c = s[i + j];
+      if (j == 8 || j == 13 || j == 18 || j == 23)
+        ok = c == '-';
+      else
+        ok = is_hex(c);
+    }
+    if (ok) return std::string(s.substr(i, 36));
+  }
+  return {};
+}
+}  // namespace
+
+std::string discover_wsl_vm_guid() {
+  std::FILE* pipe = _popen("hcsdiag list 2>&1", "r");
+  if (pipe == nullptr) return {};
+  std::string out;
+  char buf[512];
+  while (std::fgets(buf, sizeof(buf), pipe) != nullptr) out += buf;
+  _pclose(pipe);
+  // hcsdiag prints one compute system per block; the WSL utility VM's line
+  // contains "WSL". Prefer a line mentioning WSL; fall back to the first GUID.
+  std::size_t start = 0;
+  std::string fallback;
+  for (std::size_t i = 0; i <= out.size(); ++i) {
+    if (i == out.size() || out[i] == '\n') {
+      const std::string_view line(out.data() + start, i - start);
+      const std::string g = first_guid(line);
+      if (!g.empty()) {
+        if (line.find("WSL") != std::string_view::npos) return g;
+        if (fallback.empty()) fallback = g;
+      }
+      start = i + 1;
+    }
+  }
+  return fallback;
+}
+
 std::string build_wsl_command(const WslAgentSpec& spec) {
   const std::string agent = spec.agent_path.empty() ? "wsldrived" : spec.agent_path;
   std::string cmd = "wsl.exe";
@@ -33,7 +81,8 @@ std::string build_wsl_command(const WslAgentSpec& spec) {
   cmd += " -- ";
   cmd += sh_quote(agent);
   cmd += " --root " + sh_quote(spec.wsl_root);
-  cmd += " --listen tcp://127.0.0.1:" + std::to_string(spec.port);
+  const std::string listen = spec.listen.empty() ? ("tcp://127.0.0.1:" + std::to_string(spec.port)) : spec.listen;
+  cmd += " --listen " + listen;
   cmd += " --exit-when-idle";  // agent terminates when this client's socket closes
   return cmd;
 }
@@ -62,7 +111,7 @@ void WslAgent::stop() {
   // listen port), then the wsl.exe client.
   const std::string kill = "wsl.exe" + (spec_.distro.empty() ? std::string() : " -d " + spec_.distro) +
                            " -- pkill -f " + [&] {
-                             std::string pat = "wsldrived.*127.0.0.1:" + std::to_string(spec_.port);
+                             std::string pat = "wsldrived.*:" + std::to_string(spec_.port);
                              std::string q = "'";
                              for (char c : pat) q += (c == '\'') ? std::string("'\\''") : std::string(1, c);
                              q.push_back('\'');

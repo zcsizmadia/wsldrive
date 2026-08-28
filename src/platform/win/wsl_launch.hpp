@@ -12,8 +12,14 @@ struct WslAgentSpec {
   std::string distro;      // e.g. "Ubuntu"; empty = the default distro
   std::string agent_path;  // path to wsldrived inside the distro (default: "wsldrived" on PATH)
   std::string wsl_root;    // the ext4 directory to serve
-  std::uint32_t port = 0;  // loopback TCP port the agent listens on
+  std::uint32_t port = 0;  // port the agent listens on
+  std::string listen;      // full listen endpoint; empty = tcp://127.0.0.1:<port>
 };
+
+/// Best-effort discovery of the running WSL2 utility VM's GUID (via `hcsdiag
+/// list`). Returns "" if it cannot be determined (e.g. not elevated / not a
+/// Hyper-V administrator). Needed to reach the guest over AF_HYPERV.
+[[nodiscard]] std::string discover_wsl_vm_guid();
 
 /// Builds the `wsl.exe ...` command line that launches the agent. Pure, so the
 /// argument construction can be unit-tested without spawning anything.
