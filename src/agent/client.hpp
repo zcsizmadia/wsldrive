@@ -92,10 +92,17 @@ class RemoteRoot {
     bool done = false;
     proto::MsgType type{};
     std::vector<std::byte> payload;
+    // Streaming (multi-frame) reply accumulation, used for snapshots.
+    bool streaming = false;
+    bool stream_ok = true;
+    std::uint64_t snap_generation = 0;
+    std::size_t snap_bytes = 0;
+    std::vector<std::string> snap_names;      // owns entry names across frames
+    std::vector<SnapshotEntry> snap_entries;  // .name filled in by the caller at the end
   };
 
   [[nodiscard]] Result<std::shared_ptr<Pending>> request(proto::MsgType type, std::span<const std::byte> payload,
-                                                         std::chrono::milliseconds timeout);
+                                                         std::chrono::milliseconds timeout, bool streaming = false);
   void reader_loop();
   void apply_invalidation(std::span<const std::byte> payload);
   void fail_all_pending();

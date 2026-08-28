@@ -82,7 +82,8 @@ TEST_F(AgentTest, ReadAttributes) {
 /// Runs a RootServer on a loopback TCP listener with one accept thread.
 class LoopbackServer {
  public:
-  explicit LoopbackServer(fs::path root, bool watch) : server_({.root = std::move(root), .watch = watch}) {
+  explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20))
+      : server_({.root = std::move(root), .watch = watch, .coalescer = {}, .snapshot_chunk_bytes = chunk_bytes}) {
     auto l = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
     if (!l) throw std::runtime_error("bind failed");
     listener_ = std::move(*l);
@@ -179,6 +180,61 @@ std::string read_disk(const fs::path& p) {
 }
 
 std::span<const std::byte> as_bytes(std::string_view s) { return std::as_bytes(std::span{s.data(), s.size()}); }
+
+// Counts entries under root (files + directories), matching what scan_tree emits
+// for a tree with no sockets/fifos/devices.
+std::size_t scan_count(const fs::path& root) {
+  std::size_t n = 0;
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(root, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+    ++n;
+  return n;
+}
+
+#ifndef _WIN32
+TEST_F(AgentTest, ScannerReportsSymlinks) {
+  std::error_code ec;
+  fs::create_symlink("main.cpp", root_ / "src" / "link_to_main", ec);
+  ASSERT_FALSE(ec);
+  bool saw_symlink = false;
+  std::vector<std::string> names;
+  std::vector<SnapshotEntry> entries;
+  auto stats = scan_tree(root_, [&](const SnapshotEntry& e) {
+    names.emplace_back(e.name);
+    entries.push_back(e);
+    if (e.attr.kind == NodeKind::Symlink) saw_symlink = true;
+  });
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_TRUE(saw_symlink);
+  EXPECT_EQ(stats->symlinks, 1u);
+  for (std::size_t i = 0; i < entries.size(); ++i) entries[i].name = names[i];
+  MetadataTree t;
+  ASSERT_TRUE(t.load_snapshot(entries).has_value());
+  const auto link = t.lookup("src/link_to_main");
+  ASSERT_TRUE(link.has_value());
+  EXPECT_EQ(t.node(*link).attr.kind, NodeKind::Symlink);
+}
+#endif
+
+TEST_F(AgentTest, ChunkedSnapshotReassembles) {
+  // Add enough entries that a tiny per-frame budget forces many frames.
+  for (int i = 0; i < 200; ++i) write_file(root_ / ("chunk_" + std::to_string(i) + ".dat"), "x");
+  fs::create_directories(root_ / "deep" / "a" / "b");
+  write_file(root_ / "deep" / "a" / "b" / "leaf.txt", "found");
+  const std::size_t expected = scan_count(root_);
+
+  LoopbackServer srv(root_, /*watch=*/false, /*chunk_bytes=*/256);  // ~a handful of entries per frame
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  EXPECT_EQ(c->with_tree([](const MetadataTree& t) { return t.size(); }), expected + 1);  // +root
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) { return t.lookup("deep/a/b/leaf.txt").has_value(); }));
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) { return t.lookup("chunk_199.dat").has_value(); }));
+  // The reply really was split across many frames.
+  EXPECT_GT(c->stats().snapshot_bytes, 256u);
+}
 
 TEST_F(AgentTest, WriteThroughMutations) {
   LoopbackServer srv(root_, /*watch=*/false);  // isolate the optimistic-update path
