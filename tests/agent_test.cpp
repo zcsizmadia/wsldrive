@@ -181,10 +181,9 @@ TEST_F(AgentTest, ServerDisconnectFailsPendingRequests) {
   EXPECT_FALSE(r.has_value());
 }
 
-#ifdef _WIN32
 TEST_F(AgentTest, LiveInvalidationsReachTheClient) {
   LoopbackServer srv(root_, /*watch=*/true);
-  ASSERT_TRUE(srv.server().watching());
+  if (!srv.server().watching()) GTEST_SKIP() << "no filesystem watcher on this platform/environment";
   auto client = connect_client(srv.endpoint());
   ASSERT_NE(client, nullptr);
   auto hello = client->connect();
@@ -243,6 +242,7 @@ TEST_F(AgentTest, LiveInvalidationsReachTheClient) {
   EXPECT_GT(client->stats().generation, 1u);
 }
 
+#ifdef _WIN32
 TEST(Win32Watcher, ReportsEventsAndStopsCleanly) {
   const fs::path root = fs::temp_directory_path() / "wsldrive-watcher-test";
   fs::remove_all(root);
