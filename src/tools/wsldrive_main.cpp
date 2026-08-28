@@ -41,7 +41,7 @@ void usage() {
       "  wsldrive doctor                                      (check WinFsp + WSL environment)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
-      "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback]   (attach to a running agent)\n"
+      "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback] [--no-prefetch]  (attach to an agent)\n"
 #endif
 #if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
       "  wsldrive mount <dir> --win-root <winpath> --win-agent <wsldrived.exe> [--hvsocket [--vm-guid G]]\n"
@@ -164,6 +164,7 @@ int main(int argc, char** argv) {
     bool have_distro = false;
     bool writeback = false;
     bool hvsocket = false;
+    bool prefetch = true;
     std::string vm_guid;
     for (int i = 3; i < argc; ++i) {
       const std::string_view a = argv[i];
@@ -182,6 +183,8 @@ int main(int argc, char** argv) {
         win_agent = val();
       else if (a == "--writeback")
         writeback = true;
+      else if (a == "--no-prefetch")
+        prefetch = false;
       else if (a == "--distro") {
         distro = val();
         have_distro = true;
@@ -353,6 +356,10 @@ int main(int argc, char** argv) {
     }
     const auto ts = root.with_tree([](const wsld::MetadataTree& t) { return t.stats(); });
     std::printf("mounting %s (%zu nodes) at %s ...\n", source.c_str(), ts.nodes, mountpoint.c_str());
+    if (prefetch) {
+      const std::size_t dirs = root.warm_cache();  // background warm-up so first reads are hot
+      if (dirs > 0) std::printf("prefetching %zu directories in the background...\n", dirs);
+    }
     wsld::mount::FuseMount fm(root);
     if (auto r = fm.mount(mountpoint, writeback); !r) {
       std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));

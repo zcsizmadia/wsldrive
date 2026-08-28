@@ -410,6 +410,39 @@ TEST_F(AgentTest, PrefetchWarmsSiblings) {
   EXPECT_GT(c->stats().read_cache_hits, hits_before) << "sibling should have been prefetched";
 }
 
+TEST_F(AgentTest, WarmCachePrefetchesWholeTree) {
+  // A tree spread across several directories; warm_cache() should populate the
+  // read cache for all of them so the first read of any file is a cache hit.
+  for (int d = 0; d < 3; ++d) {
+    fs::create_directories(root_ / ("wc" + std::to_string(d)));
+    for (int i = 0; i < 10; ++i)
+      write_file(root_ / ("wc" + std::to_string(d)) / ("f" + std::to_string(i) + ".txt"),
+                 "d" + std::to_string(d) + "f" + std::to_string(i));
+  }
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  const std::size_t queued = c->warm_cache();
+  EXPECT_GT(queued, 0u);
+  c->wait_prefetch_idle(10s);
+
+  const auto st = c->stats();
+  EXPECT_GT(st.prefetch_files, 0u) << "prefetcher should have fetched files";
+  EXPECT_GT(st.prefetch_bytes, 0u);
+
+  // A file we never explicitly read is served from the warmed cache (a hit, no
+  // new miss).
+  const auto misses_before = c->stats().read_cache_misses;
+  auto r = c->read("wc2/f7.txt", 0, 100);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->data()), r->size()), "d2f7");
+  EXPECT_EQ(c->stats().read_cache_misses, misses_before) << "warmed file should not miss";
+  EXPECT_GE(c->stats().read_cache_hits, 1u);
+}
+
 TEST_F(AgentTest, ServerDisconnectFailsPendingRequests) {
   auto srv = std::make_unique<LoopbackServer>(root_, false);
   auto client = connect_client(srv->endpoint());

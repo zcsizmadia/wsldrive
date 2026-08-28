@@ -39,6 +39,11 @@ class RemoteRoot {
     std::uint64_t read_cache_hits = 0;
     std::uint64_t read_cache_misses = 0;
     std::uint64_t read_cache_bytes = 0;
+    // Cold-read instrumentation: time spent fetching bytes on a read miss (the
+    // boundary cost that warming hides), and what the background prefetcher did.
+    std::uint64_t read_miss_fetch_ns = 0;
+    std::uint64_t prefetch_files = 0;
+    std::uint64_t prefetch_bytes = 0;
   };
 
   using InvalidationHook = std::function<void(const proto::InvalidationBatch&)>;
@@ -69,6 +74,18 @@ class RemoteRoot {
       const std::vector<std::string>& paths, std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
   [[nodiscard]] Result<std::chrono::nanoseconds> ping(std::chrono::milliseconds timeout = std::chrono::seconds(5));
+
+  /// Proactively warm the read cache after mount: queue every directory whose
+  /// small files fit within the cache budget for background prefetch, so the
+  /// first reads a tool makes are already warm (cold reads avoided). Returns the
+  /// number of directories queued; skips directories once the estimated small-
+  /// file bytes would exceed the cache cap (huge trees fall back to lazy
+  /// read-ahead). Non-blocking — the background prefetcher does the work.
+  std::size_t warm_cache();
+
+  /// Blocks until the background prefetcher has drained its queue (or the
+  /// connection closes / the timeout elapses). Mainly for tests and benchmarks.
+  void wait_prefetch_idle(std::chrono::milliseconds timeout = std::chrono::minutes(5));
 
   // --- write-through mutations (Phase 3) -------------------------------------
   // Each performs the operation on the far side, then optimistically updates the
@@ -166,9 +183,11 @@ class RemoteRoot {
   std::thread prefetch_;
   std::mutex pf_mu_;
   std::condition_variable pf_cv_;
+  std::condition_variable pf_done_cv_;       // signalled when the queue drains to empty
   std::deque<std::string> pf_queue_;
   std::unordered_set<std::string> pf_seen_;  // directories already queued/prefetched
   std::atomic<bool> pf_stop_{false};
+  std::atomic<std::size_t> pf_pending_{0};   // dirs queued but not yet fully processed
   static constexpr std::size_t kPrefetchBatchBytes = 4u << 20;
   static constexpr std::size_t kPrefetchBatchCount = 512;
 };
