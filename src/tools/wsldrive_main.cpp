@@ -40,7 +40,7 @@ void usage() {
       "  wsldrive doctor                                      (check WinFsp + WSL environment)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
-      "  wsldrive mount <mountpoint> --connect <endpoint>      (attach to a running agent)\n"
+      "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback]   (attach to a running agent)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_WINFSP
       "  wsldrive mount <drive> --distro <name> --wsl-root <path> [--agent <path>] [--port N]\n"
@@ -156,11 +156,14 @@ int main(int argc, char** argv) {
     std::string connect, distro, wsl_root, agent_path;
     std::uint32_t port = 51789;
     bool have_distro = false;
+    bool writeback = false;
     for (int i = 3; i < argc; ++i) {
       const std::string_view a = argv[i];
       auto val = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
       if (a == "--connect")
         connect = val();
+      else if (a == "--writeback")
+        writeback = true;
       else if (a == "--distro") {
         distro = val();
         have_distro = true;
@@ -241,7 +244,7 @@ int main(int argc, char** argv) {
     const auto ts = root.with_tree([](const wsld::MetadataTree& t) { return t.stats(); });
     std::printf("mounting %s (%zu nodes) at %s ...\n", ep->to_string().c_str(), ts.nodes, mountpoint.c_str());
     wsld::mount::FuseMount fm(root);
-    if (auto r = fm.mount(mountpoint); !r) {
+    if (auto r = fm.mount(mountpoint, writeback); !r) {
       std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));
       return 1;
     }

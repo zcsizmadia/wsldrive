@@ -43,9 +43,27 @@ namespace {
 
 struct Context {
   agent::RemoteRoot* root;
+  bool writeback = false;
 };
 
 Context* ctx() { return static_cast<Context*>(fuse_get_context()->private_data); }
+
+// Per-open-file write buffer used in write-back mode. Coalesces a contiguous run
+// of writes and flushes it on fsync/flush/release (or when it grows past a cap).
+struct WriteHandle {
+  std::string path;
+  std::uint64_t start = 0;  // offset of buf[0] within the file
+  std::vector<std::byte> buf;
+};
+
+constexpr std::size_t kWriteBackCap = 8u << 20;
+
+WriteHandle* handle_of(struct fuse_file_info* fi) {
+  return fi != nullptr ? reinterpret_cast<WriteHandle*>(static_cast<std::uintptr_t>(fi->fh)) : nullptr;
+}
+
+// Flushes a write handle's buffer to the agent. Returns 0 or a negative errno.
+int flush_handle(WriteHandle* h);
 
 #ifdef _WIN32
 // winfsp-x64.dll is delay-loaded; load it (default search path, then the
@@ -141,14 +159,17 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, OffT, struct
   });
 }
 
-int op_open(const char* path, struct fuse_file_info*) {
+int op_open(const char* path, struct fuse_file_info* fi) {
   const std::string rel = to_rel(path);
-  return ctx()->root->with_tree([&](const MetadataTree& t) -> int {
+  const int rc = ctx()->root->with_tree([&](const MetadataTree& t) -> int {
     const auto id = t.lookup(rel, LookupMode::CaseInsensitive);
     if (!id) return -ENOENT;
     if (t.node(*id).is_dir()) return -EISDIR;
     return 0;
   });
+  if (rc == 0 && ctx()->writeback && fi != nullptr)
+    fi->fh = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(new WriteHandle{rel, 0, {}}));
+  return rc;
 }
 
 int err_to_errno(Errc e) {
@@ -165,16 +186,54 @@ int err_to_errno(Errc e) {
   }
 }
 
-int op_create(const char* path, ModeT mode, struct fuse_file_info*) {
-  auto r = ctx()->root->create_file(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
-  return r ? 0 : err_to_errno(r.error());
+int op_create(const char* path, ModeT mode, struct fuse_file_info* fi) {
+  const std::string rel = to_rel(path);
+  auto r = ctx()->root->create_file(rel, static_cast<std::uint32_t>(mode) & 0777u);
+  if (!r) return err_to_errno(r.error());
+  if (ctx()->writeback && fi != nullptr)
+    fi->fh = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(new WriteHandle{rel, 0, {}}));
+  return 0;
 }
 
-int op_write(const char* path, const char* buf, size_t size, OffT offset, struct fuse_file_info*) {
+int flush_handle(WriteHandle* h) {
+  if (h == nullptr || h->buf.empty()) return 0;
+  auto r = ctx()->root->write(h->path, h->start, h->buf);
+  if (!r) return err_to_errno(r.error());
+  h->start += h->buf.size();
+  h->buf.clear();
+  return 0;
+}
+
+int op_write(const char* path, const char* buf, size_t size, OffT offset, struct fuse_file_info* fi) {
+  WriteHandle* h = handle_of(fi);
+  if (ctx()->writeback && h != nullptr) {
+    const auto off = static_cast<std::uint64_t>(offset);
+    // Only a write contiguous with the buffer can extend it; otherwise flush and restart.
+    if (!h->buf.empty() && off != h->start + h->buf.size()) {
+      if (int rc = flush_handle(h); rc != 0) return rc;
+    }
+    if (h->buf.empty()) h->start = off;
+    const auto* p = reinterpret_cast<const std::byte*>(buf);
+    h->buf.insert(h->buf.end(), p, p + size);
+    if (h->buf.size() >= kWriteBackCap) {
+      if (int rc = flush_handle(h); rc != 0) return rc;
+    }
+    return static_cast<int>(size);
+  }
   auto r = ctx()->root->write(to_rel(path), static_cast<std::uint64_t>(offset),
                               std::as_bytes(std::span<const char>(buf, size)));
   if (!r) return err_to_errno(r.error());
   return static_cast<int>(*r);
+}
+
+int op_flush(const char*, struct fuse_file_info* fi) { return flush_handle(handle_of(fi)); }
+
+int op_release(const char*, struct fuse_file_info* fi) {
+  WriteHandle* h = handle_of(fi);
+  const int rc = flush_handle(h);
+  delete h;
+  if (fi != nullptr) fi->fh = 0;
+  return rc;
 }
 
 int op_truncate(const char* path, OffT size, struct fuse_file_info*) {
@@ -202,7 +261,10 @@ int op_rename(const char* from, const char* to, unsigned int) {
   return r ? 0 : err_to_errno(r.error());
 }
 
-int op_read(const char* path, char* buf, size_t size, OffT offset, struct fuse_file_info*) {
+int op_read(const char* path, char* buf, size_t size, OffT offset, struct fuse_file_info* fi) {
+  if (ctx()->writeback) {
+    if (int rc = flush_handle(handle_of(fi)); rc != 0) return rc;  // never read stale bytes
+  }
   const std::string rel = to_rel(path);
   const std::uint32_t want = static_cast<std::uint32_t>(std::min<size_t>(size, 16u << 20));
   auto data = ctx()->root->read(rel, static_cast<std::uint64_t>(offset), want);
@@ -226,7 +288,7 @@ int op_statfs(const char*, StatvfsT* st) {
   return 0;
 }
 
-int op_fsync(const char*, int, struct fuse_file_info*) { return 0; }
+int op_fsync(const char*, int, struct fuse_file_info* fi) { return flush_handle(handle_of(fi)); }
 
 void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
   cfg->kernel_cache = 0;
@@ -252,6 +314,8 @@ fuse_operations make_ops() {
   ops.rename = op_rename;
   ops.statfs = op_statfs;
   ops.fsync = op_fsync;
+  ops.flush = op_flush;
+  ops.release = op_release;
   return ops;
 }
 
@@ -259,13 +323,14 @@ fuse_operations make_ops() {
 
 FuseMount::~FuseMount() { unmount(); }
 
-Result<void> FuseMount::mount(const std::string& mountpoint) {
+Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
 #ifdef _WIN32
   if (!load_winfsp_dll()) return fail(Errc::Unsupported);
 #endif
 
   static Context context;  // FUSE keeps a single mount per process here
   context.root = &root_;
+  context.writeback = writeback;
   static fuse_operations ops = make_ops();
 
   struct fuse_args args = FUSE_ARGS_INIT(0, nullptr);

@@ -55,7 +55,10 @@ pushed invalidations. **Read-write**: create, write, append, truncate, mkdir, re
 on the drive letter are written through to ext4 (verified by mounting a WSL tree, writing from Windows,
 and reading the bytes back inside WSL). ext4 names illegal on Windows (`: ? * < > | "`, control chars,
 a trailing dot/space) are mapped to the Unicode private-use area (the WSL/Cygwin convention) so they
-appear and round-trip on the drive. Built via the FUSE3 API, so the same mount serves Linux
+appear and round-trip on the drive. Pass `--writeback` to coalesce a file's writes and flush them on
+`fsync`/close (fewer round-trips for write-heavy work such as build output; durability is at close
+rather than per write). **Hardlinks** are currently reported as independent files (`st_nlink` is not
+preserved) — a known limitation. Built via the FUSE3 API, so the same mount serves Linux
 (Direction B) later. The mount target builds only when WinFsp is detected, so CI and non-Windows builds
 are unaffected. Set `WSLDRIVE_FUSE_DEBUG=1` to log WinFsp FUSE operations.
 
