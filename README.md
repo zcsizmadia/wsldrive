@@ -85,6 +85,30 @@ paths from the mount and from sync.
 **Non-goals:** replacing `/mnt/c` (wsldrive mounts alongside it); general-purpose bidirectional sync;
 kernel drivers or signing beyond WinFsp's.
 
+## Install
+
+The installer sets everything up and confirms each choice with you first — drive letter, distro, paths,
+and whether to restart WSL — so that after a reboot the drive(s) mount automatically with no manual
+tweaking. From an elevated PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1        # interactive: asks + confirms
+```
+
+It installs the binaries, checks for (or chain-installs) WinFsp, registers the Hyper-V socket services,
+restarts WSL once (with your OK), and registers an at-logon task that mounts on every boot and
+re-discovers the dynamic WSL VM GUID each time. Useful flags:
+
+```powershell
+scripts\install.ps1 -DryRun          # print the full plan, change nothing
+scripts\install.ps1 -Unattended -DriveLetter W -Distro Ubuntu -WslRoot '~' -Yes
+scripts\install.ps1 -Uninstall       # remove tasks + registration + binaries
+```
+
+The one-time steps that need elevation (driver, HKLM registry) and the single `wsl --shutdown` are all
+performed *by the installer* — the only thing you supply is what to mount where. To run wsldrive
+manually instead of installing, use the commands below.
+
 ## Usage
 
 ### Direction A — mount a WSL ext4 tree as a Windows drive
