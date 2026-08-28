@@ -72,6 +72,27 @@ scripts\install.ps1 -Unattended -DriveLetter W -WinRoot C:\projects -Mountpoint 
 scripts\install.ps1 -Uninstall       # remove tasks + registration + binaries
 ```
 
+### Several mounts at once (multiple distros)
+
+Pass a config file and each entry becomes its own mount, with its own port and its own
+logon task — so multiple drives and multiple distros coexist:
+
+```powershell
+scripts\install.ps1 -Config wsldrive.json
+```
+```json
+{ "mounts": [
+    { "drive": "W", "distro": "Ubuntu", "wslRoot": "~" },
+    { "drive": "Y", "distro": "Debian", "wslRoot": "~/work" },
+    { "winRoot": "C:/projects", "mountpoint": "~/win", "distro": "Ubuntu" }
+] }
+```
+
+`direction` is inferred (`drive` → A, `winRoot` → B) and `port` is auto-assigned unless you set
+it. Colliding drive letters, ports, or task names are rejected up front. See
+[`wsldrive.example.json`](wsldrive.example.json). Re-running the installer stops the old mounts,
+replaces the binaries, removes tasks the new config no longer defines, and starts the new set.
+
 ### 3. Build the installer from source
 
 ```powershell

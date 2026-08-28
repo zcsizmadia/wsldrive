@@ -1,0 +1,26 @@
+{
+  "//": "Example wsldrive config. Install several mounts at once with:",
+  "//install": "powershell -ExecutionPolicy Bypass -File scripts\\install.ps1 -Config wsldrive.json",
+
+  "mounts": [
+    {
+      "//": "Direction A: a WSL folder as a Windows drive letter (the common case).",
+      "drive": "W",
+      "distro": "Ubuntu",
+      "wslRoot": "~"
+    },
+    {
+      "//": "A second distro, its own drive letter and its own port (auto-assigned if omitted).",
+      "drive": "Y",
+      "distro": "Debian",
+      "wslRoot": "~/work"
+    },
+    {
+      "//": "Direction B (advanced): a Windows folder mounted inside WSL - a Linux path, not a drive letter.",
+      "winRoot": "C:/projects",
+      "mountpoint": "~/win",
+      "distro": "Ubuntu",
+      "hvsocket": true
+    }
+  ]
+}
