@@ -26,6 +26,9 @@ inline constexpr std::uint16_t kVersion = 1;
 inline constexpr std::size_t kHeaderSize = 24;
 inline constexpr std::uint32_t kMaxPayload = 64u << 20;  // 64 MiB per frame
 
+// FrameHeader::flags bits.
+inline constexpr std::uint32_t kFlagMore = 0x1;  // more frames follow for this response (streamed reply)
+
 enum class MsgType : std::uint16_t {
   Hello = 1,
   HelloAck = 2,

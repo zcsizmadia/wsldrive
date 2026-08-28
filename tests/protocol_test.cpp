@@ -229,6 +229,44 @@ TEST(Messages, ErrorRoundTrip) {
   EXPECT_EQ(e->detail, "no such file");
 }
 
+// Feeds pseudo-random buffers to every decoder to prove they never read out of
+// bounds or loop: each must return a value or an Errc, and consume no more than
+// the input. Deterministic PRNG so failures reproduce.
+TEST(Fuzz, DecodersAreBounded) {
+  std::uint64_t state = 0x123456789abcdef0ULL;
+  auto next = [&] {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  for (int iter = 0; iter < 20000; ++iter) {
+    const std::size_t n = next() % 300;
+    std::vector<std::byte> buf(n);
+    for (auto& b : buf) b = static_cast<std::byte>(next() & 0xFF);
+
+    (void)decode_header(buf);
+    auto run = [&](auto fn) {
+      Reader r(buf);
+      auto res = fn(r);
+      EXPECT_LE(r.position(), buf.size());
+      (void)res;
+    };
+    run([](Reader& r) { return read_hello(r); });
+    run([](Reader& r) { return read_attributes(r); });
+    run([](Reader& r) { return read_snapshot_header(r); });
+    run([](Reader& r) { return read_snapshot_entry(r); });
+    run([](Reader& r) { return read_invalidation(r); });
+    run([](Reader& r) { return read_read_request(r); });
+    run([](Reader& r) { return read_read_response(r); });
+    run([](Reader& r) { return read_write_request(r); });
+    run([](Reader& r) { return read_create_request(r); });
+    run([](Reader& r) { return read_rename_request(r); });
+    run([](Reader& r) { return read_truncate_request(r); });
+    run([](Reader& r) { return read_error(r); });
+  }
+}
+
 TEST(Frame, WriteFrameFillsHeader) {
   std::vector<std::byte> buf;
   write_frame(buf, MsgType::Hello, 42, [](Writer& w) { write_hello(w, Hello{.agent = "t"}); });

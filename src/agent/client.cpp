@@ -50,27 +50,23 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
 
 Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
   const auto t0 = std::chrono::steady_clock::now();
-  auto p = request(proto::MsgType::SnapshotRequest, {}, timeout);
+  auto p = request(proto::MsgType::SnapshotRequest, {}, timeout, /*streaming=*/true);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Snapshot) return fail(Errc::ProtocolError);
+  if (!(*p)->stream_ok) return fail(Errc::Corrupt);
 
-  std::vector<SnapshotEntry> entries;
-  proto::Reader r((*p)->payload);
-  auto hdr = proto::read_snapshot_header(r);
-  if (!hdr) return fail(hdr.error());
-  entries.reserve(hdr->count);
-  for (std::uint32_t i = 0; i < hdr->count; ++i) {
-    auto e = proto::read_snapshot_entry(r);
-    if (!e) return fail(e.error());
-    entries.push_back(*e);
-  }
+  // Names were copied per frame; point each entry at its owned string now that
+  // the accumulation vector will not grow again.
+  auto& names = (*p)->snap_names;
+  auto& entries = (*p)->snap_entries;
+  for (std::size_t i = 0; i < entries.size(); ++i) entries[i].name = names[i];
   {
     std::unique_lock lock(tree_mu_);
     if (auto res = tree_.load_snapshot(entries); !res) return res;
   }
   std::lock_guard lock(stats_mu_);
-  stats_.generation = hdr->generation;
-  stats_.snapshot_bytes = (*p)->payload.size();
+  stats_.generation = (*p)->snap_generation;
+  stats_.snapshot_bytes = (*p)->snap_bytes;
   stats_.last_snapshot_time = std::chrono::steady_clock::now() - t0;
   return {};
 }
@@ -207,10 +203,11 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
 }
 
 Result<std::shared_ptr<RemoteRoot::Pending>> RemoteRoot::request(proto::MsgType type, std::span<const std::byte> payload,
-                                                                std::chrono::milliseconds timeout) {
+                                                                std::chrono::milliseconds timeout, bool streaming) {
   if (closed_) return fail(Errc::ConnectionClosed);
   const std::uint64_t id = next_request_.fetch_add(1);
   auto pending = std::make_shared<Pending>();
+  pending->streaming = streaming;
   {
     std::lock_guard lock(pending_mu_);
     pending_.emplace(id, pending);
@@ -245,15 +242,55 @@ void RemoteRoot::reader_loop() {
       apply_invalidation(f->payload);
       continue;
     }
+    const bool streamed_chunk = f->header.type == proto::MsgType::Snapshot;
     std::shared_ptr<Pending> pending;
     {
       std::lock_guard lock(pending_mu_);
-      if (auto it = pending_.find(f->header.request_id); it != pending_.end()) {
-        pending = it->second;
-        pending_.erase(it);
-      }
+      const auto it = pending_.find(f->header.request_id);
+      if (it == pending_.end()) continue;  // late reply to a timed-out request
+      pending = it->second;
+      // A streaming snapshot stays registered until it completes (handled below);
+      // every other reply completes on this single frame.
+      if (!(pending->streaming && streamed_chunk)) pending_.erase(it);
     }
-    if (!pending) continue;  // late reply to a timed-out request
+
+    if (pending->streaming && streamed_chunk) {
+      bool complete = false;
+      {
+        std::lock_guard lock(pending->mu);
+        pending->snap_bytes += f->payload.size();
+        proto::Reader r(f->payload);
+        if (auto hdr = proto::read_snapshot_header(r)) {
+          pending->snap_generation = hdr->generation;
+          for (std::uint32_t i = 0; i < hdr->count; ++i) {
+            auto e = proto::read_snapshot_entry(r);
+            if (!e) {
+              pending->stream_ok = false;
+              break;
+            }
+            pending->snap_names.emplace_back(e->name);
+            pending->snap_entries.push_back(SnapshotEntry{e->parent, {}, e->attr});
+          }
+        } else {
+          pending->stream_ok = false;
+        }
+        const bool more = (f->header.flags & proto::kFlagMore) != 0;
+        if (!more || !pending->stream_ok) {
+          pending->type = proto::MsgType::Snapshot;
+          pending->done = true;
+          complete = true;
+        }
+      }
+      if (complete) {
+        {
+          std::lock_guard lock(pending_mu_);
+          pending_.erase(f->header.request_id);
+        }
+        pending->cv.notify_one();
+      }
+      continue;
+    }
+
     {
       std::lock_guard lock(pending->mu);
       pending->type = f->header.type;

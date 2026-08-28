@@ -24,6 +24,9 @@ class RootServer {
     std::filesystem::path root;
     bool watch = true;
     Coalescer::Options coalescer{};
+    // Snapshot replies are split into frames of about this many payload bytes so
+    // arbitrarily large trees are not bound by the single-frame limit.
+    std::size_t snapshot_chunk_bytes = 4u << 20;
   };
 
   explicit RootServer(Options opts);

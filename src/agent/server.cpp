@@ -280,25 +280,40 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
 }
 
 Result<void> RootServer::send_snapshot(std::uint64_t request_id, net::FrameChannel& ch) {
-  std::vector<std::byte> frame;
-  frame.reserve(1u << 20);
-  std::uint32_t count = 0;
-  std::size_t count_pos = 0;
   const std::uint64_t gen = generation_.load();
-  Result<ScanStats> scanned;
-  proto::write_frame(frame, proto::MsgType::Snapshot, request_id, [&](proto::Writer& w) {
-    proto::write_snapshot_header(w, gen, 0);
-    count_pos = w.size() - 4;
-    scanned = scan_tree(opts_.root, [&](const SnapshotEntry& e) {
-      proto::write_snapshot_entry(w, e);
-      ++count;
-    });
-    w.patch_u32(count_pos, count);
+  const std::size_t budget = opts_.snapshot_chunk_bytes;
+
+  // Each frame is self-describing: SnapshotHeader{gen, entries-in-this-frame}
+  // followed by that many entries. The kFlagMore flag is set on every frame but
+  // the last, so the client accumulates until it sees a frame without it.
+  std::vector<std::byte> entries;  // encoded entries buffered for the current frame
+  std::uint32_t count = 0;
+  Result<void> send_rc{};
+
+  auto flush = [&](bool more) -> Result<void> {
+    std::vector<std::byte> frame;
+    proto::write_frame(
+        frame, proto::MsgType::Snapshot, request_id,
+        [&](proto::Writer& w) {
+          proto::write_snapshot_header(w, gen, count);
+          w.raw(entries);
+        },
+        more ? proto::kFlagMore : 0u);
+    entries.clear();
+    count = 0;
+    return ch.send_raw(frame);
+  };
+
+  auto scanned = scan_tree(opts_.root, [&](const SnapshotEntry& e) {
+    if (!send_rc) return;  // a previous flush failed; stop buffering
+    proto::Writer w(entries);
+    proto::write_snapshot_entry(w, e);
+    ++count;
+    if (entries.size() >= budget) send_rc = flush(/*more=*/true);
   });
   if (!scanned) return send_error(request_id, scanned.error(), "scan failed", ch);
-  if (frame.size() - proto::kHeaderSize > proto::kMaxPayload)
-    return send_error(request_id, Errc::TooLarge, "tree exceeds one frame; chunked snapshots not yet implemented", ch);
-  return ch.send_raw(frame);
+  if (!send_rc) return send_rc;
+  return flush(/*more=*/false);  // final frame (possibly empty) terminates the stream
 }
 
 Result<void> RootServer::send_read(const net::Frame& f, net::FrameChannel& ch) {
