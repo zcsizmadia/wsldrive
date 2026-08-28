@@ -13,7 +13,27 @@ namespace wsld::agent {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
-RootServer::RootServer(Options opts) : opts_(std::move(opts)), coalescer_(opts_.coalescer) {}
+RootServer::RootServer(Options opts) : opts_(std::move(opts)), coalescer_(opts_.coalescer) {
+  // Load .wsldriveignore from the served root, if present.
+  std::error_code ec;
+  const fs::path ignore_file = opts_.root / ".wsldriveignore";
+  if (fs::is_regular_file(ignore_file, ec)) {
+    if (std::FILE* fp =
+#ifdef _WIN32
+            _wfopen(ignore_file.c_str(), L"rb")
+#else
+            std::fopen(ignore_file.c_str(), "rb")
+#endif
+    ) {
+      std::string text;
+      char buf[4096];
+      std::size_t n;
+      while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) text.append(buf, n);
+      std::fclose(fp);
+      ignore_ = IgnoreRules::parse(text);
+    }
+  }
+}
 
 RootServer::~RootServer() { stop(); }
 
@@ -68,6 +88,11 @@ void RootServer::flush_loop() {
     batch.generation = generation_.fetch_add(1) + 1;
     batch.ops.reserve(planned.size());
     for (PlannedOp& op : planned) {
+      // Ignored paths are absent from the client's tree; skip their events. (Kind
+      // does not tell us dir vs file for removes, so test both interpretations.)
+      if (!ignore_.empty() && op.kind != InvalidationKind::Rescan &&
+          (ignore_.ignored(op.path, /*is_dir=*/false) || ignore_.ignored(op.path, /*is_dir=*/true)))
+        continue;
       proto::InvalidationOp out;
       out.kind = op.kind;
       out.path = std::move(op.path);
@@ -304,13 +329,17 @@ Result<void> RootServer::send_snapshot(std::uint64_t request_id, net::FrameChann
     return ch.send_raw(frame);
   };
 
-  auto scanned = scan_tree(opts_.root, [&](const SnapshotEntry& e) {
-    if (!send_rc) return;  // a previous flush failed; stop buffering
-    proto::Writer w(entries);
-    proto::write_snapshot_entry(w, e);
-    ++count;
-    if (entries.size() >= budget) send_rc = flush(/*more=*/true);
-  });
+  auto scanned = scan_tree(
+      opts_.root,
+      [&](const SnapshotEntry& e) {
+        if (!send_rc) return;  // a previous flush failed; stop buffering
+        proto::Writer w(entries);
+        proto::write_snapshot_entry(w, e);
+        ++count;
+        if (entries.size() >= budget) send_rc = flush(/*more=*/true);
+      },
+      ignore_.empty() ? agent::SkipPredicate{}
+                      : [this](std::string_view rel, bool is_dir) { return ignore_.ignored(rel, is_dir); });
   if (!scanned) return send_error(request_id, scanned.error(), "scan failed", ch);
   if (!send_rc) return send_rc;
   return flush(/*more=*/false);  // final frame (possibly empty) terminates the stream

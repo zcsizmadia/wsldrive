@@ -3,6 +3,7 @@ add_executable(core_tests
   content_cache_test.cpp
   flat_map_test.cpp
   hash_test.cpp
+  ignore_test.cpp
   metadata_tree_test.cpp
   path_test.cpp
   protocol_test.cpp
