@@ -19,6 +19,7 @@
 #include "platform/win/wsl_launch.hpp"
 #endif
 #if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
+#include "platform/linux/win_launch.hpp"
 #include <csignal>
 #endif
 
@@ -41,6 +42,10 @@ void usage() {
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
       "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback]   (attach to a running agent)\n"
+#endif
+#if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
+      "  wsldrive mount <dir> --win-root <winpath> --win-agent <wsldrived.exe> [--hvsocket [--vm-guid G]]\n"
+      "                                                       (Direction B: serve a Windows path into WSL)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_WINFSP
       "  wsldrive mount <drive> --distro <name> --wsl-root <path> [--agent <path>] [--port N]\n"
@@ -154,7 +159,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     const std::string mountpoint = argv[2];
-    std::string connect, listen, distro, wsl_root, agent_path;
+    std::string connect, listen, distro, wsl_root, agent_path, win_root, win_agent;
     std::uint32_t port = 51789;
     bool have_distro = false;
     bool writeback = false;
@@ -171,6 +176,10 @@ int main(int argc, char** argv) {
         hvsocket = true;
       else if (a == "--vm-guid")
         vm_guid = val();
+      else if (a == "--win-root")
+        win_root = val();
+      else if (a == "--win-agent")
+        win_agent = val();
       else if (a == "--writeback")
         writeback = true;
       else if (a == "--distro") {
@@ -225,7 +234,7 @@ int main(int argc, char** argv) {
       if (hvsocket) std::this_thread::sleep_for(std::chrono::milliseconds(2500));
     } else
 #endif
-        if (connect.empty() && listen.empty()) {
+        if (connect.empty() && listen.empty() && win_root.empty()) {
       usage();
       return 2;
     }
@@ -244,7 +253,36 @@ int main(int argc, char** argv) {
     (void)port;
     (void)hvsocket;
     (void)vm_guid;
+    (void)win_root;
+    (void)win_agent;
     (void)have_distro;
+
+#if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
+    // Direction B: this WSL client listens and auto-launches the Windows agent
+    // (via interop) to serve a Windows path and dial back in.
+    std::string win_agent_connect;
+    wsld::platform::WinAgent win_proc;
+    if (!win_root.empty()) {
+      if (win_agent.empty()) {
+        std::fprintf(stderr, "wsldrive: --win-agent <path-to-wsldrived.exe> is required with --win-root\n");
+        return 2;
+      }
+      if (hvsocket && port == 51789) port = 5700;
+      if (hvsocket) {
+        std::string guid = vm_guid.empty() ? wsld::platform::discover_wsl_vm_guid() : vm_guid;
+        if (guid.empty()) {
+          std::fprintf(stderr, "wsldrive: could not determine the WSL VM GUID; pass --vm-guid <guid>\n");
+          return 2;
+        }
+        listen = "vsock://any:" + std::to_string(port);
+        win_agent_connect = "hv://{" + guid + "}:" + std::to_string(port);
+      } else {
+        listen = "tcp://0.0.0.0:" + std::to_string(port);
+        win_agent_connect = "tcp://127.0.0.1:" + std::to_string(port);
+      }
+    }
+#endif
+
     std::string source;
     wsld::Result<wsld::net::Socket> sock = wsld::fail(wsld::Errc::ConnectionClosed);
     if (!listen.empty()) {
@@ -264,6 +302,18 @@ int main(int argc, char** argv) {
       source = l->local().to_string();
       std::printf("waiting for agent on %s ...\n", source.c_str());
       std::fflush(stdout);
+#if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
+      // The listener is up, so launch the Windows agent to dial back in now (an
+      // AF_HYPERV connect would block if it were started before we were listening).
+      if (!win_agent_connect.empty()) {
+        if (auto r = win_proc.start({.exe = win_agent, .win_root = win_root, .connect = win_agent_connect}); !r) {
+          std::fprintf(stderr, "wsldrive: failed to launch Windows agent '%s'\n", win_agent.c_str());
+          return 1;
+        }
+        std::printf("launched Windows agent serving %s over %s\n", win_root.c_str(), hvsocket ? "hvsocket" : "tcp");
+        std::fflush(stdout);
+      }
+#endif
       while (!g_mount_stop.load()) {
         auto s = l->accept(std::chrono::milliseconds(200));
         if (s) {

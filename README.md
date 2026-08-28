@@ -2,115 +2,176 @@
 
 [![CI](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml/badge.svg)](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml)
 
-Native-speed file access across the WSL2 boundary, in both directions:
+**Cross the WSL2 filesystem boundary at native speed — in both directions.**
 
-- **Direction A (primary):** mount a WSL2 ext4 path as a real Windows drive letter so
-  Windows-only tools (Visual Studio, GitHub Desktop, Explorer, Unity, ...) stop paying the
-  `\\wsl.localhost` Plan 9 tax.
-- **Direction B (secondary, benchmark-gated):** a cached view of Windows drives inside WSL2.
+Anyone doing real work in WSL2 hits the same wall: files on the *other* side of the VM boundary are
+slow. Opening a WSL source tree from Visual Studio or Explorer crawls over `\\wsl.localhost`; a Linux
+build reading `/mnt/c` stalls on every file. It's the single most common WSL2 complaint, and it taxes
+every edit-build-test loop that spans the two worlds.
 
-See [plan.md](plan.md) for the design, semantics table, benchmark targets and roadmap.
+`wsldrive` makes that boundary disappear. It keeps the whole directory tree's metadata in RAM on the
+side that's reading, caches file contents, and moves bytes over a **Hyper-V socket** instead of the OS's
+network filesystem — so cross-boundary access runs **5–15× faster on reads** (more on metadata) than the
+paths Windows and WSL ship:
 
-## Status
+|   | today (OS path) | with wsldrive | speedup |
+|---|--:|--:|--:|
+| **Windows reading WSL files** (read 3000 files) | 2856 ms (`\\wsl.localhost`) | 366 ms | **~8×** |
+| **WSL reading Windows files** (read 3000 files) | 5853 ms (`/mnt/c`) | 383 ms | **~15×** |
+| directory walk, either direction | 100–400 ms | ~12–39 ms | **~3–30×** |
 
-Early. The platform-independent core is implemented and tested:
+Both directions are read-write and mount *alongside* the built-in paths — nothing to replace, no kernel
+driver of its own (WinFsp on Windows, libfuse3 in WSL). Full numbers in [`bench/RESULTS.md`](bench/RESULTS.md).
 
-| module | purpose |
+- **Direction A — WSL2 ext4 as a Windows drive letter.** Windows-only tools (Visual Studio, GitHub
+  Desktop, Explorer/Search, Unity, Office) reach a WSL source tree without paying the `\\wsl.localhost`
+  Plan 9 tax.
+- **Direction B — a Windows drive mounted inside WSL2.** Linux tools read/write an NTFS tree without the
+  `/mnt/c` 9P/virtiofs tax.
+
+WSL2 only. WSL1 has no VM boundary (DrvFs runs in the NT kernel, `\\wsl$` is served in-process), so it
+has neither problem and is unsupported by design.
+
+## How it works
+
+Two small user-space binaries, no kernel drivers of wsldrive's own:
+
+- **`wsldrived`** — the *agent*: serves a directory tree (snapshot, file contents, writes) and watches
+  it for changes (`ReadDirectoryChangesW`+IOCP on Windows, inotify on Linux), pushing coalesced
+  invalidations.
+- **`wsldrive`** — the *client*: mounts the served tree as a filesystem (WinFsp on Windows, libfuse3 in
+  WSL, one FUSE3 implementation) backed by an in-RAM metadata mirror and a content cache.
+
+Either binary can host either role, so the same code serves both directions — the direction is just
+which side runs the agent and which runs the mount.
+
+**Metadata in RAM.** The whole tree (names, sizes, mtimes, mode→attributes) loads on mount and stays
+coherent via pushed invalidations, so `stat`/`readdir`/`open`/negative lookups never cross the boundary.
+
+**Content cache + read-ahead.** Small files are cached whole in RAM (BLAKE3-addressed, LRU, invalidated
+on change); on a read miss the file's directory is bulk-fetched in one `ReadMany` round-trip, so a
+sequential reader pays one request per directory, not per file.
+
+**Writes** are write-through by default (durability = the source filesystem); `--writeback` coalesces a
+file's writes and flushes on `fsync`/close for write-heavy work.
+
+### Transport
+
+The wire protocol is a small framed binary protocol (24-byte little-endian header + payload) over a
+stream socket. Two transports:
+
+- **Hyper-V sockets** (`AF_HYPERV` on Windows, `AF_VSOCK` in WSL) — the fast path. WSL2 routes hvsocket
+  host→guest, so the **WSL side listens** (`vsock://any:<port>`) and the **Windows side connects**
+  (`hv://{<wsl-vm-guid>}:<port>`). Not IP, so no firewall involvement. This is what makes the
+  WSL→Windows direction fast; see [Enabling hvsocket](#enabling-the-hyper-v-socket-transport).
+- **Loopback TCP** — the fallback (works in NAT and mirrored WSL networking). Fast for Windows→WSL
+  (Direction A); slow for the WSL→Windows request path, which is why Direction B wants hvsocket.
+
+### Semantics (ext4 ↔ Windows)
+
+| ext4 | Windows view |
 |---|---|
-| `core/metadata_tree` | in-RAM directory tree: O(1) child lookup, case-insensitive view, readdir, snapshots |
-| `core/string_pool`, `core/flat_map` | interned names and an open-addressing (parent, name) → node index |
-| `core/protocol` | 24-byte framed, little-endian wire format with zero-copy decoding |
-| `core/coalescer` | collapses watcher event bursts into minimal ordered invalidation batches |
-| `core/content_cache` | content-addressed (BLAKE3) on-disk cache with atomic writes and LRU eviction |
-| `core/unicode`, `core/path` | locale-independent case folding, path normalisation |
+| case-sensitive names | case-preserving; case-colliding siblings flagged, the shadowed one hidden |
+| symlinks | reported as symlinks/reparse points |
+| mode bits | synthesised attributes (`READONLY` when no write bit); no ACL emulation |
+| ns mtime | truncated to 100 ns |
+| hard links | reported as independent files (`st_nlink` not preserved) — known limitation |
+| names illegal on Windows (`: ? * < > \| "`, control chars, trailing dot/space) | mapped to U+F0xx (WSL/Cygwin convention), round-tripping |
+| sockets / fifos / devices | hidden |
 
-### Mounting (Direction A)
+A `.wsldriveignore` at the served root (gitignore-style: `node_modules/`, `*.log`, `/build`, …) excludes
+paths from the mount and from sync.
 
-With [WinFsp](https://winfsp.dev) installed (runtime **and** the Developer/SDK feature), a WSL2
-ext4 tree can be mounted as a Windows drive letter:
+**Non-goals:** replacing `/mnt/c` (wsldrive mounts alongside it); general-purpose bidirectional sync;
+kernel drivers or signing beyond WinFsp's.
+
+## Usage
+
+### Direction A — mount a WSL ext4 tree as a Windows drive
+
+Requires [WinFsp](https://winfsp.dev) (runtime **and** the Developer/SDK feature). From any PowerShell:
 
 ```powershell
-# One command: wsldrive launches the agent inside the distro and mounts it.
-wsldrive mount W: --distro Ubuntu --wsl-root ~/project
-
-# Check the environment first (WinFsp + WSL):
-wsldrive doctor
-
-# Or attach to an already-running agent:
-#   in WSL:      wsldrived --root ~/project --listen tcp://0.0.0.0:7788
-#   on Windows:  wsldrive mount W: --connect tcp://127.0.0.1:7788
+wsldrive doctor                                            # check WinFsp + WSL
+wsldrive mount W: --distro Ubuntu --wsl-root ~/project     # launches the agent in the distro, mounts W:
+wsldrive mount W: --distro Ubuntu --wsl-root ~/project --hvsocket   # ... over Hyper-V sockets
 ```
 
-With `--distro`, `wsldrive` starts `wsldrived` in the distro over `wsl.exe`, waits for it to
-listen, mounts, and tears the agent down on exit (the agent also self-terminates if the Windows
-side goes away). Ctrl+C unmounts cleanly.
+`--distro` auto-launches `wsldrived` in the distro over `wsl.exe`, mounts, and tears it down on exit
+(the agent self-terminates if the Windows side goes away). Ctrl+C unmounts cleanly. To attach to an
+agent you started yourself: `wsldrive mount W: --connect tcp://127.0.0.1:7788`.
 
-Add `--hvsocket` to use the **Hyper-V socket transport** instead of loopback TCP — the agent listens
-on `vsock` and the client connects over `AF_HYPERV`, bypassing the localhost relay. This is what makes
-the WSL→Windows direction fast (see `bench/RESULTS.md`). One-time setup: run
-`scripts/register-hvsocket.ps1` elevated and `wsl --shutdown`. The WSL VM GUID is discovered via
-`hcsdiag` (Hyper-V admin) or passed with `--vm-guid`.
+### Direction B — mount a Windows drive inside WSL
 
-Drop a `.wsldriveignore` at the served root (gitignore-style: `node_modules/`, `*.log`, `/build`, ...)
-to exclude directories from the mounted view and from sync — handy for keeping build output and vendored
-trees off the drive.
-
-Metadata (`dir`, `stat`, directory listing) is served from the client's in-RAM mirror with no
-round-trips; file contents are fetched over the socket on demand; live edits in WSL propagate via
-pushed invalidations. **Read-write**: create, write, append, truncate, mkdir, rename, unlink and rmdir
-on the drive letter are written through to ext4 (verified by mounting a WSL tree, writing from Windows,
-and reading the bytes back inside WSL). ext4 names illegal on Windows (`: ? * < > | "`, control chars,
-a trailing dot/space) are mapped to the Unicode private-use area (the WSL/Cygwin convention) so they
-appear and round-trip on the drive. Pass `--writeback` to coalesce a file's writes and flush them on
-`fsync`/close (fewer round-trips for write-heavy work such as build output; durability is at close
-rather than per write). **Hardlinks** are currently reported as independent files (`st_nlink` is not
-preserved) — a known limitation. Built via the FUSE3 API, so the same mount serves Linux
-(Direction B) later. The mount target builds only when WinFsp is detected, so CI and non-Windows builds
-are unaffected. Set `WSLDRIVE_FUSE_DEBUG=1` to log WinFsp FUSE operations.
-
-### Direction B (Windows drive cached in WSL, experimental)
-
-The mount is built on the FUSE3 API, so the same implementation runs in WSL via libfuse3:
+One command, run in WSL (launches the Windows agent via interop and mounts over hvsocket):
 
 ```bash
-# on Windows: serve a Windows path
-wsldrived.exe --root C:\path\to\project --listen tcp://0.0.0.0:7788
-# in WSL: mount it
-wsldrive mount /mnt/win --connect tcp://<windows-host>:7788
+wsldrive mount /tmp/win --win-root 'C:/project' \
+  --win-agent /mnt/c/path/to/wsldrived.exe --hvsocket
 ```
 
-It is functional (read/write across the transport, live invalidations via the Windows-side
-`ReadDirectoryChangesW` watcher) and verified end-to-end. It is **gated and experimental**: reads
-currently go over the socket rather than a local cache, so it does not yet beat `virtiofs=true` for
-`/mnt/c`. For fast Linux access to Windows files today, enable virtiofs; Direction B becomes a
-worthwhile replacement once the read-cache layer lands.
+Or attach to an agent started on Windows yourself:
 
-Platform layers (Hyper-V socket transport) continue in later phases.
+```bash
+# on Windows:  wsldrived.exe --root C:\project --listen tcp://0.0.0.0:7788
+# in WSL:      wsldrive mount /tmp/win --connect tcp://127.0.0.1:7788
+```
 
-### Baseline micro-benchmarks
+### Enabling the Hyper-V socket transport
 
-`core_bench`, MSVC 19.42 RelWithDebInfo, 20-thread laptop CPU @ 2.8 GHz, 2026-08-27. Synthetic tree =
-100 modules × 10 components × 100 files (100k files, 1.1k directories).
+WSL2 only routes registered hvsocket services, so once per machine:
+
+1. `powershell -ExecutionPolicy Bypass -File scripts\register-hvsocket.ps1` **(elevated)** — registers
+   the vsock service GUIDs (ports 5700–5709).
+2. `wsl --shutdown` so the VM picks them up.
+3. The WSL VM GUID is discovered automatically via `hcsdiag` (needs Hyper-V admin) or passed with
+   `--vm-guid <guid>`.
+
+## Benchmarks
+
+Real-world cross-boundary numbers from `scripts/bench-real.ps1` on this dev machine (3000 small files
+across 60 dirs; median warm run, ms; "native" = the same workload run locally on the owning OS — the
+floor). Full methodology and notes in [`bench/RESULTS.md`](bench/RESULTS.md).
+
+**Direction A — Windows reading a WSL2 ext4 tree:**
+
+| scenario | walk (enumerate) | read (all bytes) |
+|---|--:|--:|
+| native (in WSL, reference) | 4 ms | 39 ms |
+| `\\wsl.localhost` (Plan 9) | 104 ms | 2856 ms |
+| **wsldrive drive** | **39 ms** | **cold 574 / warm 366 ms** |
+
+**Direction B — WSL reading a Windows NTFS tree:**
+
+| scenario | walk (enumerate) | read (all bytes) |
+|---|--:|--:|
+| native (on Windows, reference) | 10 ms | 118 ms |
+| `/mnt/c` (9P) | 119 ms | 5853 ms |
+| `/mnt/c` (virtiofs=true) | 406 ms | 7686 ms |
+| **wsldrive over hvsocket** | **12 ms** | **cold 621 / warm 383 ms** |
+
+So ~2.7× walk / ~5–8× read vs `\\wsl.localhost` (Direction A), and ~10× vs both `/mnt/c` transports
+(Direction B) — with near-native metadata in both directions. Core micro-benchmarks (`core_bench`,
+RelWithDebInfo):
 
 | operation | time |
 |---|---|
-| path lookup, 3 components, exact hit | ~150–180 ns |
-| path lookup, case-insensitive, wrong case | ~220 ns |
-| negative lookup (name unknown anywhere) | ~140 ns |
-| negative lookup (name exists in another dir) | ~100 ns |
-| readdir, 100 entries (attrs + names) | ~150 ns |
-| upsert existing path / insert+remove churn | ~230 ns / ~130 ns |
+| path lookup, 3 components | ~150 ns |
+| readdir, 100 entries | ~150 ns |
 | (parent,name)→node probe, 1M entries, hit / miss | 15 ns / 14 ns (`std::unordered_map`: 44 ns) |
-| snapshot encode / streaming decode, 100k entries | 2.5 ms / 3.2 ms (36 bytes per entry) |
-| snapshot decode + build tree, 100k entries | ~27 ms |
+| snapshot encode / decode, 100k entries | 2.5 ms / 3.2 ms (36 bytes/entry) |
 | coalesce 30k watcher events (10k-file checkout) | ~7 ms |
-| BLAKE3, 1 MiB / 16 MiB | 4.4 GiB/s |
+| BLAKE3 | 4.4 GiB/s |
 
-Run them yourself with `.\scripts\build.ps1 -Bench`.
+Run them with `.\scripts\build.ps1 -Bench`, or the end-to-end suite with `.\scripts\bench-real.ps1`.
 
 ## Build
 
-Windows (Visual Studio 2022, from any PowerShell):
+Modern C++23, CMake ≥ 3.28 + presets; dependencies (GoogleTest, Google Benchmark, BLAKE3) are fetched by
+CMake with pinned hashes. Builds warning-clean under `/W4` (MSVC) and `-Wall -Wextra -Wpedantic
+-Wconversion …` (GCC), warnings-as-errors including the linker.
+
+Windows (Visual Studio 2022):
 
 ```powershell
 .\scripts\build.ps1            # configure + build + unit tests (RelWithDebInfo)
@@ -120,8 +181,17 @@ Windows (Visual Studio 2022, from any PowerShell):
 WSL2 (Ubuntu 22.04+ / Debian 12+):
 
 ```bash
-sudo ./scripts/wsl-setup.sh
+sudo ./scripts/wsl-setup.sh    # build-essential, cmake, ninja, libfuse3-dev
 cmake --preset linux-release && cmake --build --preset linux-release && ctest --preset linux-release
 ```
 
-Dependencies (GoogleTest, Google Benchmark, BLAKE3) are fetched by CMake at configure time.
+The WinFsp mount builds only when WinFsp is detected (Windows); the libfuse3 mount only when libfuse3 is
+detected (Linux) — so CI and minimal builds are unaffected.
+
+## Layout
+
+`src/core` — platform-independent library (metadata tree, string pool, framed protocol, coalescer,
+content cache, ignore rules, name escaping, path utils), all unit-tested. `src/net` — sockets
+(TCP/vsock/hvsocket) and the framed channel. `src/platform` — watchers and process launchers per OS.
+`src/agent` — the scanner, `RootServer`, and the `RemoteRoot` client. `src/mount` — the FUSE3 mount.
+`src/tools` — the `wsldrive` and `wsldrived` binaries. `tests`, `bench`, `scripts` as named.
