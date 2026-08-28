@@ -17,6 +17,9 @@
 #ifndef LinuxBin
   #define LinuxBin "..\build\linux-release\src\tools\wsldrive"
 #endif
+#ifndef LinuxAgent
+  #define LinuxAgent "..\build\linux-release\src\tools\wsldrived"
+#endif
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
@@ -46,8 +49,10 @@ Source: "{#BinDir}\wsldrived.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\scripts\install.ps1";          DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\register-hvsocket.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
-; The Linux client is optional (Direction B); include it if it was built.
-Source: "{#LinuxBin}"; DestDir: "{app}"; DestName: "wsldrive-linux"; Flags: ignoreversion skipifsourcedoesntexist
+; The Linux binaries are optional; include them if built. wsldrive-linux is the
+; client (Direction B); wsldrived-linux is the agent that serves the WSL tree (Direction A).
+Source: "{#LinuxBin}";   DestDir: "{app}"; DestName: "wsldrive-linux";  Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#LinuxAgent}"; DestDir: "{app}"; DestName: "wsldrived-linux"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Code]
 var
@@ -58,7 +63,8 @@ var
 { Run a command line, capture stdout as a string (via a temp file). }
 function RunCapture(const CmdLine: string): string;
 var
-  Tmp, Content: string;
+  Tmp: string;
+  Content: AnsiString;   // LoadStringFromFile takes an AnsiString (var), not String
   Res: Integer;
 begin
   Result := '';
@@ -66,7 +72,7 @@ begin
   if Exec(ExpandConstant('{cmd}'), '/C ' + CmdLine + ' > "' + Tmp + '" 2>NUL',
           '', SW_HIDE, ewWaitUntilTerminated, Res) then
     if LoadStringFromFile(Tmp, Content) then
-      Result := Content;
+      Result := String(Content);
 end;
 
 function DefaultDistro(): string;
@@ -99,11 +105,11 @@ begin
     'What should wsldrive set up?',
     'Pick the directions to mount. You can re-run this installer to change them.',
     'Each selected direction is mounted automatically at every logon.', False, False);
-  PageChoices.Add('Mount a WSL folder as a Windows drive letter (Direction A)');
-  PageChoices.Add('Mount a Windows folder inside WSL (Direction B)');
-  PageChoices.Add('Use Hyper-V sockets (fast transport) — recommended');
-  PageChoices.Add('Restart WSL now if needed (closes running WSL sessions)');
-  PageChoices.Values[0] := True;
+  PageChoices.Add('Mount a WSL folder as a Windows drive letter (recommended)');
+  PageChoices.Add('Advanced: also mount a Windows folder inside WSL (Direction B)');
+  PageChoices.Add('Use Hyper-V sockets for Direction B (recommended)');
+  PageChoices.Add('Restart WSL now if Direction B needs it (closes running WSL sessions)');
+  PageChoices.Values[0] := True;   { Direction A on by default (easy mode) }
   PageChoices.Values[2] := True;
   PageChoices.Values[3] := True;
 
@@ -190,6 +196,8 @@ begin
   begin
     dl := Uppercase(Trim(PageA.Values[0])); StringChangeEx(dl, ':', '', True);
     a := a + ' -DriveLetter ' + dl + ' -WslRoot "' + Trim(PageA.Values[2]) + '"';
+    if FileExists(ExpandConstant('{app}\wsldrived-linux')) then
+      a := a + ' -LinuxAgent "' + ExpandConstant('{app}\wsldrived-linux') + '"';
   end;
   if PageChoices.Values[1] then
   begin
@@ -207,16 +215,18 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
-    { Hand off to the script for registration, scheduled tasks, and (Direction B)
-      staging the Linux client into WSL — see -LinuxBin in BuildArgs. }
+    { Hand off to the script: it copies binaries, stages the Linux agent/client
+      into WSL, registers hvsocket (Direction B), and creates the logon tasks. }
     if not Exec('powershell.exe', BuildArgs(), '', SW_SHOW, ewWaitUntilTerminated, Res) then
       MsgBox('Setup could not run install.ps1.', mbError, MB_OK)
     else if Res <> 0 then
       MsgBox('install.ps1 exited with code ' + IntToStr(Res) + '. See its output.', mbInformation, MB_OK);
 
-    if PageChoices.Values[2] and PageChoices.Values[3] then
+    { A WSL restart is only needed for Direction B over hvsocket (Direction A uses
+      loopback TCP). Offer it only then. }
+    if PageChoices.Values[1] and PageChoices.Values[2] and PageChoices.Values[3] then
     begin
-      if MsgBox('Restart WSL now so the fast transport takes effect? '
+      if MsgBox('Restart WSL now so the Hyper-V socket transport takes effect? '
                 + 'This closes running WSL sessions.', mbConfirmation, MB_YESNO) = IDYES then
         Exec(ExpandConstant('{cmd}'), '/C wsl.exe --shutdown', '', SW_HIDE, ewWaitUntilTerminated, Res);
     end;

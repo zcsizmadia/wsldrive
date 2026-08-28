@@ -24,13 +24,17 @@ $ErrorActionPreference = 'Stop'
 $root    = Split-Path -Parent $PSScriptRoot
 $iss     = Join-Path $root 'installer\wsldrive.iss'
 $binDir  = Join-Path $root "build\msvc-$Config\src\tools"
-$linux   = Join-Path $root 'build\linux-release\src\tools\wsldrive'
+$linux   = Join-Path $root 'build\linux-release\src\tools\wsldrive'    # client (Direction B)
+$linuxAgent = Join-Path $root 'build\linux-release\src\tools\wsldrived' # agent (Direction A)
 
 if (-not (Test-Path (Join-Path $binDir 'wsldrive.exe'))) {
   throw "wsldrive.exe not found in $binDir. Build first: .\scripts\build.ps1 -Config $Config"
 }
 if (-not (Test-Path $linux)) {
   Write-Host "[warn] Linux client not found ($linux); the installer will omit Direction B support." -ForegroundColor Yellow
+}
+if (-not (Test-Path $linuxAgent)) {
+  Write-Host "[warn] Linux agent not found ($linuxAgent); the installer will omit Direction A auto-launch." -ForegroundColor Yellow
 }
 
 function Find-Iscc {
@@ -64,6 +68,7 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 & $iscc `
   "/DBinDir=$binDir" `
   "/DLinuxBin=$linux" `
+  "/DLinuxAgent=$linuxAgent" `
   "/DAppVersion=$Version" `
   $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }

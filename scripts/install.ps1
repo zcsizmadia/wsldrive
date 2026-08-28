@@ -33,6 +33,7 @@
 [CmdletBinding()]
 param(
   [switch] $Unattended,                       # no prompts; use the values below / defaults
+  [switch] $Advanced,                         # also offer Direction B (mount a Windows folder in WSL)
   [switch] $Yes,                              # auto-confirm destructive steps (WSL restart)
   [switch] $DryRun,                           # print the plan, change nothing
   [switch] $Uninstall,                        # remove tasks + binaries + registration
@@ -44,11 +45,12 @@ param(
   [string] $DriveLetter,                      # e.g. W  (empty in -Unattended => skip Direction A)
   [string] $Distro,                           # WSL distro (default: the WSL default distro)
   [string] $WslRoot = '~',                    # path inside the distro to serve
+  [string] $LinuxAgent,                       # Linux wsldrived (agent) to stage into WSL (Direction A)
 
   # Direction B: mount a Windows path inside WSL
   [string] $WinRoot,                          # e.g. C:\projects  (empty => skip Direction B)
   [string] $Mountpoint = '~/win',             # mount point inside the distro
-  [string] $LinuxBin,                         # Linux wsldrive binary to stage into WSL (Direction B)
+  [string] $LinuxBin,                         # Linux wsldrive (client) to stage into WSL (Direction B)
 
   [switch] $NoHvsocket,                       # use loopback TCP instead of Hyper-V sockets
   [switch] $NoShutdown,                        # never run `wsl --shutdown` (installer drives this)
@@ -168,7 +170,21 @@ $srcAgent = if ($BinDir) { Join-Path $BinDir 'wsldrived.exe' } else { '' }
 if (-not (Test-Path $srcCli) -or -not (Test-Path $srcAgent)) {
   throw "Could not find wsldrive.exe / wsldrived.exe. Build first (.\scripts\build.ps1) or pass -BinDir."
 }
-$linuxCli = if ($LinuxBin) { $LinuxBin } else { Join-Path $root 'build\linux-release\src\tools\wsldrive' }  # Direction B
+$linuxCli   = if ($LinuxBin)   { $LinuxBin }   else { Join-Path $root 'build\linux-release\src\tools\wsldrive' }   # Direction B client
+$linuxAgent = if ($LinuxAgent) { $LinuxAgent } else { Join-Path $root 'build\linux-release\src\tools\wsldrived' }  # Direction A agent
+
+# Copy a Windows-side Linux binary into the distro at an absolute path under the
+# user's home, and return that WSL path. (Absolute, not ~, because the agent path
+# is passed through single-quoting downstream where ~ would not expand.)
+function Stage-Into-Wsl([string]$srcWin, [string]$name, [string]$wslHome) {
+  $staged = "$env:LOCALAPPDATA\wsldrive\$name"
+  New-Item -ItemType Directory -Force -Path (Split-Path $staged) | Out-Null
+  Copy-Item -Force $srcWin $staged
+  $srcWsl = To-WslPath $staged
+  $dest = "$wslHome/.local/bin/$name"
+  & wsl.exe -d $distro -- bash -lc "mkdir -p '$wslHome/.local/bin' && cp '$srcWsl' '$dest' && chmod +x '$dest'" 2>$null
+  return $dest
+}
 
 # ===========================================================================
 # 1. Gather + confirm configuration
@@ -193,17 +209,23 @@ if ($Unattended) {
   }
 }
 
-# Direction B
+# Direction B (advanced): mounts a Windows folder *inside WSL* (a Linux path, not
+# a drive letter). Only offered in advanced mode; easy mode is Direction A only.
 $doB = $false
 if ($Unattended) {
-  $doB = [bool]$WinRoot
-} else {
-  $doB = AskYN 'Mount a Windows folder inside WSL (Direction B)?' ([bool]$WinRoot)
+  $doB = [bool]$WinRoot   # passing -WinRoot opts into Direction B
+} elseif ($Advanced -or $WinRoot) {
+  $doB = AskYN 'Advanced: also mount a Windows folder inside WSL (Direction B)?' ([bool]$WinRoot)
   if ($doB) {
     $WinRoot = Ask 'Windows folder to expose (e.g. C:\projects)' $WinRoot
     $Mountpoint = Ask 'Mount point inside the distro' $Mountpoint
     if (-not $distro) { $distro = Ask 'WSL distro to mount into' (Get-DefaultDistro) }
   }
+}
+if ($doA -and -not (Test-Path $linuxAgent)) {
+  Warn "Direction A needs the Linux build of the agent (wsldrived) at:`n         $linuxAgent"
+  Warn "Build it in WSL:  cmake --preset linux-release && cmake --build --preset linux-release"
+  if (-not (AskYN 'Continue and set up Direction A anyway (the task will fail until it exists)?' $false)) { $doA = $false }
 }
 if ($doB -and -not (Test-Path $linuxCli)) {
   Warn "Direction B needs the Linux build of wsldrive at:`n         $linuxCli"
@@ -213,23 +235,32 @@ if ($doB -and -not (Test-Path $linuxCli)) {
 
 if (-not $doA -and -not $doB) { Warn 'Nothing selected to mount. Exiting.'; exit 0 }
 
-# WSL restart is only needed the first time we register hvsocket services.
-$needShutdown = $useHv
-$agentWslPath = To-WslPath (Join-Path $InstallDir 'wsldrived.exe')
+# Absolute WSL home (agent/client are staged under it); resolved once here.
+$wslHome = if ($distro) { (& wsl.exe -d $distro -- bash -lc 'echo $HOME' 2>$null).Trim() } else { '' }
+
+# Expand a leading ~ in the served WSL root to an absolute path: it is
+# single-quoted when passed to the agent, so ~ would not expand in the distro
+# shell and the agent would try to open a literal "~" directory and exit.
+if ($doA -and $wslHome) {
+  if ($WslRoot -eq '~') { $WslRoot = $wslHome }
+  elseif ($WslRoot -like '~/*') { $WslRoot = $wslHome + $WslRoot.Substring(1) }
+}
+
+# WSL restart is only needed the first time we register hvsocket services, which
+# only happens for Direction B (Direction A uses loopback TCP).
+$needShutdown = $useHv -and $doB
+$agentWslPath = To-WslPath (Join-Path $InstallDir 'wsldrived.exe')  # Windows agent (Direction B), seen from WSL
 
 # ---- confirmation summary --------------------------------------------------
 Step 'Review — this is everything the installer will do'
 Say  "  install dir      : $InstallDir"
 Say  "  binaries         : $srcCli"
-Say  "  transport        : $(if ($useHv) {'Hyper-V sockets (fast)'} else {'loopback TCP'})"
-if ($useHv) { Say "  hvsocket ports   : $FirstPort..$($FirstPort+$PortCount-1)  (HKLM registration)" }
 if ($doA) {
-  Say "  Direction A      : ${letter}:  <=  $distro : $WslRoot"
-  Say "                     auto-start at logon (task '$TaskA')"
+  Say "  Direction A      : ${letter}:  <=  $distro : $WslRoot   (loopback TCP, auto-start '$TaskA')"
 }
 if ($doB) {
-  Say "  Direction B      : $distro : $Mountpoint  <=  $WinRoot"
-  Say "                     auto-start at logon (task '$TaskB')"
+  Say "  Direction B      : $distro : $Mountpoint  <=  $WinRoot   ($(if($useHv){'hvsocket'}else{'TCP'}), auto-start '$TaskB')"
+  if ($useHv) { Say "  hvsocket ports   : $FirstPort..$($FirstPort+$PortCount-1)  (HKLM registration)" }
 }
 if (-not (Test-WinFsp)) { Say "  WinFsp           : NOT installed -> $(if ($WinFspMsi) {'will chain-install'} else {'you will be prompted'})" }
 if ($needShutdown) { Say "  WSL restart      : REQUIRED once (closes running WSL sessions) so it picks up the socket registration" }
@@ -273,20 +304,21 @@ if ($sameDir) {
     Copy-Item -Force $srcCli, $srcAgent $InstallDir
   }
 }
+# Stage the Linux binaries into the distro. Direction A needs the agent
+# (wsldrived) to serve the WSL tree; Direction B needs the client (wsldrive).
+$agentInWsl = ''  # absolute path of the staged Linux agent, for the Direction A task
+if ($doA) {
+  Plan "stage Linux wsldrived into ${distro}:$wslHome/.local/bin/wsldrived"
+  if (-not $DryRun -and (Test-Path $linuxAgent)) { $agentInWsl = Stage-Into-Wsl $linuxAgent 'wsldrived' $wslHome }
+}
 if ($doB) {
-  $linuxDest = "$env:LOCALAPPDATA\wsldrive\wsldrive-linux"   # staged where WSL can read it
-  Plan "stage Linux wsldrive -> $linuxDest and copy into ${distro}:~/.local/bin/wsldrive"
-  if (-not $DryRun -and (Test-Path $linuxCli)) {
-    New-Item -ItemType Directory -Force -Path (Split-Path $linuxDest) | Out-Null
-    Copy-Item -Force $linuxCli $linuxDest
-    $linuxSrcWsl = To-WslPath $linuxDest
-    & wsl.exe -d $distro -- bash -lc "mkdir -p ~/.local/bin && cp '$linuxSrcWsl' ~/.local/bin/wsldrive && chmod +x ~/.local/bin/wsldrive" 2>$null
-  }
+  Plan "stage Linux wsldrive into ${distro}:$wslHome/.local/bin/wsldrive"
+  if (-not $DryRun -and (Test-Path $linuxCli)) { [void](Stage-Into-Wsl $linuxCli 'wsldrive' $wslHome) }
 }
 Ok 'Binaries installed.'
 
-# --- hvsocket registration ---
-if ($useHv) {
+# --- hvsocket registration (Direction B only; Direction A uses loopback TCP) ---
+if ($useHv -and $doB) {
   Step 'Hyper-V socket registration'
   Plan "register service GUIDs for ports $FirstPort..$($FirstPort+$PortCount-1)"
   if (-not $DryRun) { & "$PSScriptRoot\register-hvsocket.ps1" -FirstPort $FirstPort -Count $PortCount | Out-Null }
@@ -294,13 +326,17 @@ if ($useHv) {
 }
 
 # --- scheduled tasks (auto-start at logon) ---
-function Register-MountTask([string]$name, [string]$exe, [string]$argline) {
-  Plan "register logon task '$name': $exe $argline"
+# Direction A maps a drive letter, which must be visible to the user's normal
+# (non-elevated) apps, so its task runs at the user's normal level (Limited).
+# Direction B mounts inside WSL and needs Hyper-V admin for VM-GUID discovery, so
+# its task runs Highest — elevation there does not affect any drive letter.
+function Register-MountTask([string]$name, [string]$exe, [string]$argline, [bool]$Elevated) {
+  Plan "register logon task '$name' ($(if($Elevated){'elevated'}else{'normal'})): $exe $argline"
   if ($DryRun) { return }
   $action    = New-ScheduledTaskAction -Execute $exe -Argument $argline
   $trigger   = New-ScheduledTaskTrigger -AtLogOn
   $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-                 -LogonType Interactive -RunLevel Highest
+                 -LogonType Interactive -RunLevel $(if ($Elevated) { 'Highest' } else { 'Limited' })
   $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                  -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
   Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal `
@@ -308,20 +344,23 @@ function Register-MountTask([string]$name, [string]$exe, [string]$argline) {
 }
 
 Step 'Auto-start'
-$hvArg = if ($useHv) { ' --hvsocket' } else { '' }
 if ($doA) {
+  # Direction A is already fast over loopback TCP and needs no VM GUID, so it does
+  # not use hvsocket (which would force an elevated, non-visible drive). Non-elevated.
   $exe = Join-Path $InstallDir 'wsldrive.exe'
-  $arg = "mount ${letter}: --distro $distro --wsl-root $WslRoot$hvArg"
-  Register-MountTask $TaskA $exe $arg
-  Ok "Direction A will mount ${letter}: at logon."
+  $agentArg = if ($agentInWsl) { " --agent $agentInWsl" } elseif ($wslHome) { " --agent $wslHome/.local/bin/wsldrived" } else { '' }
+  $arg = "mount ${letter}: --distro $distro --wsl-root $WslRoot$agentArg"
+  Register-MountTask $TaskA $exe $arg $false
+  Ok "Direction A will mount ${letter}: at logon (loopback TCP)."
 }
 if ($doB) {
   # Runs the Linux client inside WSL; it launches the Windows agent over interop.
+  $hvArgB = if ($useHv) { ' --hvsocket' } else { '' }
   $winRootFwd = $WinRoot -replace '\\','/'
-  $bcmd = "~/.local/bin/wsldrive mount $Mountpoint --win-root '$winRootFwd' --win-agent '$agentWslPath'$hvArg"
+  $bcmd = "~/.local/bin/wsldrive mount $Mountpoint --win-root '$winRootFwd' --win-agent '$agentWslPath'$hvArgB"
   $arg  = "-d $distro -- bash -lc `"mkdir -p $Mountpoint; $bcmd`""
-  Register-MountTask $TaskB 'wsl.exe' $arg
-  Ok "Direction B will mount $Mountpoint at logon."
+  Register-MountTask $TaskB 'wsl.exe' $arg $true
+  Ok "Direction B will mount $Mountpoint at logon$(if($useHv){' (hvsocket)'}else{' (TCP)'})."
 }
 
 # --- WSL restart ---
