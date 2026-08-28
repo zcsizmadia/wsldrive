@@ -1,0 +1,328 @@
+#include "core/protocol.hpp"
+
+#include <cstring>
+
+namespace wsld::proto {
+
+namespace {
+
+inline void put_le(std::byte* p, std::uint64_t v, std::size_t n) noexcept {
+  for (std::size_t i = 0; i < n; ++i) p[i] = static_cast<std::byte>((v >> (8 * i)) & 0xFF);
+}
+
+inline std::uint64_t get_le(const std::byte* p, std::size_t n) noexcept {
+  std::uint64_t v = 0;
+  for (std::size_t i = 0; i < n; ++i) v |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(p[i])) << (8 * i);
+  return v;
+}
+
+}  // namespace
+
+// --- frame header --------------------------------------------------------------
+
+void encode_header(const FrameHeader& h, std::span<std::byte, kHeaderSize> out) noexcept {
+  put_le(out.data() + 0, kMagic, 4);
+  put_le(out.data() + 4, kVersion, 2);
+  put_le(out.data() + 6, static_cast<std::uint16_t>(h.type), 2);
+  put_le(out.data() + 8, h.flags, 4);
+  put_le(out.data() + 12, h.payload_len, 4);
+  put_le(out.data() + 16, h.request_id, 8);
+}
+
+Result<FrameHeader> decode_header(std::span<const std::byte> in) noexcept {
+  if (in.size() < kHeaderSize) return fail(Errc::Truncated);
+  if (get_le(in.data(), 4) != kMagic) return fail(Errc::BadMagic);
+  if (get_le(in.data() + 4, 2) != kVersion) return fail(Errc::UnsupportedVersion);
+  FrameHeader h;
+  h.type = static_cast<MsgType>(get_le(in.data() + 6, 2));
+  h.flags = static_cast<std::uint32_t>(get_le(in.data() + 8, 4));
+  h.payload_len = static_cast<std::uint32_t>(get_le(in.data() + 12, 4));
+  h.request_id = get_le(in.data() + 16, 8);
+  if (h.payload_len > kMaxPayload) return fail(Errc::TooLarge);
+  return h;
+}
+
+// --- Writer ------------------------------------------------------------------------
+
+void Writer::u16(std::uint16_t v) {
+  const std::size_t p = out_.size();
+  out_.resize(p + 2);
+  put_le(out_.data() + p, v, 2);
+}
+
+void Writer::u32(std::uint32_t v) {
+  const std::size_t p = out_.size();
+  out_.resize(p + 4);
+  put_le(out_.data() + p, v, 4);
+}
+
+void Writer::u64(std::uint64_t v) {
+  const std::size_t p = out_.size();
+  out_.resize(p + 8);
+  put_le(out_.data() + p, v, 8);
+}
+
+void Writer::varint(std::uint64_t v) {
+  while (v >= 0x80) {
+    out_.push_back(static_cast<std::byte>((v & 0x7F) | 0x80));
+    v >>= 7;
+  }
+  out_.push_back(static_cast<std::byte>(v));
+}
+
+void Writer::raw(std::span<const std::byte> b) { out_.insert(out_.end(), b.begin(), b.end()); }
+
+void Writer::string(std::string_view s) {
+  varint(s.size());
+  const std::size_t p = out_.size();
+  out_.resize(p + s.size());
+  if (!s.empty()) std::memcpy(out_.data() + p, s.data(), s.size());
+}
+
+void Writer::blob(std::span<const std::byte> b) {
+  varint(b.size());
+  raw(b);
+}
+
+void Writer::patch_u32(std::size_t pos, std::uint32_t v) noexcept { put_le(out_.data() + pos, v, 4); }
+
+// --- Reader ------------------------------------------------------------------------
+
+Result<std::uint8_t> Reader::u8() noexcept {
+  if (remaining() < 1) return fail(Errc::Truncated);
+  return std::to_integer<std::uint8_t>(in_[pos_++]);
+}
+
+Result<std::uint16_t> Reader::u16() noexcept {
+  if (remaining() < 2) return fail(Errc::Truncated);
+  const auto v = static_cast<std::uint16_t>(get_le(in_.data() + pos_, 2));
+  pos_ += 2;
+  return v;
+}
+
+Result<std::uint32_t> Reader::u32() noexcept {
+  if (remaining() < 4) return fail(Errc::Truncated);
+  const auto v = static_cast<std::uint32_t>(get_le(in_.data() + pos_, 4));
+  pos_ += 4;
+  return v;
+}
+
+Result<std::uint64_t> Reader::u64() noexcept {
+  if (remaining() < 8) return fail(Errc::Truncated);
+  const std::uint64_t v = get_le(in_.data() + pos_, 8);
+  pos_ += 8;
+  return v;
+}
+
+Result<std::uint64_t> Reader::varint() noexcept {
+  std::uint64_t v = 0;
+  for (unsigned shift = 0; shift < 64; shift += 7) {
+    if (pos_ >= in_.size()) return fail(Errc::Truncated);
+    const auto b = std::to_integer<std::uint8_t>(in_[pos_++]);
+    v |= static_cast<std::uint64_t>(b & 0x7F) << shift;
+    if ((b & 0x80) == 0) {
+      // The 10th byte may carry at most one payload bit.
+      if (shift == 63 && b > 1) return fail(Errc::Corrupt);
+      return v;
+    }
+  }
+  return fail(Errc::Corrupt);
+}
+
+Result<std::span<const std::byte>> Reader::raw(std::size_t n) noexcept {
+  if (remaining() < n) return fail(Errc::Truncated);
+  auto s = in_.subspan(pos_, n);
+  pos_ += n;
+  return s;
+}
+
+Result<std::string_view> Reader::string() noexcept {
+  auto len = varint();
+  if (!len) return fail(len.error());
+  if (*len > remaining()) return fail(Errc::Truncated);
+  auto s = std::string_view(reinterpret_cast<const char*>(in_.data() + pos_), static_cast<std::size_t>(*len));
+  pos_ += static_cast<std::size_t>(*len);
+  return s;
+}
+
+Result<std::span<const std::byte>> Reader::blob() noexcept {
+  auto len = varint();
+  if (!len) return fail(len.error());
+  if (*len > remaining()) return fail(Errc::Truncated);
+  return raw(static_cast<std::size_t>(*len));
+}
+
+// --- messages ------------------------------------------------------------------------
+
+void write_attributes(Writer& w, const Attributes& a) {
+  w.u8(static_cast<std::uint8_t>(a.kind));
+  w.varint(a.mode);
+  w.varint(a.size);
+  w.i64(a.mtime_ns);
+}
+
+Result<Attributes> read_attributes(Reader& r) noexcept {
+  Attributes a;
+  auto kind = r.u8();
+  if (!kind) return fail(kind.error());
+  if (*kind > static_cast<std::uint8_t>(NodeKind::Other)) return fail(Errc::Corrupt);
+  a.kind = static_cast<NodeKind>(*kind);
+  auto mode = r.varint();
+  if (!mode) return fail(mode.error());
+  if (*mode > 0xFFFFFFFFULL) return fail(Errc::Corrupt);
+  a.mode = static_cast<std::uint32_t>(*mode);
+  auto size = r.varint();
+  if (!size) return fail(size.error());
+  a.size = *size;
+  auto mtime = r.i64();
+  if (!mtime) return fail(mtime.error());
+  a.mtime_ns = *mtime;
+  return a;
+}
+
+void write_hello(Writer& w, const Hello& h) {
+  w.u32(h.protocol_version);
+  w.u64(h.capabilities);
+  w.string(h.agent);
+}
+
+Result<Hello> read_hello(Reader& r) noexcept {
+  Hello h;
+  auto v = r.u32();
+  if (!v) return fail(v.error());
+  h.protocol_version = *v;
+  auto caps = r.u64();
+  if (!caps) return fail(caps.error());
+  h.capabilities = *caps;
+  auto agent = r.string();
+  if (!agent) return fail(agent.error());
+  h.agent = *agent;
+  return h;
+}
+
+void write_snapshot_header(Writer& w, std::uint64_t generation, std::uint32_t count) {
+  w.u64(generation);
+  w.u32(count);
+}
+
+void write_snapshot_entry(Writer& w, const SnapshotEntry& e) {
+  w.u32(e.parent);
+  write_attributes(w, e.attr);
+  w.string(e.name);
+}
+
+Result<SnapshotHeader> read_snapshot_header(Reader& r) noexcept {
+  auto gen = r.u64();
+  if (!gen) return fail(gen.error());
+  auto count = r.u32();
+  if (!count) return fail(count.error());
+  // Each entry is at least 4 (parent) + 1 (kind) + 1 + 1 + 8 + 1 (empty name) bytes.
+  if (static_cast<std::uint64_t>(*count) * 16 > r.remaining()) return fail(Errc::Corrupt);
+  return SnapshotHeader{*gen, *count};
+}
+
+Result<SnapshotEntry> read_snapshot_entry(Reader& r) noexcept {
+  SnapshotEntry e;
+  auto parent = r.u32();
+  if (!parent) return fail(parent.error());
+  e.parent = *parent;
+  auto attr = read_attributes(r);
+  if (!attr) return fail(attr.error());
+  e.attr = *attr;
+  auto name = r.string();
+  if (!name) return fail(name.error());
+  e.name = *name;
+  return e;
+}
+
+void write_invalidation(Writer& w, const InvalidationBatch& b) {
+  w.u64(b.generation);
+  w.varint(b.ops.size());
+  for (const InvalidationOp& op : b.ops) {
+    w.u8(static_cast<std::uint8_t>(op.kind));
+    w.string(op.path);
+    if (op.kind == InvalidationKind::Upsert) write_attributes(w, op.attr);
+  }
+}
+
+Result<InvalidationBatch> read_invalidation(Reader& r) noexcept {
+  InvalidationBatch b;
+  auto gen = r.u64();
+  if (!gen) return fail(gen.error());
+  b.generation = *gen;
+  auto count = r.varint();
+  if (!count) return fail(count.error());
+  if (*count > r.remaining()) return fail(Errc::Corrupt);  // every op is >= 2 bytes
+  b.ops.reserve(static_cast<std::size_t>(*count));
+  for (std::uint64_t i = 0; i < *count; ++i) {
+    InvalidationOp op;
+    auto kind = r.u8();
+    if (!kind) return fail(kind.error());
+    if (*kind > static_cast<std::uint8_t>(InvalidationKind::Rescan)) return fail(Errc::Corrupt);
+    op.kind = static_cast<InvalidationKind>(*kind);
+    auto path = r.string();
+    if (!path) return fail(path.error());
+    op.path.assign(*path);
+    if (op.kind == InvalidationKind::Upsert) {
+      auto attr = read_attributes(r);
+      if (!attr) return fail(attr.error());
+      op.attr = *attr;
+    }
+    b.ops.push_back(std::move(op));
+  }
+  return b;
+}
+
+void write_read_request(Writer& w, const ReadRequest& q) {
+  w.u64(q.offset);
+  w.u32(q.length);
+  w.string(q.path);
+}
+
+Result<ReadRequest> read_read_request(Reader& r) noexcept {
+  ReadRequest q;
+  auto off = r.u64();
+  if (!off) return fail(off.error());
+  q.offset = *off;
+  auto len = r.u32();
+  if (!len) return fail(len.error());
+  q.length = *len;
+  auto path = r.string();
+  if (!path) return fail(path.error());
+  q.path = *path;
+  return q;
+}
+
+void write_read_response(Writer& w, const ReadResponse& p) {
+  w.u64(p.file_size);
+  w.blob(p.data);
+}
+
+Result<ReadResponse> read_read_response(Reader& r) noexcept {
+  ReadResponse p;
+  auto size = r.u64();
+  if (!size) return fail(size.error());
+  p.file_size = *size;
+  auto data = r.blob();
+  if (!data) return fail(data.error());
+  p.data = *data;
+  return p;
+}
+
+void write_error(Writer& w, const ErrorMessage& e) {
+  w.u32(e.code);
+  w.string(e.detail);
+}
+
+Result<ErrorMessage> read_error(Reader& r) noexcept {
+  ErrorMessage e;
+  auto code = r.u32();
+  if (!code) return fail(code.error());
+  e.code = *code;
+  auto detail = r.string();
+  if (!detail) return fail(detail.error());
+  e.detail = *detail;
+  return e;
+}
+
+}  // namespace wsld::proto

@@ -1,0 +1,71 @@
+#pragma once
+
+#include "core/coalescer.hpp"
+#include "core/error.hpp"
+#include "net/frame_channel.hpp"
+#include "platform/watcher.hpp"
+
+#include <atomic>
+#include <condition_variable>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace wsld::agent {
+
+/// Serves one directory tree to any number of connected peers: answers
+/// snapshot and read requests, and pushes coalesced invalidations produced by
+/// the platform watcher.
+class RootServer {
+ public:
+  struct Options {
+    std::filesystem::path root;
+    bool watch = true;
+    Coalescer::Options coalescer{};
+  };
+
+  explicit RootServer(Options opts);
+  ~RootServer();
+  RootServer(const RootServer&) = delete;
+  RootServer& operator=(const RootServer&) = delete;
+
+  /// Starts the watcher/flusher threads. Without a watcher (Unsupported) the
+  /// server still works, only without live invalidations.
+  [[nodiscard]] Result<void> start();
+  void stop();
+
+  /// Handles frames on `ch` until the peer disconnects. Blocking; call from a
+  /// per-connection thread. The channel must outlive the call.
+  void serve(net::FrameChannel& ch);
+
+  [[nodiscard]] bool watching() const noexcept { return watcher_ != nullptr; }
+  [[nodiscard]] std::uint64_t generation() const noexcept { return generation_.load(); }
+  [[nodiscard]] const std::filesystem::path& root() const noexcept { return opts_.root; }
+
+ private:
+  Result<void> handle(const net::Frame& f, net::FrameChannel& ch);
+  Result<void> send_snapshot(std::uint64_t request_id, net::FrameChannel& ch);
+  Result<void> send_read(const net::Frame& f, net::FrameChannel& ch);
+  Result<void> send_error(std::uint64_t request_id, Errc code, std::string_view detail, net::FrameChannel& ch);
+
+  void on_event(const FsEvent& ev);
+  void flush_loop();
+  void broadcast(const std::vector<std::byte>& frame);
+
+  Options opts_;
+  std::atomic<std::uint64_t> generation_{1};
+
+  std::unique_ptr<platform::Watcher> watcher_;
+  std::mutex coalescer_mu_;
+  std::condition_variable coalescer_cv_;
+  Coalescer coalescer_;
+  std::thread flusher_;
+  std::atomic<bool> stopping_{false};
+
+  std::mutex peers_mu_;
+  std::vector<net::FrameChannel*> peers_;
+};
+
+}  // namespace wsld::agent

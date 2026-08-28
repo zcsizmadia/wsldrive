@@ -1,0 +1,19 @@
+BasedOnStyle: Google
+Standard: c++20
+ColumnLimit: 110
+IndentWidth: 2
+AccessModifierOffset: -1
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"core/'
+    Priority: 1
+  - Regex: '^"platform/'
+    Priority: 2
+  - Regex: '^<(gtest|benchmark|blake3)'
+    Priority: 3
+  - Regex: '^<.*'
+    Priority: 4

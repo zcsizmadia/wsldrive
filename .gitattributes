@@ -1,0 +1,7 @@
+# Normalise line endings. Source is LF in the repo; Windows-only scripts keep CRLF,
+# shell scripts stay LF so they run inside WSL2 when the tree is on /mnt/c.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.png binary
+*.jpg binary
