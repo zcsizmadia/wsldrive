@@ -1,11 +1,15 @@
+# build output
 build/
 out/
+.cache/
+
+# IDE / editor
 .vs/
 .vscode/
-.cache/
 *.user
 *.swp
 CMakeUserPresets.json
 
-# transient logs
+# transient logs / captured output
 *.log
+*.err

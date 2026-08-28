@@ -4,6 +4,8 @@
 #include "platform/watcher.hpp"
 #ifdef _WIN32
 #include "platform/win/wsl_launch.hpp"
+#else
+#include "platform/linux/win_launch.hpp"
 #endif
 
 #include <gtest/gtest.h>
@@ -505,6 +507,18 @@ TEST(WslLaunch, BuildsCommand) {
   EXPECT_EQ(v.find("tcp://"), std::string::npos);
 }
 
+#else
+TEST(WinLaunch, BuildsCommand) {
+  const std::string cmd = platform::build_win_agent_command(
+      {.exe = "/mnt/c/wsldrived.exe", .win_root = "C:/proj", .connect = "hv://{guid}:5700"});
+  EXPECT_NE(cmd.find("/mnt/c/wsldrived.exe"), std::string::npos);
+  EXPECT_NE(cmd.find("--root C:/proj"), std::string::npos);
+  EXPECT_NE(cmd.find("--connect hv://{guid}:5700"), std::string::npos);
+  EXPECT_NE(cmd.find("--exit-when-idle"), std::string::npos);
+}
+#endif
+
+#ifdef _WIN32
 TEST(Win32Watcher, ReportsEventsAndStopsCleanly) {
   const fs::path root = fs::temp_directory_path() / "wsldrive-watcher-test";
   fs::remove_all(root);

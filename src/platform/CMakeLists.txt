@@ -8,7 +8,8 @@ if(WIN32)
     win/wsl_launch.cpp)
 else()
   target_sources(wsldrive_platform PRIVATE
-    linux/dir_watcher.cpp)
+    linux/dir_watcher.cpp
+    linux/win_launch.cpp)
 endif()
 
 target_link_libraries(wsldrive_platform PUBLIC wsldrive::core)

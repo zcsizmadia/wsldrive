@@ -38,8 +38,8 @@ than both 9P and virtiofs** on reads and near-native on metadata — well past t
 `/mnt/c` reads are ~50-65× slower than native — the well-known WSL pain.
 Notably, on this machine **`virtiofs=true` did not beat 9P** for these
 workloads (walk 406 ms, read 7686 ms; five warm runs stayed 5.9-9.8 s), and it
-shows no persistent read cache. So the Direction B bar the plan gates against is
-still multi-second — leaving clear room for wsldrive to win once cold reads are
+shows no persistent read cache. So the Direction B bar (virtiofs) is still
+multi-second — leaving clear room for wsldrive to win once cold reads are
 addressed (metadata is already RAM-served; warm reads are cache hits). The
 wsldrive FUSE mount is functional (mounts, reads, writes; verified end-to-end)
 and serves **all metadata from the client's in-RAM mirror**, so `walk`/`stat`
@@ -63,11 +63,21 @@ agent). Setup:
 1. Register the vsock service GUIDs once, elevated (see
    `scripts/register-hvsocket.ps1`) — WSL2 only routes registered services.
 2. Restart WSL (`wsl --shutdown`) so the VM picks up the registered services.
-3. Find the WSL VM GUID (elevated / Hyper-V admin): `hcsdiag list`.
 
-Auto-discovering the VM GUID and a one-flag `--hvsocket` UX (so the manual GUID
-and port aren't needed) is the remaining productionization step. Direction A is
-already fast over plain loopback TCP and does not require this.
+The `--hvsocket` flag then wires everything: the VM GUID is auto-discovered via
+`hcsdiag` (or passed with `--vm-guid`), a registered vsock port is chosen, the
+agent is auto-launched, and the client connects over `AF_HYPERV`:
+
+```powershell
+# Direction A (on Windows): mount a WSL tree over hvsocket
+wsldrive mount W: --distro Ubuntu --wsl-root ~/project --hvsocket
+```
+```bash
+# Direction B (in WSL): mount a Windows tree over hvsocket
+wsldrive mount /tmp/win --win-root 'C:/project' --win-agent /mnt/c/.../wsldrived.exe --hvsocket
+```
+
+Direction A is also fast over plain loopback TCP and does not require hvsocket.
 
 ## Performance work landed
 
