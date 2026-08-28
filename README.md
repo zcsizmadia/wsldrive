@@ -24,7 +24,26 @@ Early. The platform-independent core is implemented and tested:
 | `core/content_cache` | content-addressed (BLAKE3) on-disk cache with atomic writes and LRU eviction |
 | `core/unicode`, `core/path` | locale-independent case folding, path normalisation |
 
-Platform layers (WinFsp, fanotify, Hyper-V sockets) come next.
+### Mounting (Direction A, read-only MVP)
+
+With [WinFsp](https://winfsp.dev) installed (runtime **and** the Developer/SDK feature), a WSL2
+ext4 tree can be mounted as a Windows drive letter:
+
+```powershell
+# in WSL: serve a tree
+wsldrived --root ~/project --listen tcp://0.0.0.0:7788
+
+# on Windows: mount it
+wsldrive mount W: --connect tcp://127.0.0.1:7788
+```
+
+Metadata (`dir`, `stat`, directory listing) is served from the client's in-RAM mirror with no
+round-trips; file contents are fetched over the socket on demand; live edits in WSL propagate via
+pushed invalidations. Read-only for now — write-through is Phase 3. Built via the FUSE3 API, so the
+same mount serves Linux (Direction B) later. The mount target builds only when WinFsp is detected, so
+CI and non-Windows builds are unaffected.
+
+Platform layers (Hyper-V socket transport, fanotify) continue in later phases.
 
 ### Baseline micro-benchmarks
 

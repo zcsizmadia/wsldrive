@@ -7,6 +7,10 @@
 #include "net/frame_channel.hpp"
 #include "net/socket.hpp"
 
+#ifdef WSLDRIVE_HAVE_WINFSP
+#include "mount/fuse_mount.hpp"
+#endif
+
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -19,7 +23,12 @@ namespace {
 
 void usage() {
   std::fputs(
-      "usage: wsldrive fetch (--connect <endpoint> | --listen <endpoint>) [--watch] [--read <path>] [--lookups N]\n",
+      "usage:\n"
+      "  wsldrive fetch (--connect <endpoint> | --listen <endpoint>) [--watch] [--read <path>] [--lookups N]\n"
+#ifdef WSLDRIVE_HAVE_WINFSP
+      "  wsldrive mount <mountpoint> --connect <endpoint>      (e.g. mountpoint = Z:)\n"
+#endif
+      ,
       stderr);
 }
 
@@ -28,7 +37,65 @@ double ms(std::chrono::nanoseconds d) { return std::chrono::duration<double, std
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2 || std::string_view(argv[1]) != "fetch") {
+  const std::string_view command = argc >= 2 ? std::string_view(argv[1]) : std::string_view{};
+
+#ifdef WSLDRIVE_HAVE_WINFSP
+  if (command == "mount") {
+    if (argc < 3) {
+      usage();
+      return 2;
+    }
+    const std::string mountpoint = argv[2];
+    std::string connect;
+    for (int i = 3; i < argc; ++i) {
+      const std::string_view a = argv[i];
+      if (a == "--connect" && i + 1 < argc)
+        connect = argv[++i];
+      else {
+        usage();
+        return 2;
+      }
+    }
+    if (connect.empty()) {
+      usage();
+      return 2;
+    }
+    auto ep = wsld::net::Endpoint::parse(connect);
+    if (!ep) {
+      std::fprintf(stderr, "wsldrive: bad endpoint '%s'\n", connect.c_str());
+      return 2;
+    }
+    auto sock = wsld::net::connect(*ep);
+    if (!sock) {
+      std::fprintf(stderr, "wsldrive: connect failed: %s (os error %d)\n", wsld::to_string(sock.error()),
+                   wsld::net::last_socket_error());
+      return 1;
+    }
+    wsld::agent::RemoteRoot root(std::make_unique<wsld::net::FrameChannel>(std::move(*sock)));
+    if (auto h = root.connect(); !h) {
+      std::fprintf(stderr, "wsldrive: handshake failed: %s\n", wsld::to_string(h.error()));
+      return 1;
+    }
+    if (auto r = root.fetch_snapshot(); !r) {
+      std::fprintf(stderr, "wsldrive: snapshot failed: %s\n", wsld::to_string(r.error()));
+      return 1;
+    }
+    const auto ts = root.with_tree([](const wsld::MetadataTree& t) { return t.stats(); });
+    std::printf("mounting %s (%zu nodes) at %s ...\n", ep->to_string().c_str(), ts.nodes, mountpoint.c_str());
+    wsld::mount::FuseMount fm(root);
+    if (auto r = fm.mount(mountpoint); !r) {
+      std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));
+      return 1;
+    }
+    std::printf("mounted. Ctrl+C to unmount.\n");
+    std::fflush(stdout);
+    while (fm.mounted() && root.connected()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    fm.unmount();
+    return 0;
+  }
+#endif
+
+  if (command != "fetch") {
     usage();
     return 2;
   }
