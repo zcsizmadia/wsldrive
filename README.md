@@ -87,24 +87,23 @@ kernel drivers or signing beyond WinFsp's.
 
 ## Install
 
-The installer sets everything up and confirms each choice with you first — drive letter, distro, paths,
-and whether to restart WSL — so that after a reboot the drive(s) mount automatically with no manual
-tweaking. It installs the binaries, checks for (or chain-installs) WinFsp, registers the Hyper-V socket
-services, restarts WSL once (with your OK), and registers an at-logon task that mounts on every boot and
-re-discovers the dynamic WSL VM GUID each time. The one-time elevation steps (driver, HKLM registry) and
-the single `wsl --shutdown` are all performed *by the installer* — the only thing you supply is what to
-mount where.
+However you install it, the outcome is the same: the installer confirms each choice with you first —
+drive letter, distro, paths, and whether to restart WSL — then does *everything else itself* (installs
+the binaries, checks for / chain-installs WinFsp, registers the Hyper-V socket services, restarts WSL
+once with your OK, and registers an at-logon task that mounts on every boot and re-discovers the dynamic
+WSL VM GUID each time). The one-time elevation steps and the single `wsl --shutdown` are the installer's
+job — the only thing you supply is what to mount where. Pick whichever route below suits you.
 
-**GUI installer** (a wizard; build it with `scripts\build-installer.ps1`, which needs
-[Inno Setup](https://jrsoftware.org/isdl.php)):
+### 1. Download the installer (easiest — no build)
 
-```powershell
-.\scripts\build.ps1                       # build the binaries first
-.\scripts\build-installer.ps1             # -> installer\dist\wsldrive-setup.exe
-```
+Grab **`wsldrive-setup.exe`** from the [latest release](https://github.com/zcsizmadia/wsldrive/releases/latest)
+and run it. It's a wizard: choose the direction(s), confirm the details, done. Each release also ships
+`wsldrive-windows-x64.zip` (raw binaries + the install script, for the route below) and
+`wsldrive-linux-x64` (the Direction B client).
 
-**Script** (same logic, no packaging — for CI, locked-down machines, or preference). From an elevated
-PowerShell:
+### 2. Run the script (no packaging — for CI, locked-down machines, or preference)
+
+Download `wsldrive-windows-x64.zip` (or clone the repo), then from an **elevated** PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1   # interactive: asks + confirms
@@ -113,8 +112,17 @@ scripts\install.ps1 -Unattended -DriveLetter W -Distro Ubuntu -WslRoot '~' -Yes
 scripts\install.ps1 -Uninstall       # remove tasks + registration + binaries
 ```
 
-The GUI is a thin front-end that drives `install.ps1`, so both do exactly the same thing. To run
-wsldrive manually without installing, use the commands below.
+### 3. Build the installer from source
+
+```powershell
+.\scripts\build.ps1                       # build wsldrive.exe / wsldrived.exe first
+.\scripts\build-installer.ps1             # compile the wizard -> installer\dist\wsldrive-setup.exe
+```
+
+`build-installer.ps1` needs [Inno Setup](https://jrsoftware.org/isdl.php) (pass `-InstallInno` to fetch
+it via winget). The GUI wizard is a thin front-end that drives `install.ps1`, so routes 1–3 all do
+exactly the same thing. Releases (and their `wsldrive-setup.exe`) are produced automatically by the
+`Release` workflow on each `v*` tag. To run wsldrive manually without installing, use the commands below.
 
 ## Usage
 
