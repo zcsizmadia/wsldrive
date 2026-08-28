@@ -30,12 +30,15 @@ jobs:
       - name: Build
         run: |
           cmake --preset linux-release
-          cmake --build --preset linux-release --target wsldrive --parallel
-      - name: Upload Linux client
+          # wsldrive = client (Direction B); wsldrived = agent (Direction A auto-launch)
+          cmake --build --preset linux-release --target wsldrive wsldrived --parallel
+      - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
           name: wsldrive-linux
-          path: build/linux-release/src/tools/wsldrive
+          path: |
+            build/linux-release/src/tools/wsldrive
+            build/linux-release/src/tools/wsldrived
           if-no-files-found: error
 
   # -- Windows binaries + installer, then publish the release. -------------
@@ -89,11 +92,21 @@ jobs:
           Write-Host "mount support present."
           exit 0   # ignore wsldrive.exe's usage exit code
 
-      - name: Fetch Linux client
+      - name: Fetch Linux binaries
         uses: actions/download-artifact@v4
         with:
           name: wsldrive-linux
           path: build/linux-release/src/tools
+
+      - name: Verify Linux binaries present
+        shell: pwsh
+        run: |
+          foreach ($f in 'wsldrive','wsldrived') {
+            if (-not (Test-Path "build/linux-release/src/tools/$f")) {
+              throw "Linux $f missing after download — the installer would omit a direction."
+            }
+          }
+          Write-Host "Linux client + agent present."
 
       - name: Build installer
         shell: pwsh
@@ -108,8 +121,9 @@ jobs:
           $z = 'staging\wsldrive-windows-x64.zip'
           Copy-Item build\msvc-release\src\tools\wsldrive.exe,build\msvc-release\src\tools\wsldrived.exe .
           Compress-Archive -Force -DestinationPath $z -Path `
-            wsldrive.exe,wsldrived.exe,scripts\install.ps1,scripts\register-hvsocket.ps1,README.md
-          Copy-Item build\linux-release\src\tools\wsldrive staging\wsldrive-linux-x64
+            wsldrive.exe,wsldrived.exe,scripts\install.ps1,scripts\register-hvsocket.ps1,README.md,LICENSE
+          Copy-Item build\linux-release\src\tools\wsldrive  staging\wsldrive-linux-x64
+          Copy-Item build\linux-release\src\tools\wsldrived staging\wsldrived-linux-x64
 
       - name: Upload build artifacts (always, for inspection)
         uses: actions/upload-artifact@v4
