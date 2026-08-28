@@ -330,6 +330,40 @@ TEST_F(AgentTest, WriteThroughMutations) {
   EXPECT_EQ(c->write("../escape.txt", 0, as_bytes("x")).error(), Errc::InvalidPath);
 }
 
+TEST_F(AgentTest, ReadCacheServesRepeatReads) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  auto str = [](const std::vector<std::byte>& v) {
+    return std::string(reinterpret_cast<const char*>(v.data()), v.size());
+  };
+
+  auto r1 = c->read("README.md", 0, 100);  // seeded "# readme\n"
+  ASSERT_TRUE(r1.has_value());
+  EXPECT_EQ(str(*r1), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_misses, 1u);
+  EXPECT_EQ(c->stats().read_cache_hits, 0u);
+
+  auto r2 = c->read("README.md", 0, 100);  // served from cache
+  ASSERT_TRUE(r2.has_value());
+  EXPECT_EQ(str(*r2), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_hits, 1u);
+
+  auto r3 = c->read("README.md", 2, 4);  // partial slice from cache
+  ASSERT_TRUE(r3.has_value());
+  EXPECT_EQ(str(*r3), "read");
+  EXPECT_EQ(c->stats().read_cache_hits, 2u);
+
+  // A write (even same-size) drops the cache entry; the next read refetches.
+  ASSERT_TRUE(c->write("README.md", 0, as_bytes("XXXXX")).has_value());
+  auto r4 = c->read("README.md", 0, 100);
+  ASSERT_TRUE(r4.has_value());
+  EXPECT_EQ(str(*r4).substr(0, 5), "XXXXX");
+  EXPECT_EQ(c->stats().read_cache_misses, 2u);
+}
+
 TEST_F(AgentTest, ServerDisconnectFailsPendingRequests) {
   auto srv = std::make_unique<LoopbackServer>(root_, false);
   auto client = connect_client(srv->endpoint());
