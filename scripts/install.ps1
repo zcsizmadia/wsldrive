@@ -165,8 +165,9 @@ if (-not $BinDir) {
     if (Test-Path (Join-Path $p 'wsldrive.exe')) { $BinDir = $p; break }
   }
 }
-$srcCli   = if ($BinDir) { Join-Path $BinDir 'wsldrive.exe' }  else { '' }
-$srcAgent = if ($BinDir) { Join-Path $BinDir 'wsldrived.exe' } else { '' }
+$srcCli      = if ($BinDir) { Join-Path $BinDir 'wsldrive.exe' }  else { '' }
+$srcAgent    = if ($BinDir) { Join-Path $BinDir 'wsldrived.exe' } else { '' }
+$srcLauncher = if ($BinDir) { Join-Path $BinDir 'wsldrivew.exe' } else { '' }  # windowless launcher (optional)
 if (-not (Test-Path $srcCli) -or -not (Test-Path $srcAgent)) {
   throw "Could not find wsldrive.exe / wsldrived.exe. Build first (.\scripts\build.ps1) or pass -BinDir."
 }
@@ -298,10 +299,11 @@ $sameDir = (Test-Path $InstallDir) -and ((Resolve-Path $BinDir).Path -eq (Resolv
 if ($sameDir) {
   Ok "Binaries already in place ($InstallDir)."
 } else {
-  Plan "copy wsldrive.exe / wsldrived.exe -> $InstallDir"
+  Plan "copy wsldrive.exe / wsldrived.exe / wsldrivew.exe -> $InstallDir"
   if (-not $DryRun) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Force $srcCli, $srcAgent $InstallDir
+    if (Test-Path $srcLauncher) { Copy-Item -Force $srcLauncher $InstallDir }
   }
 }
 # Stage the Linux binaries into the distro. Direction A needs the agent
@@ -331,9 +333,21 @@ if ($useHv -and $doB) {
 # Direction B mounts inside WSL and needs Hyper-V admin for VM-GUID discovery, so
 # its task runs Highest — elevation there does not affect any drive letter.
 function Register-MountTask([string]$name, [string]$exe, [string]$argline, [bool]$Elevated) {
-  Plan "register logon task '$name' ($(if($Elevated){'elevated'}else{'normal'})): $exe $argline"
+  # Run through the windowless launcher so no console window appears at logon.
+  # (The mount process runs for the life of the mount; a visible console could be
+  # closed by accident, which would unmount the drive.) Fall back to direct exec
+  # if the launcher isn't present.
+  $launcher = Join-Path $InstallDir 'wsldrivew.exe'
+  if (Test-Path $launcher) {
+    $taskExe = $launcher
+    $taskArg = ('"{0}" {1}' -f $exe, $argline)
+  } else {
+    $taskExe = $exe
+    $taskArg = $argline
+  }
+  Plan "register logon task '$name' ($(if($Elevated){'elevated'}else{'normal'}), windowless): $taskExe $taskArg"
   if ($DryRun) { return }
-  $action    = New-ScheduledTaskAction -Execute $exe -Argument $argline
+  $action    = New-ScheduledTaskAction -Execute $taskExe -Argument $taskArg
   $trigger   = New-ScheduledTaskTrigger -AtLogOn
   $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
                  -LogonType Interactive -RunLevel $(if ($Elevated) { 'Highest' } else { 'Limited' })

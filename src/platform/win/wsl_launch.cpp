@@ -4,8 +4,10 @@
 
 #include <windows.h>
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -89,7 +91,44 @@ std::string build_wsl_command(const WslAgentSpec& spec) {
   return cmd;
 }
 
+namespace {
+// True only when `wsl -l -q` succeeds AND does not list `distro` — i.e. the distro
+// is definitely not installed (as opposed to merely not started yet). Returns
+// false on any uncertainty (couldn't enumerate), so callers never fast-fail on a
+// transient early-boot hiccup.
+bool distro_definitely_absent(const std::string& distro) {
+  if (distro.empty()) return false;  // default distro: cannot name-check
+  ::_putenv_s("WSL_UTF8", "1");      // make wsl.exe emit UTF-8, not UTF-16
+  std::FILE* pipe = ::_popen("wsl.exe -l -q 2>NUL", "r");
+  if (pipe == nullptr) return false;
+  std::string out;
+  char buf[512];
+  while (std::fgets(buf, sizeof(buf), pipe) != nullptr) out += buf;
+  const int rc = ::_pclose(pipe);
+  if (rc != 0 || out.empty()) return false;  // could not enumerate -> unknown
+  if (out.size() >= 3 && static_cast<unsigned char>(out[0]) == 0xEF) out.erase(0, 3);  // strip UTF-8 BOM
+  auto lower = [](std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  const std::string want = lower(distro);
+  std::size_t start = 0;
+  for (std::size_t i = 0; i <= out.size(); ++i) {
+    if (i == out.size() || out[i] == '\n') {
+      std::string line(out, start, i - start);
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\0')) line.pop_back();
+      std::size_t b = 0;
+      while (b < line.size() && line[b] == ' ') ++b;
+      if (lower(line.substr(b)) == want) return false;  // present
+      start = i + 1;
+    }
+  }
+  return true;  // enumerated fine, distro not among them
+}
+}  // namespace
+
 bool wait_wsl_ready(const std::string& distro, std::chrono::milliseconds timeout) {
+  if (distro_definitely_absent(distro)) return false;  // fast-fail: not installed
   std::string cmd = "wsl.exe";
   if (!distro.empty()) cmd += " -d " + distro;
   cmd += " -e true";  // succeeds (exit 0) only once the distro is actually up

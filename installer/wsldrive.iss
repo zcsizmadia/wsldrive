@@ -47,6 +47,7 @@ ArchitecturesAllowed=x64compatible
 [Files]
 Source: "{#BinDir}\wsldrive.exe";  DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\wsldrived.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinDir}\wsldrivew.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\scripts\install.ps1";          DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\register-hvsocket.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme

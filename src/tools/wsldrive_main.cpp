@@ -215,7 +215,8 @@ int main(int argc, char** argv) {
       std::printf("waiting for WSL (%s) to be ready...\n", distro.empty() ? "default distro" : distro.c_str());
       std::fflush(stdout);
       if (!wsld::platform::wait_wsl_ready(distro, std::chrono::seconds(90))) {
-        std::fprintf(stderr, "wsldrive: WSL did not become ready within 90s\n");
+        std::fprintf(stderr, "wsldrive: distro '%s' is not available (not installed, or did not start within 90s)\n",
+                     distro.empty() ? "(default)" : distro.c_str());
         return 1;
       }
       // WSL2 routes hvsocket host->guest: the agent listens on vsock and this
