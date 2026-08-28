@@ -1,3 +1,4 @@
+#include "bench_util.hpp"
 #include "core/metadata_tree.hpp"
 #include "synthetic.hpp"
 
@@ -144,7 +145,7 @@ void BM_ExportSnapshot100k(benchmark::State& state) {
     s.tree.export_snapshot([&](const SnapshotEntry& e) { total += e.parent + e.name.size(); });
     benchmark::DoNotOptimize(total);
   }
-  state.SetItemsProcessed(state.iterations() * (big().tree.size() - 1));
+  state.SetItemsProcessed(scaled(state.iterations(), big().tree.size() - 1));
 }
 BENCHMARK(BM_ExportSnapshot100k)->Unit(benchmark::kMillisecond);
 
@@ -157,7 +158,7 @@ void BM_LoadSnapshot100k(benchmark::State& state) {
     (void)t.load_snapshot(entries);
     benchmark::DoNotOptimize(t.size());
   }
-  state.SetItemsProcessed(state.iterations() * entries.size());
+  state.SetItemsProcessed(scaled(state.iterations(), entries.size()));
 }
 BENCHMARK(BM_LoadSnapshot100k)->Unit(benchmark::kMillisecond);
 

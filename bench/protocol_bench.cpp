@@ -1,3 +1,4 @@
+#include "bench_util.hpp"
 #include "core/protocol.hpp"
 #include "synthetic.hpp"
 
@@ -30,8 +31,8 @@ void BM_EncodeSnapshot100k(benchmark::State& state) {
     });
     benchmark::DoNotOptimize(buf.data());
   }
-  state.SetBytesProcessed(static_cast<std::int64_t>(state.iterations() * buf.size()));
-  state.SetItemsProcessed(state.iterations() * (big().tree.size() - 1));
+  state.SetBytesProcessed(scaled(state.iterations(), buf.size()));
+  state.SetItemsProcessed(scaled(state.iterations(), big().tree.size() - 1));
   state.counters["bytes/entry"] = static_cast<double>(buf.size()) / static_cast<double>(big().tree.size() - 1);
 }
 BENCHMARK(BM_EncodeSnapshot100k)->Unit(benchmark::kMillisecond);
@@ -45,8 +46,8 @@ void BM_DecodeSnapshot100kStreaming(benchmark::State& state) {
     benchmark::DoNotOptimize(gen);
     benchmark::DoNotOptimize(total);
   }
-  state.SetBytesProcessed(static_cast<std::int64_t>(state.iterations() * buf.size()));
-  state.SetItemsProcessed(state.iterations() * (big().tree.size() - 1));
+  state.SetBytesProcessed(scaled(state.iterations(), buf.size()));
+  state.SetItemsProcessed(scaled(state.iterations(), big().tree.size() - 1));
 }
 BENCHMARK(BM_DecodeSnapshot100kStreaming)->Unit(benchmark::kMillisecond);
 
@@ -63,7 +64,7 @@ void BM_DecodeSnapshot100kIntoTree(benchmark::State& state) {
     (void)t.load_snapshot(entries);
     benchmark::DoNotOptimize(t.size());
   }
-  state.SetItemsProcessed(state.iterations() * (big().tree.size() - 1));
+  state.SetItemsProcessed(scaled(state.iterations(), big().tree.size() - 1));
 }
 BENCHMARK(BM_DecodeSnapshot100kIntoTree)->Unit(benchmark::kMillisecond);
 
