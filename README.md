@@ -114,9 +114,30 @@ WSL2 only routes registered hvsocket services, so once per machine:
 
 ## Benchmarks
 
-Real-world cross-boundary numbers are in [`bench/RESULTS.md`](bench/RESULTS.md) (short version: Direction
-A ~2.7× walk / ~5× read vs `\\wsl.localhost`; Direction B over hvsocket ~10× vs `/mnt/c` 9P and
-virtiofs). Core micro-benchmarks (`core_bench`, RelWithDebInfo):
+Real-world cross-boundary numbers from `scripts/bench-real.ps1` on this dev machine (3000 small files
+across 60 dirs; median warm run, ms; "native" = the same workload run locally on the owning OS — the
+floor). Full methodology and notes in [`bench/RESULTS.md`](bench/RESULTS.md).
+
+**Direction A — Windows reading a WSL2 ext4 tree:**
+
+| scenario | walk (enumerate) | read (all bytes) |
+|---|--:|--:|
+| native (in WSL, reference) | 4 ms | 39 ms |
+| `\\wsl.localhost` (Plan 9) | 104 ms | 2856 ms |
+| **wsldrive drive** | **39 ms** | **cold 574 / warm 366 ms** |
+
+**Direction B — WSL reading a Windows NTFS tree:**
+
+| scenario | walk (enumerate) | read (all bytes) |
+|---|--:|--:|
+| native (on Windows, reference) | 10 ms | 118 ms |
+| `/mnt/c` (9P) | 119 ms | 5853 ms |
+| `/mnt/c` (virtiofs=true) | 406 ms | 7686 ms |
+| **wsldrive over hvsocket** | **12 ms** | **cold 621 / warm 383 ms** |
+
+So ~2.7× walk / ~5–8× read vs `\\wsl.localhost` (Direction A), and ~10× vs both `/mnt/c` transports
+(Direction B) — with near-native metadata in both directions. Core micro-benchmarks (`core_bench`,
+RelWithDebInfo):
 
 | operation | time |
 |---|---|
