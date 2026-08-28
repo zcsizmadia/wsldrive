@@ -1,0 +1,35 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="wsldrive">
+  <defs>
+    <linearGradient id="bg" x1="16" y1="16" x2="240" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B2A6B"/>
+      <stop offset="0.55" stop-color="#1E63C9"/>
+      <stop offset="1" stop-color="#12C7C7"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="16" y1="16" x2="120" y2="150" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- badge -->
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#sheen)"/>
+
+  <!-- the boundary the data crosses -->
+  <line x1="128" y1="52" x2="128" y2="204" stroke="#ffffff" stroke-opacity="0.30"
+        stroke-width="4" stroke-linecap="round" stroke-dasharray="2 16"/>
+
+  <!-- top arrow: WSL -> Windows (points right), pierces the seam -->
+  <g>
+    <rect x="60" y="96" width="98" height="20" rx="10" fill="#ffffff"/>
+    <path d="M150 78 L196 106 L150 134 Z" fill="#ffffff"/>
+    <rect x="44" y="100" width="12" height="12" rx="6" fill="#ffffff" fill-opacity="0.55"/>
+  </g>
+
+  <!-- bottom arrow: Windows -> WSL (points left), pierces the seam -->
+  <g>
+    <rect x="98" y="140" width="98" height="20" rx="10" fill="#BdF3F3"/>
+    <path d="M106 122 L60 150 L106 178 Z" fill="#BdF3F3"/>
+    <rect x="200" y="144" width="12" height="12" rx="6" fill="#BdF3F3" fill-opacity="0.55"/>
+  </g>
+</svg>
