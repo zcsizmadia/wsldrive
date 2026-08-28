@@ -89,25 +89,32 @@ kernel drivers or signing beyond WinFsp's.
 
 The installer sets everything up and confirms each choice with you first — drive letter, distro, paths,
 and whether to restart WSL — so that after a reboot the drive(s) mount automatically with no manual
-tweaking. From an elevated PowerShell:
+tweaking. It installs the binaries, checks for (or chain-installs) WinFsp, registers the Hyper-V socket
+services, restarts WSL once (with your OK), and registers an at-logon task that mounts on every boot and
+re-discovers the dynamic WSL VM GUID each time. The one-time elevation steps (driver, HKLM registry) and
+the single `wsl --shutdown` are all performed *by the installer* — the only thing you supply is what to
+mount where.
+
+**GUI installer** (a wizard; build it with `scripts\build-installer.ps1`, which needs
+[Inno Setup](https://jrsoftware.org/isdl.php)):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1        # interactive: asks + confirms
+.\scripts\build.ps1                       # build the binaries first
+.\scripts\build-installer.ps1             # -> installer\dist\wsldrive-setup.exe
 ```
 
-It installs the binaries, checks for (or chain-installs) WinFsp, registers the Hyper-V socket services,
-restarts WSL once (with your OK), and registers an at-logon task that mounts on every boot and
-re-discovers the dynamic WSL VM GUID each time. Useful flags:
+**Script** (same logic, no packaging — for CI, locked-down machines, or preference). From an elevated
+PowerShell:
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1   # interactive: asks + confirms
 scripts\install.ps1 -DryRun          # print the full plan, change nothing
 scripts\install.ps1 -Unattended -DriveLetter W -Distro Ubuntu -WslRoot '~' -Yes
 scripts\install.ps1 -Uninstall       # remove tasks + registration + binaries
 ```
 
-The one-time steps that need elevation (driver, HKLM registry) and the single `wsl --shutdown` are all
-performed *by the installer* — the only thing you supply is what to mount where. To run wsldrive
-manually instead of installing, use the commands below.
+The GUI is a thin front-end that drives `install.ps1`, so both do exactly the same thing. To run
+wsldrive manually without installing, use the commands below.
 
 ## Usage
 

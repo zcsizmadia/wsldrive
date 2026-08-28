@@ -48,8 +48,10 @@ param(
   # Direction B: mount a Windows path inside WSL
   [string] $WinRoot,                          # e.g. C:\projects  (empty => skip Direction B)
   [string] $Mountpoint = '~/win',             # mount point inside the distro
+  [string] $LinuxBin,                         # Linux wsldrive binary to stage into WSL (Direction B)
 
   [switch] $NoHvsocket,                       # use loopback TCP instead of Hyper-V sockets
+  [switch] $NoShutdown,                        # never run `wsl --shutdown` (installer drives this)
   [string] $WinFspMsi,                        # path to WinFsp MSI to chain-install if missing
   [int]    $FirstPort = 5700,
   [int]    $PortCount = 10
@@ -166,7 +168,7 @@ $srcAgent = if ($BinDir) { Join-Path $BinDir 'wsldrived.exe' } else { '' }
 if (-not (Test-Path $srcCli) -or -not (Test-Path $srcAgent)) {
   throw "Could not find wsldrive.exe / wsldrived.exe. Build first (.\scripts\build.ps1) or pass -BinDir."
 }
-$linuxCli = Join-Path $root 'build\linux-release\src\tools\wsldrive'  # for Direction B (runs inside WSL)
+$linuxCli = if ($LinuxBin) { $LinuxBin } else { Join-Path $root 'build\linux-release\src\tools\wsldrive' }  # Direction B
 
 # ===========================================================================
 # 1. Gather + confirm configuration
@@ -259,12 +261,17 @@ if ($doA) {
   }
 }
 
-# --- copy binaries ---
+# --- copy binaries (a no-op when a packaged installer already placed them here) ---
 Step 'Install binaries'
-Plan "copy wsldrive.exe / wsldrived.exe -> $InstallDir"
-if (-not $DryRun) {
-  New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-  Copy-Item -Force $srcCli, $srcAgent $InstallDir
+$sameDir = (Test-Path $InstallDir) -and ((Resolve-Path $BinDir).Path -eq (Resolve-Path $InstallDir).Path)
+if ($sameDir) {
+  Ok "Binaries already in place ($InstallDir)."
+} else {
+  Plan "copy wsldrive.exe / wsldrived.exe -> $InstallDir"
+  if (-not $DryRun) {
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Copy-Item -Force $srcCli, $srcAgent $InstallDir
+  }
 }
 if ($doB) {
   $linuxDest = "$env:LOCALAPPDATA\wsldrive\wsldrive-linux"   # staged where WSL can read it
@@ -320,7 +327,7 @@ if ($doB) {
 # --- WSL restart ---
 if ($needShutdown) {
   Step 'Restart WSL'
-  $go = $Yes -or (AskYN 'Restart WSL now so it picks up the socket registration? (closes running WSL sessions)' $true)
+  $go = if ($NoShutdown) { $false } else { $Yes -or (AskYN 'Restart WSL now so it picks up the socket registration? (closes running WSL sessions)' $true) }
   if ($go) {
     Plan 'wsl --shutdown'
     if (-not $DryRun) { & wsl.exe --shutdown }
