@@ -24,9 +24,15 @@ Studio, Explorer, Git for Windows) reaching WSL files.
 |------------------------------|-----------------:|-----------------:|
 | native (on Windows, ref)     |          10 ms   |         118 ms   |
 | `/mnt/c` (9P)                |         119 ms   |        5853 ms   |
+| `/mnt/c` (**virtiofs=true**) |         406 ms   |        7686 ms   |
 | **wsldrive FUSE mount**      | metadata from RAM (see below) | cold: latency-bound; warm: from cache |
 
-`/mnt/c` reads are ~50× slower than native — the well-known WSL pain. The
+`/mnt/c` reads are ~50-65× slower than native — the well-known WSL pain.
+Notably, on this machine **`virtiofs=true` did not beat 9P** for these
+workloads (walk 406 ms, read 7686 ms; five warm runs stayed 5.9-9.8 s), and it
+shows no persistent read cache. So the Direction B bar the plan gates against is
+still multi-second — leaving clear room for wsldrive to win once cold reads are
+addressed (metadata is already RAM-served; warm reads are cache hits). The
 wsldrive FUSE mount is functional (mounts, reads, writes; verified end-to-end)
 and serves **all metadata from the client's in-RAM mirror**, so `walk`/`stat`
 workloads avoid the per-op boundary cost the same way Direction A does.
