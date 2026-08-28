@@ -45,6 +45,10 @@ With `--distro`, `wsldrive` starts `wsldrived` in the distro over `wsl.exe`, wai
 listen, mounts, and tears the agent down on exit (the agent also self-terminates if the Windows
 side goes away). Ctrl+C unmounts cleanly.
 
+Drop a `.wsldriveignore` at the served root (gitignore-style: `node_modules/`, `*.log`, `/build`, ...)
+to exclude directories from the mounted view and from sync — handy for keeping build output and vendored
+trees off the drive.
+
 Metadata (`dir`, `stat`, directory listing) is served from the client's in-RAM mirror with no
 round-trips; file contents are fetched over the socket on demand; live edits in WSL propagate via
 pushed invalidations. **Read-write**: create, write, append, truncate, mkdir, rename, unlink and rmdir

@@ -20,12 +20,18 @@ struct ScanStats {
 /// reported as symlinks, not as their targets.
 [[nodiscard]] Result<Attributes> read_attributes(const std::filesystem::path& p) noexcept;
 
+/// Called with each entry's normalised relative path and directory flag; return
+/// true to exclude it (and, for a directory, everything beneath it).
+using SkipPredicate = std::function<bool(std::string_view rel, bool is_dir)>;
+
 /// Walks `root` breadth-first and emits SnapshotEntry values in the order and
 /// with the parent indices that MetadataTree::load_snapshot expects.
 /// Entry names are UTF-8. `on_entry` may retain nothing: the name view is only
-/// valid for the duration of the call.
+/// valid for the duration of the call. If `skip` is set, matching entries are
+/// omitted (directories are not descended into).
 [[nodiscard]] Result<ScanStats> scan_tree(const std::filesystem::path& root,
-                                          const std::function<void(const SnapshotEntry&)>& on_entry);
+                                          const std::function<void(const SnapshotEntry&)>& on_entry,
+                                          const SkipPredicate& skip = {});
 
 /// Converts a filesystem path component to UTF-8 (identity on POSIX).
 [[nodiscard]] std::string filename_utf8(const std::filesystem::path& p);

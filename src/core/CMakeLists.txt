@@ -2,6 +2,7 @@ add_library(wsldrive_core STATIC
   coalescer.cpp
   content_cache.cpp
   hash.cpp
+  ignore.cpp
   metadata_tree.cpp
   path.cpp
   protocol.cpp

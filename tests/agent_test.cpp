@@ -219,6 +219,28 @@ TEST_F(AgentTest, ScannerReportsSymlinks) {
 }
 #endif
 
+TEST_F(AgentTest, IgnoreRulesExcludeFromSnapshot) {
+  write_file(root_ / ".wsldriveignore", "build/\n*.log\n");
+  fs::create_directories(root_ / "build" / "obj");
+  write_file(root_ / "build" / "obj" / "x.o", "obj");
+  write_file(root_ / "app.log", "log");
+  write_file(root_ / "keep.txt", "keep");
+
+  LoopbackServer srv(root_, /*watch=*/false);  // loads .wsldriveignore at construction
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  c->with_tree([](const MetadataTree& t) {
+    EXPECT_FALSE(t.lookup("build").has_value());
+    EXPECT_FALSE(t.lookup("build/obj/x.o").has_value());
+    EXPECT_FALSE(t.lookup("app.log").has_value());
+    EXPECT_TRUE(t.lookup("keep.txt").has_value());
+    EXPECT_TRUE(t.lookup("README.md").has_value());  // seeded, not ignored
+  });
+}
+
 TEST_F(AgentTest, ChunkedSnapshotReassembles) {
   // Add enough entries that a tiny per-frame budget forces many frames.
   for (int i = 0; i < 200; ++i) write_file(root_ / ("chunk_" + std::to_string(i) + ".dat"), "x");

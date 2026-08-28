@@ -2,6 +2,7 @@
 
 #include "core/coalescer.hpp"
 #include "core/error.hpp"
+#include "core/ignore.hpp"
 #include "net/frame_channel.hpp"
 #include "platform/watcher.hpp"
 
@@ -64,6 +65,7 @@ class RootServer {
   Options opts_;
   std::atomic<std::uint64_t> generation_{1};
 
+  IgnoreRules ignore_;
   std::unique_ptr<platform::Watcher> watcher_;
   std::mutex coalescer_mu_;
   std::condition_variable coalescer_cv_;

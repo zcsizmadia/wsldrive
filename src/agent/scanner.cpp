@@ -82,17 +82,19 @@ Result<Attributes> read_attributes(const fs::path& p) noexcept {
   return a;
 }
 
-Result<ScanStats> scan_tree(const fs::path& root, const std::function<void(const SnapshotEntry&)>& on_entry) {
+Result<ScanStats> scan_tree(const fs::path& root, const std::function<void(const SnapshotEntry&)>& on_entry,
+                            const SkipPredicate& skip) {
   std::error_code ec;
   if (!fs::is_directory(root, ec)) return fail(Errc::NotADirectory);
 
   ScanStats stats;
   struct Pending {
     fs::path path;
+    std::string rel;  // '/'-separated path relative to root ("" for the root)
     std::uint32_t index;
   };
   std::deque<Pending> queue;
-  queue.push_back(Pending{root, 0});
+  queue.push_back(Pending{root, std::string{}, 0});
   std::uint32_t next_index = 1;
   std::string name;
 
@@ -117,11 +119,16 @@ Result<ScanStats> scan_tree(const fs::path& root, const std::function<void(const
         continue;
       }
       name = filename_utf8(e.path());
+      std::string rel = dir.rel.empty() ? name : dir.rel + "/" + name;
+      if (skip && skip(rel, a.kind == NodeKind::Directory)) {
+        ++stats.skipped;
+        continue;
+      }
       on_entry(SnapshotEntry{dir.index, name, a});
       switch (a.kind) {
         case NodeKind::Directory:
           ++stats.directories;
-          queue.push_back(Pending{e.path(), next_index});
+          queue.push_back(Pending{e.path(), std::move(rel), next_index});
           break;
         case NodeKind::File: ++stats.files; break;
         case NodeKind::Symlink: ++stats.symlinks; break;
