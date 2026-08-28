@@ -245,3 +245,8 @@ content cache, ignore rules, name escaping, path utils), all unit-tested. `src/n
 (TCP/vsock/hvsocket) and the framed channel. `src/platform` — watchers and process launchers per OS.
 `src/agent` — the scanner, `RootServer`, and the `RemoteRoot` client. `src/mount` — the FUSE3 mount.
 `src/tools` — the `wsldrive` and `wsldrived` binaries. `tests`, `bench`, `scripts` as named.
+
+## License
+
+[MIT](LICENSE). WinFsp (a runtime dependency for Direction A) is licensed separately under GPLv3 or a
+commercial license and is **not** bundled — the installer chain-installs it from winfsp.dev.

@@ -21,7 +21,7 @@
   #define LinuxAgent "..\build\linux-release\src\tools\wsldrived"
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.9.0"
 #endif
 #define AppName "wsldrive"
 
@@ -34,6 +34,7 @@ DefaultDirName={autopf}\wsldrive
 DefaultGroupName=wsldrive
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\wsldrive.exe
+LicenseFile=..\LICENSE
 OutputBaseFilename=wsldrive-setup
 OutputDir=dist
 Compression=lzma2
@@ -49,6 +50,7 @@ Source: "{#BinDir}\wsldrived.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\scripts\install.ps1";          DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\register-hvsocket.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "..\LICENSE";   DestDir: "{app}"; Flags: ignoreversion
 ; The Linux binaries are optional; include them if built. wsldrive-linux is the
 ; client (Direction B); wsldrived-linux is the agent that serves the WSL tree (Direction A).
 Source: "{#LinuxBin}";   DestDir: "{app}"; DestName: "wsldrive-linux";  Flags: ignoreversion skipifsourcedoesntexist
