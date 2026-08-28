@@ -12,11 +12,13 @@ owning OS — the theoretical floor, shown for reference.
 |-----------------------------|-----------------:|-----------------:|
 | native (in WSL, reference)  |            4 ms  |          39 ms   |
 | `\\wsl.localhost` (Plan 9)  |          104 ms  |        2856 ms   |
-| **wsldrive drive**          |       **39 ms**  |      **538 ms**  |
+| **wsldrive drive**          |       **39 ms**  |  **cold 574 / warm 366 ms** |
 
-**wsldrive is ~2.7× faster on metadata (walk) and ~5.3× faster on reads than the
+**wsldrive is ~2.7× faster on metadata (walk) and ~5–8× faster on reads than the
 `\\wsl.localhost` Plan 9 path** — the everyday path for Windows tools (Visual
-Studio, Explorer, Git for Windows) reaching WSL files.
+Studio, Explorer, Git for Windows) reaching WSL files. Reads are served with
+directory read-ahead (one bulk request per directory) and, once warm, from the
+in-RAM cache.
 
 ## Direction B — WSL accessing a Windows NTFS tree
 
@@ -37,12 +39,20 @@ wsldrive FUSE mount is functional (mounts, reads, writes; verified end-to-end)
 and serves **all metadata from the client's in-RAM mirror**, so `walk`/`stat`
 workloads avoid the per-op boundary cost the same way Direction A does.
 
-**Honest limitation:** the mount currently fetches file *contents* one file per
-request. Over the higher-latency WSL→Windows path a *cold* bulk read of many
-files is dominated by per-request round-trips; the read cache only accelerates
-*repeat* reads. Bulk **read-ahead / request pipelining** is the next
-optimization and is what would let Direction B beat `/mnt/c` on cold reads too.
-Until then, enable `virtiofs=true` for fast cold `/mnt/c` access.
+**Transport is the Direction B bottleneck.** Reads now use directory read-ahead
+(one bulk `ReadMany` request per directory instead of one per file) — verified
+to work on Direction A, where the same code path reads 3000 files cold in
+574 ms. But over the **WSL→Windows** path, each request/response round-trip
+costs on the order of *seconds* through the WSL2 localhost-forwarding relay
+(this machine runs `networkingMode=mirrored`), so even a handful of bulk
+round-trips is slow. Read-ahead cuts the round-trip *count*; it cannot fix a
+multi-second-per-trip transport.
+
+The fix is the **Hyper-V socket transport** (`AF_VSOCK`/`AF_HYPERV`, already
+scaffolded in `net/socket`), which bypasses the TCP/relay path and talks
+guest↔host directly. That is the next work for Direction B; until it lands, use
+`virtiofs=true` for `/mnt/c`. Direction A is unaffected — its transport
+(Windows→WSL loopback) is already sub-millisecond, which is why it is fast today.
 
 ## Performance work landed
 
@@ -52,3 +62,6 @@ Until then, enable `virtiofs=true` for fast cold `/mnt/c` access.
 - **All metadata in RAM** on the accessing side (already in the design): `stat`,
   `readdir`, negative lookups never cross the boundary — the source of the
   Direction A walk win and the Direction B metadata win.
+- **Directory read-ahead**: on a read miss, the file's directory is bulk-fetched
+  in one `ReadMany` request (with an async prefetcher for large directories), so
+  a sequential reader pays one round-trip per directory rather than per file.

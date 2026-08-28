@@ -1,5 +1,7 @@
 #include "agent/client.hpp"
 
+#include "core/path.hpp"
+
 #include <algorithm>
 #include <utility>
 
@@ -15,10 +17,16 @@ void RemoteRoot::close() {
   // destructor must always join the reader, never skip it.
   closed_.store(true);
   std::call_once(cleanup_, [this] {
+    {
+      std::lock_guard lock(pf_mu_);
+      pf_stop_.store(true);
+    }
+    pf_cv_.notify_all();
     ch_->shutdown();
     ch_->close();
     if (reader_.joinable()) reader_.join();
-    fail_all_pending();
+    fail_all_pending();  // releases any in-flight prefetch read_many request
+    if (prefetch_.joinable()) prefetch_.join();
   });
 }
 
@@ -34,6 +42,7 @@ RemoteRoot::Stats RemoteRoot::stats() const {
 
 Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
   if (!reader_.joinable()) reader_ = std::thread([this] { reader_loop(); });
+  if (!prefetch_.joinable()) prefetch_ = std::thread([this] { prefetch_loop(); });
   std::vector<std::byte> payload;
   proto::Writer w(payload);
   proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion, .capabilities = 0, .agent = "wsldrive/0.1"});
@@ -123,27 +132,166 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
     }
   }
 
-  // Miss: fetch the whole file once, cache it, then serve the requested slice.
-  auto whole = read_remote(path, 0, static_cast<std::uint32_t>(size), timeout);
-  if (!whole) return whole;
+  // Miss: synchronous read-ahead. Fetch the target plus its uncached small
+  // siblings in one bulk round-trip so a sequential reader over a directory pays
+  // one request per directory, not one per file. The async prefetcher then picks
+  // up any siblings beyond this batch.
+  const std::string target(path);
+  const std::string dir(split_parent(path).first);
+  std::vector<std::string> batch{target};
+  std::vector<std::pair<std::int64_t, std::uint64_t>> meta{{mtime, size}};
+  std::uint64_t bytes = size;
   {
-    std::lock_guard lock(rcache_mu_);
-    if (const auto it = rcache_.find(path); it != rcache_.end()) rcache_bytes_ -= it->second.data.size();
-    rcache_bytes_ += whole->size();
-    rcache_[std::string(path)] = CacheEntry{mtime, size, ++rcache_tick_, *whole};
-    // Evict least-recently-used entries until back under the byte budget.
-    while (rcache_bytes_ > rcache_cap_ && rcache_.size() > 1) {
-      auto victim = rcache_.begin();
-      for (auto i = std::next(rcache_.begin()); i != rcache_.end(); ++i)
-        if (i->second.last_use < victim->second.last_use) victim = i;
-      rcache_bytes_ -= victim->second.data.size();
-      rcache_.erase(victim);
+    std::shared_lock lock(tree_mu_);
+    if (const auto did = tree_.lookup(dir, LookupMode::Exact); did && tree_.node(*did).is_dir()) {
+      tree_.for_each_child(*did, [&](NodeId c) {
+        if (batch.size() >= 256 || bytes >= (2u << 20)) return;
+        const auto& n = tree_.node(c);
+        if (n.attr.kind != NodeKind::File || n.attr.size == 0 || n.attr.size > kMaxCacheableFile) return;
+        std::string p = dir.empty() ? std::string(tree_.name(c)) : dir + "/" + std::string(tree_.name(c));
+        if (p == target) return;
+        batch.push_back(std::move(p));
+        meta.push_back({n.attr.mtime_ns, n.attr.size});
+        bytes += n.attr.size;
+      });
     }
+  }
+
+  std::vector<std::byte> target_bytes;
+  bool have_target = false;
+  if (auto res = read_many(batch, timeout); res && (*res)[0].has_value()) {
+    for (std::size_t i = 0; i < batch.size(); ++i)
+      if ((*res)[i]) {
+        if (i == 0) {
+          target_bytes = *(*res)[0];
+          have_target = true;
+        }
+        cache_put(batch[i], meta[i].first, meta[i].second, std::move(*(*res)[i]));
+      }
+  }
+  if (!have_target) {  // bulk path unavailable; fetch the target directly
+    auto whole = read_remote(path, 0, static_cast<std::uint32_t>(size), timeout);
+    if (!whole) return whole;
+    target_bytes = *whole;
+    cache_put(target, mtime, size, std::move(*whole));
+  }
+  {
     std::lock_guard s(stats_mu_);
     ++stats_.read_cache_misses;
-    stats_.read_cache_bytes = rcache_bytes_;
   }
-  return slice(*whole, offset, length);
+  if (batch.size() >= 256) enqueue_prefetch(dir);  // large dir: async-fetch the remainder
+  return slice(target_bytes, offset, length);
+}
+
+void RemoteRoot::cache_put(std::string path, std::int64_t mtime_ns, std::uint64_t size, std::vector<std::byte> data) {
+  std::lock_guard lock(rcache_mu_);
+  if (const auto it = rcache_.find(path); it != rcache_.end()) rcache_bytes_ -= it->second.data.size();
+  rcache_bytes_ += data.size();
+  rcache_[path] = CacheEntry{mtime_ns, size, ++rcache_tick_, std::move(data)};
+  while (rcache_bytes_ > rcache_cap_ && rcache_.size() > 1) {
+    auto victim = rcache_.begin();
+    for (auto i = std::next(rcache_.begin()); i != rcache_.end(); ++i)
+      if (i->second.last_use < victim->second.last_use) victim = i;
+    rcache_bytes_ -= victim->second.data.size();
+    rcache_.erase(victim);
+  }
+  std::lock_guard s(stats_mu_);
+  stats_.read_cache_bytes = rcache_bytes_;
+}
+
+Result<std::vector<std::optional<std::vector<std::byte>>>> RemoteRoot::read_many(const std::vector<std::string>& paths,
+                                                                                 std::chrono::milliseconds timeout) {
+  std::vector<std::byte> payload;
+  proto::Writer w(payload);
+  proto::ReadManyRequest req;
+  req.paths.reserve(paths.size());
+  for (const auto& p : paths) req.paths.emplace_back(p);
+  proto::write_read_many_request(w, req);
+  auto p = request(proto::MsgType::ReadManyRequest, payload, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::ReadManyResponse) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto resp = proto::read_read_many_response(r);
+  if (!resp) return fail(resp.error());
+  std::vector<std::optional<std::vector<std::byte>>> out(paths.size());
+  for (std::size_t i = 0; i < resp->items.size() && i < out.size(); ++i)
+    if (resp->items[i].ok) out[i] = std::vector<std::byte>(resp->items[i].data.begin(), resp->items[i].data.end());
+  return out;
+}
+
+void RemoteRoot::enqueue_prefetch(std::string dir) {
+  std::lock_guard lock(pf_mu_);
+  if (pf_stop_.load()) return;
+  if (!pf_seen_.insert(dir).second) return;  // already queued or done
+  pf_queue_.push_back(std::move(dir));
+  pf_cv_.notify_one();
+}
+
+void RemoteRoot::prefetch_loop() {
+  struct FileMeta {
+    std::string path;
+    std::int64_t mtime;
+    std::uint64_t size;
+  };
+  for (;;) {
+    std::string dir;
+    {
+      std::unique_lock lock(pf_mu_);
+      pf_cv_.wait(lock, [&] { return pf_stop_.load() || !pf_queue_.empty(); });
+      if (pf_stop_.load()) return;
+      dir = std::move(pf_queue_.front());
+      pf_queue_.pop_front();
+    }
+
+    // Enumerate this directory's small regular files from the mirror.
+    std::vector<FileMeta> files;
+    {
+      std::shared_lock lock(tree_mu_);
+      const auto id = tree_.lookup(dir, LookupMode::Exact);
+      if (id && tree_.node(*id).is_dir()) {
+        tree_.for_each_child(*id, [&](NodeId c) {
+          const auto& n = tree_.node(c);
+          if (n.attr.kind == NodeKind::File && n.attr.size > 0 && n.attr.size <= kMaxCacheableFile) {
+            std::string p = dir.empty() ? std::string(tree_.name(c)) : dir + "/" + std::string(tree_.name(c));
+            files.push_back(FileMeta{std::move(p), n.attr.mtime_ns, n.attr.size});
+          }
+        });
+      }
+    }
+
+    std::vector<std::string> batch;
+    std::vector<const FileMeta*> meta;
+    std::uint64_t bytes = 0;
+    auto flush = [&] {
+      if (batch.empty() || pf_stop_.load()) {
+        batch.clear();
+        meta.clear();
+        bytes = 0;
+        return;
+      }
+      if (auto res = read_many(batch); res) {
+        for (std::size_t i = 0; i < batch.size(); ++i)
+          if ((*res)[i]) cache_put(batch[i], meta[i]->mtime, meta[i]->size, std::move(*(*res)[i]));
+      }
+      batch.clear();
+      meta.clear();
+      bytes = 0;
+    };
+
+    for (const FileMeta& fm : files) {
+      if (pf_stop_.load()) break;
+      {  // skip files already cached at the current version
+        std::lock_guard lock(rcache_mu_);
+        const auto it = rcache_.find(fm.path);
+        if (it != rcache_.end() && it->second.mtime_ns == fm.mtime && it->second.size == fm.size) continue;
+      }
+      batch.push_back(fm.path);
+      meta.push_back(&fm);
+      bytes += fm.size;
+      if (batch.size() >= kPrefetchBatchCount || bytes >= kPrefetchBatchBytes) flush();
+    }
+    flush();
+  }
 }
 
 Result<std::chrono::nanoseconds> RemoteRoot::ping(std::chrono::milliseconds timeout) {
@@ -414,6 +562,11 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
         rcache_.erase(it);
       }
     }
+  }
+  // Let a changed directory be re-prefetched on the next read there.
+  {
+    std::lock_guard lock(pf_mu_);
+    for (const proto::InvalidationOp& op : batch->ops) pf_seen_.erase(std::string(split_parent(op.path).first));
   }
   InvalidationHook hook;
   {

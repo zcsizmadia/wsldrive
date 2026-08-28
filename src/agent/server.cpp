@@ -164,6 +164,7 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch) {
     case proto::MsgType::Ping: return ch.send(proto::MsgType::Pong, f.header.request_id, {});
     case proto::MsgType::SnapshotRequest: return send_snapshot(f.header.request_id, ch);
     case proto::MsgType::ReadRequest: return send_read(f, ch);
+    case proto::MsgType::ReadManyRequest: return send_read_many(f, ch);
     case proto::MsgType::WriteRequest:
     case proto::MsgType::CreateRequest:
     case proto::MsgType::MkdirRequest:
@@ -380,6 +381,51 @@ Result<void> RootServer::send_read(const net::Frame& f, net::FrameChannel& ch) {
   }
   return ch.send_with(proto::MsgType::ReadResponse, f.header.request_id, [&](proto::Writer& w) {
     proto::write_read_response(w, proto::ReadResponse{.file_size = size, .data = data});
+  });
+}
+
+Result<void> RootServer::send_read_many(const net::Frame& f, net::FrameChannel& ch) {
+  proto::Reader r(f.payload);
+  auto q = proto::read_read_many_request(r);
+  if (!q) return fail(q.error());
+
+  const std::size_t n = q->paths.size();
+  std::vector<std::vector<std::byte>> datas(n);
+  std::vector<char> oks(n, 0);
+  std::size_t total = 0;
+  const std::size_t cap = proto::kMaxPayload - (64u << 10);  // headroom for framing
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::string rel = normalize_path(q->paths[i]);
+    if (rel.find("..") != std::string::npos) continue;
+    const fs::path full = join_relative(opts_.root, rel);
+    std::error_code ec;
+    const auto sz = fs::file_size(full, ec);
+    if (ec || sz > (16u << 20) || total + sz > cap) continue;  // skip; client fetches individually
+    std::FILE* fp =
+#ifdef _WIN32
+        _wfopen(full.c_str(), L"rb");
+#else
+        std::fopen(full.c_str(), "rb");
+#endif
+    if (fp == nullptr) continue;
+    std::vector<std::byte> buf(static_cast<std::size_t>(sz));
+    const std::size_t got = buf.empty() ? 0 : std::fread(buf.data(), 1, buf.size(), fp);
+    std::fclose(fp);
+    buf.resize(got);
+    total += got;
+    datas[i] = std::move(buf);
+    oks[i] = 1;
+  }
+
+  return ch.send_with(proto::MsgType::ReadManyResponse, f.header.request_id, [&](proto::Writer& w) {
+    proto::ReadManyResponse resp;
+    resp.items.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      resp.items[i].ok = oks[i] != 0;
+      if (oks[i]) resp.items[i].data = datas[i];
+    }
+    proto::write_read_many_response(w, resp);
   });
 }
 
