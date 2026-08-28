@@ -89,7 +89,9 @@ coherent via pushed invalidations, so `stat`/`readdir`/`open`/negative lookups n
 
 **Content cache + read-ahead.** Small files are cached whole in RAM (BLAKE3-addressed, LRU, invalidated
 on change); on a read miss the file's directory is bulk-fetched in one `ReadMany` round-trip, so a
-sequential reader pays one request per directory, not per file.
+sequential reader pays one request per directory, not per file. On mount the client also **warms the
+cache in the background** — it queues every directory whose small files fit the cache budget, so the
+first reads a tool makes are already hot and cold-read latency is avoided (disable with `--no-prefetch`).
 
 **Writes** are write-through by default (durability = the source filesystem); `--writeback` coalesces a
 file's writes and flushes on `fsync`/close for write-heavy work.

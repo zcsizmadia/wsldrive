@@ -159,6 +159,7 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
 
   std::vector<std::byte> target_bytes;
   bool have_target = false;
+  const auto fetch_t0 = std::chrono::steady_clock::now();  // measure the boundary fetch cost
   if (auto res = read_many(batch, timeout); res && (*res)[0].has_value()) {
     for (std::size_t i = 0; i < batch.size(); ++i)
       if ((*res)[i]) {
@@ -175,9 +176,13 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
     target_bytes = *whole;
     cache_put(target, mtime, size, std::move(*whole));
   }
+  const auto fetch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - fetch_t0)
+                            .count();
   {
     std::lock_guard s(stats_mu_);
     ++stats_.read_cache_misses;
+    stats_.read_miss_fetch_ns += static_cast<std::uint64_t>(fetch_ns);
   }
   if (batch.size() >= 256) enqueue_prefetch(dir);  // large dir: async-fetch the remainder
   return slice(target_bytes, offset, length);
@@ -223,6 +228,7 @@ void RemoteRoot::enqueue_prefetch(std::string dir) {
   std::lock_guard lock(pf_mu_);
   if (pf_stop_.load()) return;
   if (!pf_seen_.insert(dir).second) return;  // already queued or done
+  pf_pending_.fetch_add(1, std::memory_order_relaxed);
   pf_queue_.push_back(std::move(dir));
   pf_cv_.notify_one();
 }
@@ -262,6 +268,7 @@ void RemoteRoot::prefetch_loop() {
     std::vector<std::string> batch;
     std::vector<const FileMeta*> meta;
     std::uint64_t bytes = 0;
+    std::uint64_t got_files = 0, got_bytes = 0;  // fetched this directory (for stats)
     auto flush = [&] {
       if (batch.empty() || pf_stop_.load()) {
         batch.clear();
@@ -271,7 +278,11 @@ void RemoteRoot::prefetch_loop() {
       }
       if (auto res = read_many(batch); res) {
         for (std::size_t i = 0; i < batch.size(); ++i)
-          if ((*res)[i]) cache_put(batch[i], meta[i]->mtime, meta[i]->size, std::move(*(*res)[i]));
+          if ((*res)[i]) {
+            got_files += 1;
+            got_bytes += (*res)[i]->size();
+            cache_put(batch[i], meta[i]->mtime, meta[i]->size, std::move(*(*res)[i]));
+          }
       }
       batch.clear();
       meta.clear();
@@ -291,7 +302,54 @@ void RemoteRoot::prefetch_loop() {
       if (batch.size() >= kPrefetchBatchCount || bytes >= kPrefetchBatchBytes) flush();
     }
     flush();
+
+    if (got_files) {
+      std::lock_guard s(stats_mu_);
+      stats_.prefetch_files += got_files;
+      stats_.prefetch_bytes += got_bytes;
+    }
+    // This directory is done; wake anyone waiting for the prefetcher to drain.
+    if (pf_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      std::lock_guard lock(pf_mu_);
+      pf_done_cv_.notify_all();
+    }
   }
+}
+
+std::size_t RemoteRoot::warm_cache() {
+  std::vector<std::string> dirs;
+  {
+    std::shared_lock lock(tree_mu_);
+    const std::uint64_t cap = rcache_cap_;
+    std::uint64_t budget = 0;
+    std::vector<NodeId> stack{tree_.root()};
+    while (!stack.empty()) {
+      const NodeId id = stack.back();
+      stack.pop_back();
+      if (!tree_.node(id).is_dir()) continue;
+      std::uint64_t dir_bytes = 0;
+      tree_.for_each_child(id, [&](NodeId c) {
+        const auto& n = tree_.node(c);
+        if (n.attr.kind == NodeKind::File && n.attr.size > 0 && n.attr.size <= kMaxCacheableFile)
+          dir_bytes += n.attr.size;
+        if (n.is_dir()) stack.push_back(c);  // descend regardless of this dir's budget
+      });
+      if (dir_bytes == 0) continue;                 // nothing cacheable here
+      if (budget + dir_bytes > cap) continue;       // over budget: leave to lazy read-ahead
+      budget += dir_bytes;
+      dirs.push_back(tree_.path_of(id));
+    }
+  }
+  // Enqueue without the tree lock held (prefetch_loop takes pf_mu_ then tree_mu_).
+  for (auto& d : dirs) enqueue_prefetch(std::move(d));
+  return dirs.size();
+}
+
+void RemoteRoot::wait_prefetch_idle(std::chrono::milliseconds timeout) {
+  std::unique_lock lock(pf_mu_);
+  pf_done_cv_.wait_for(lock, timeout, [&] {
+    return pf_stop_.load() || (pf_pending_.load(std::memory_order_acquire) == 0 && pf_queue_.empty());
+  });
 }
 
 Result<std::chrono::nanoseconds> RemoteRoot::ping(std::chrono::milliseconds timeout) {
