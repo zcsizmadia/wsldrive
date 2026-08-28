@@ -7,7 +7,8 @@ add_library(wsldrive_core STATIC
   path.cpp
   protocol.cpp
   string_pool.cpp
-  unicode.cpp)
+  unicode.cpp
+  win_names.cpp)
 add_library(wsldrive::core ALIAS wsldrive_core)
 
 target_include_directories(wsldrive_core

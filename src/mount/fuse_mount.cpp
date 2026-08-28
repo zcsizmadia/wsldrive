@@ -2,6 +2,7 @@
 
 #include "core/metadata_tree.hpp"
 #include "core/path.hpp"
+#include "core/win_names.hpp"
 
 #include <fuse3/fuse.h>
 
@@ -55,11 +56,13 @@ bool load_winfsp_dll() {
   return ::LoadLibraryW(path.c_str()) != nullptr;
 }
 
-// FUSE paths are absolute ("/", "/a/b"); the tree uses relative '/'-separated keys.
+// FUSE paths are absolute ("/", "/a/b"); the tree uses relative '/'-separated
+// keys. Windows delivers names in their escaped form, so decode back to the raw
+// ext4 names the tree and the agent use.
 std::string to_rel(const char* path) {
   if (path == nullptr) return {};
   while (*path == '/') ++path;
-  return std::string(path);
+  return unescape_from_windows(path);
 }
 
 void fill_stat(const MetadataTree::Node& n, struct fuse_stat* st) {
@@ -104,7 +107,7 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, fuse_off_t, 
     int rc = 0;
     t.for_each_child(*id, [&](NodeId c) {
       if (rc != 0) return;
-      const std::string name(t.name(c));
+      const std::string name = escape_for_windows(t.name(c));  // present illegal chars safely
       struct fuse_stat st;
       fill_stat(t.node(c), &st);
       rc = filler(buf, name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));

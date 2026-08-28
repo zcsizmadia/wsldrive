@@ -53,7 +53,9 @@ Metadata (`dir`, `stat`, directory listing) is served from the client's in-RAM m
 round-trips; file contents are fetched over the socket on demand; live edits in WSL propagate via
 pushed invalidations. **Read-write**: create, write, append, truncate, mkdir, rename, unlink and rmdir
 on the drive letter are written through to ext4 (verified by mounting a WSL tree, writing from Windows,
-and reading the bytes back inside WSL). Built via the FUSE3 API, so the same mount serves Linux
+and reading the bytes back inside WSL). ext4 names illegal on Windows (`: ? * < > | "`, control chars,
+a trailing dot/space) are mapped to the Unicode private-use area (the WSL/Cygwin convention) so they
+appear and round-trip on the drive. Built via the FUSE3 API, so the same mount serves Linux
 (Direction B) later. The mount target builds only when WinFsp is detected, so CI and non-Windows builds
 are unaffected. Set `WSLDRIVE_FUSE_DEBUG=1` to log WinFsp FUSE operations.
 
