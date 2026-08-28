@@ -157,6 +157,27 @@ stream socket. Two transports:
 A `.wsldriveignore` at the served root (gitignore-style: `node_modules/`, `*.log`, `/build`, …) excludes
 paths from the mount and from sync.
 
+### What gets served (and what doesn't)
+
+The default root is your **home directory** (`~`) — that is where the work is, and it keeps the tree
+small. You can serve any path, including the whole distro:
+
+```powershell
+wsldrive mount W: --distro Ubuntu --wsl-root /          # the entire root filesystem
+```
+
+The scan **stays on the root's filesystem**. A directory that is a mount point for another filesystem
+is still listed, but appears **empty** rather than being descended into. That is what makes `/`
+practical: `/proc`, `/sys`, `/dev` and `/run` show up as empty directories instead of adding ~43k
+entries of churn, and `/mnt/c` is not pulled back across the boundary (which would otherwise mirror
+your whole Windows drive through WSL and back). On this machine `/` is ~80k entries, which the in-RAM
+mirror handles comfortably. Pass `wsldrived --cross-filesystems` to descend into mount points anyway.
+
+**Names the tree cannot represent are dropped, not fatal.** A backslash is a path separator here, but a
+legal filename character on Linux — systemd writes `system-systemd\x2dcryptsetup.slice`, so `/usr`
+contains such names. Those entries (and anything beneath them) are skipped and reported
+(`N entries dropped`), so one odd name never costs you the whole mount.
+
 **Non-goals:** replacing `/mnt/c` (wsldrive mounts alongside it); general-purpose bidirectional sync;
 kernel drivers or signing beyond WinFsp's.
 

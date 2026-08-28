@@ -74,6 +74,34 @@ TEST_F(AgentTest, ScanTreeProducesLoadableSnapshot) {
   EXPECT_EQ(scan_tree(root_ / "README.md", [](const SnapshotEntry&) {}).error(), Errc::NotADirectory);
 }
 
+TEST_F(AgentTest, SingleFileSystemScanDoesNotPruneOrdinaryTrees) {
+  // Staying on one filesystem must not change the result for a normal tree that
+  // has no mount points in it: on (the default) and off must agree.
+  auto count = [&](bool one_fs) {
+    std::size_t n = 0;
+    auto st = scan_tree(root_, [&](const SnapshotEntry&) { ++n; }, {}, one_fs);
+    EXPECT_TRUE(st.has_value());
+    return n;
+  };
+  const std::size_t with_limit = count(true);
+  const std::size_t without = count(false);
+  EXPECT_EQ(with_limit, without);
+  EXPECT_GT(with_limit, 0u);
+
+  // The root's own filesystem id must be resolvable, or the limit silently
+  // disables itself and mount points would be traversed after all.
+  EXPECT_TRUE(device_id(root_).has_value());
+  EXPECT_FALSE(device_id(root_ / "definitely-not-here").has_value());
+
+#ifndef _WIN32
+  // /proc is a pseudo-filesystem, so it must report a different id than / —
+  // this is exactly the comparison that keeps it out of a `--wsl-root /` scan.
+  const auto slash = device_id("/");
+  const auto proc = device_id("/proc");
+  if (slash && proc) { EXPECT_NE(*slash, *proc); }
+#endif
+}
+
 TEST_F(AgentTest, ReadAttributes) {
   auto a = read_attributes(root_ / "README.md");
   ASSERT_TRUE(a.has_value());

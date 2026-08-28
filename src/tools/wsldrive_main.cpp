@@ -368,6 +368,9 @@ int main(int argc, char** argv) {
     }
     const auto ts = root.with_tree([](const wsld::MetadataTree& t) { return t.stats(); });
     std::printf("mounting %s (%zu nodes) at %s ...\n", source.c_str(), ts.nodes, mountpoint.c_str());
+    if (ts.dropped > 0)
+      std::printf("  note: %zu entries dropped (names this filesystem cannot represent, e.g. a backslash)\n",
+                  ts.dropped);
     if (prefetch) {
       const std::size_t dirs = root.warm_cache();  // background warm-up so first reads are hot
       if (dirs > 0) std::printf("prefetching %zu directories in the background...\n", dirs);
@@ -479,6 +482,9 @@ int main(int argc, char** argv) {
   std::printf("snapshot: %zu nodes, %zu distinct names (%zu bytes), %zu case collisions, %zu wire bytes, %.1f ms\n",
               tree_stats.nodes, tree_stats.names, tree_stats.name_bytes, tree_stats.case_collisions,
               st.snapshot_bytes, ms(st.last_snapshot_time));
+  if (tree_stats.dropped > 0)
+    std::printf("          %zu entries dropped (names this filesystem cannot represent, e.g. a backslash)\n",
+                tree_stats.dropped);
 
   if (lookups > 0) {
     std::vector<std::string> paths;

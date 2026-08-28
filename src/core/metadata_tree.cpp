@@ -33,7 +33,7 @@ MetadataTree::MetadataTree() {
 }
 
 MetadataTree::Stats MetadataTree::stats() const noexcept {
-  return Stats{live_, names_.size(), names_.bytes(), collisions_};
+  return Stats{live_, names_.size(), names_.bytes(), collisions_, dropped_};
 }
 
 bool MetadataTree::valid_name(std::string_view name) noexcept {
@@ -307,8 +307,23 @@ Result<void> MetadataTree::load_snapshot(std::span<const SnapshotEntry> entries)
   for (std::size_t k = 0; k < entries.size(); ++k) {
     const SnapshotEntry& e = entries[k];
     if (e.parent > k) return fail(Errc::Corrupt);  // parent must precede child
-    auto id = insert(ids[e.parent], e.name, e.attr);
-    if (!id) return fail(id.error());
+    // One entry we cannot represent must not cost the whole tree: drop it (and,
+    // via the invalid placeholder, everything beneath it) and keep going. Real
+    // trees contain such names — systemd escapes unit files as
+    // `system-systemd\x2dcryptsetup.slice`, and a backslash is a path separator
+    // here. Indices stay aligned because every entry still pushes an id.
+    const NodeId parent = ids[e.parent];
+    if (parent == kInvalidNode) {  // an ancestor was dropped
+      ids.push_back(kInvalidNode);
+      ++dropped_;
+      continue;
+    }
+    auto id = insert(parent, e.name, e.attr);
+    if (!id) {
+      ids.push_back(kInvalidNode);
+      ++dropped_;
+      continue;
+    }
     ids.push_back(*id);
   }
   return {};
@@ -321,6 +336,7 @@ void MetadataTree::clear() {
   exact_.clear();
   folded_.clear();
   collisions_ = 0;
+  dropped_ = 0;
   Node root;
   root.name = names_.intern("");
   root.folded_name = root.name;

@@ -60,6 +60,11 @@ class MetadataTree {
     std::size_t names;
     std::size_t name_bytes;
     std::size_t case_collisions;  // sibling pairs that differ only by case
+    // Snapshot entries the last load_snapshot could not represent (and the
+    // descendants dropped with them) — e.g. a name containing a backslash,
+    // which systemd creates (system-systemd\x2dcryptsetup.slice). Dropping
+    // them keeps one odd name from costing the whole tree.
+    std::size_t dropped;
   };
 
   MetadataTree();
@@ -146,6 +151,7 @@ class MetadataTree {
   U64Map folded_;  // (parent, folded name) -> first node inserted with that folding
   std::size_t live_ = 0;
   std::size_t collisions_ = 0;
+  std::size_t dropped_ = 0;  // entries the last load_snapshot could not represent
 };
 
 }  // namespace wsld

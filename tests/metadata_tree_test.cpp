@@ -231,9 +231,37 @@ TEST(MetadataTree, SnapshotRoundTrip) {
 TEST(MetadataTree, LoadSnapshotRejectsForwardParents) {
   MetadataTree t;
   const std::vector<SnapshotEntry> bad{{2, "a", kFile}, {0, "b", kDir}};
-  EXPECT_EQ(t.load_snapshot(bad).error(), Errc::Corrupt);
+  EXPECT_EQ(t.load_snapshot(bad).error(), Errc::Corrupt);  // malformed wire data is still fatal
+}
+
+TEST(MetadataTree, LoadSnapshotDropsUnrepresentableEntriesInsteadOfFailing) {
+  // A single entry we cannot represent must not cost the whole tree: it is
+  // dropped (with its descendants) and the rest loads. Real filesystems contain
+  // such names — systemd writes `system-systemd\x2dcryptsetup.slice`, and a
+  // backslash is a path separator here, so it fails valid_name().
+  MetadataTree t;
+  const std::vector<SnapshotEntry> entries{
+      {0, "keep", kDir},            // 1
+      {0, "bad\\name", kDir},       // 2 - unrepresentable, dropped
+      {2, "under-bad", kFile},      // 3 - its child, dropped with it
+      {1, "kept-file", kFile},      // 4 - unaffected sibling subtree
+  };
+  ASSERT_TRUE(t.load_snapshot(entries).has_value());
+  EXPECT_EQ(t.stats().dropped, 2u);  // the bad entry and its descendant
+  EXPECT_TRUE(t.lookup("keep").has_value());
+  EXPECT_TRUE(t.lookup("keep/kept-file").has_value());
+  EXPECT_FALSE(t.lookup("bad\\name").has_value());
+
+  // A child of a non-directory is likewise dropped rather than fatal.
   const std::vector<SnapshotEntry> not_dir{{0, "f", kFile}, {1, "child", kFile}};
-  EXPECT_EQ(t.load_snapshot(not_dir).error(), Errc::NotADirectory);
+  ASSERT_TRUE(t.load_snapshot(not_dir).has_value());
+  EXPECT_EQ(t.stats().dropped, 1u);
+  EXPECT_TRUE(t.lookup("f").has_value());
+
+  // Loading a clean snapshot resets the counter.
+  const std::vector<SnapshotEntry> clean{{0, "ok", kFile}};
+  ASSERT_TRUE(t.load_snapshot(clean).has_value());
+  EXPECT_EQ(t.stats().dropped, 0u);
 }
 
 TEST(MetadataTree, LargeTree) {

@@ -303,7 +303,7 @@ if ($Config) {
       $defLetter = if ($DriveLetter) { ($DriveLetter -replace ':','').ToUpper() } else { Get-FreeDriveLetter }
       $letter = (Ask 'Drive letter' $defLetter).TrimEnd(':').ToUpper()
       $distro = Ask 'WSL distro to serve from' $distro
-      $WslRoot = Ask 'Folder inside the distro to expose' $WslRoot
+      $WslRoot = Ask 'Folder inside the distro to expose (~ = home, / = whole distro)' $WslRoot
     }
   }
   if ($doA) {

@@ -28,6 +28,10 @@ class RootServer {
     // Snapshot replies are split into frames of about this many payload bytes so
     // arbitrarily large trees are not bound by the single-frame limit.
     std::size_t snapshot_chunk_bytes = 4u << 20;
+    // Stay on the root's filesystem: mount points (pseudo-filesystems like
+    // /proc and /sys, and foreign mounts like /mnt/c) are reported but not
+    // descended into. Turn off only to deliberately serve across mounts.
+    bool one_file_system = true;
   };
 
   explicit RootServer(Options opts);
