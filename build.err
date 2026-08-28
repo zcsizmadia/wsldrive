@@ -1,0 +1,2 @@
+SIGPIPE
+CMake Error: Generator: execution of make failed. Make command was: /usr/bin/ninja

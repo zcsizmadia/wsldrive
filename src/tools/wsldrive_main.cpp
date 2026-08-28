@@ -8,12 +8,18 @@
 #include "net/socket.hpp"
 
 #ifdef _WIN32
-#include <atomic>
 #include <windows.h>
 #endif
-#ifdef WSLDRIVE_HAVE_WINFSP
+#ifdef WSLDRIVE_HAVE_MOUNT
 #include "mount/fuse_mount.hpp"
+#include <atomic>
+#include <filesystem>
+#endif
+#ifdef WSLDRIVE_HAVE_WINFSP
 #include "platform/win/wsl_launch.hpp"
+#endif
+#if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
+#include <csignal>
 #endif
 
 #include <chrono>
@@ -33,9 +39,11 @@ void usage() {
 #ifdef _WIN32
       "  wsldrive doctor                                      (check WinFsp + WSL environment)\n"
 #endif
-#ifdef WSLDRIVE_HAVE_WINFSP
+#ifdef WSLDRIVE_HAVE_MOUNT
       "  wsldrive mount <mountpoint> --connect <endpoint>      (attach to a running agent)\n"
-      "  wsldrive mount <mountpoint> --distro <name> --wsl-root <path> [--agent <path>] [--port N]\n"
+#endif
+#ifdef WSLDRIVE_HAVE_WINFSP
+      "  wsldrive mount <drive> --distro <name> --wsl-root <path> [--agent <path>] [--port N]\n"
       "                                                       (auto-launch the agent in the distro)\n"
 #endif
       ,
@@ -44,14 +52,26 @@ void usage() {
 
 double ms(std::chrono::nanoseconds d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
-#ifdef WSLDRIVE_HAVE_WINFSP
+#ifdef WSLDRIVE_HAVE_MOUNT
 std::atomic<bool> g_mount_stop{false};
+#ifdef _WIN32
 BOOL WINAPI mount_ctrl_handler(DWORD type) {
   if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
     g_mount_stop.store(true);
     return TRUE;  // handled: don't let the default handler kill us before cleanup
   }
   return FALSE;
+}
+#else
+extern "C" void mount_signal_handler(int) { g_mount_stop.store(true); }
+#endif
+void install_mount_signal_handler() {
+#ifdef _WIN32
+  ::SetConsoleCtrlHandler(mount_ctrl_handler, TRUE);
+#else
+  std::signal(SIGINT, mount_signal_handler);
+  std::signal(SIGTERM, mount_signal_handler);
+#endif
 }
 #endif
 
@@ -126,7 +146,7 @@ int main(int argc, char** argv) {
   }
 #endif
 
-#ifdef WSLDRIVE_HAVE_WINFSP
+#ifdef WSLDRIVE_HAVE_MOUNT
   if (command == "mount") {
     if (argc < 3) {
       usage();
@@ -156,7 +176,8 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Auto-launch mode: start wsldrived in the distro, then connect to it.
+#ifdef WSLDRIVE_HAVE_WINFSP
+    // Auto-launch mode (Windows only): start wsldrived in the distro, then connect.
     wsld::platform::WslAgent agent;
     if (have_distro) {
       if (wsl_root.empty()) {
@@ -169,10 +190,20 @@ int main(int argc, char** argv) {
       }
       connect = "tcp://127.0.0.1:" + std::to_string(port);
       std::printf("launched agent in %s, waiting for it to listen...\n", distro.empty() ? "(default distro)" : distro.c_str());
-    } else if (connect.empty()) {
+    } else
+#endif
+        if (connect.empty()) {
       usage();
       return 2;
     }
+
+#ifndef _WIN32
+    // Linux (Direction B): the FUSE mountpoint must exist as an empty directory.
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(mountpoint, ec);
+    }
+#endif
 
     auto ep = wsld::net::Endpoint::parse(connect);
     if (!ep) {
@@ -181,8 +212,13 @@ int main(int argc, char** argv) {
     }
     // Poll for the agent to accept connections (auto-launch needs a moment;
     // a direct --connect succeeds on the first try).
+    (void)distro;
+    (void)wsl_root;
+    (void)agent_path;
+    (void)port;
     wsld::Result<wsld::net::Socket> sock = wsld::fail(wsld::Errc::ConnectionClosed);
     const int attempts = have_distro ? 100 : 1;  // ~10 s when auto-launching
+    (void)have_distro;
     for (int i = 0; i < attempts; ++i) {
       sock = wsld::net::connect(*ep);
       if (sock) break;
@@ -209,7 +245,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));
       return 1;
     }
-    ::SetConsoleCtrlHandler(mount_ctrl_handler, TRUE);
+    install_mount_signal_handler();
     std::printf("mounted. Ctrl+C to unmount.\n");
     std::fflush(stdout);
     while (fm.mounted() && root.connected() && !g_mount_stop.load())

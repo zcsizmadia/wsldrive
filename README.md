@@ -59,7 +59,24 @@ appear and round-trip on the drive. Built via the FUSE3 API, so the same mount s
 (Direction B) later. The mount target builds only when WinFsp is detected, so CI and non-Windows builds
 are unaffected. Set `WSLDRIVE_FUSE_DEBUG=1` to log WinFsp FUSE operations.
 
-Platform layers (Hyper-V socket transport, fanotify) continue in later phases.
+### Direction B (Windows drive cached in WSL, experimental)
+
+The mount is built on the FUSE3 API, so the same implementation runs in WSL via libfuse3:
+
+```bash
+# on Windows: serve a Windows path
+wsldrived.exe --root C:\path\to\project --listen tcp://0.0.0.0:7788
+# in WSL: mount it
+wsldrive mount /mnt/win --connect tcp://<windows-host>:7788
+```
+
+It is functional (read/write across the transport, live invalidations via the Windows-side
+`ReadDirectoryChangesW` watcher) and verified end-to-end. It is **gated and experimental**: reads
+currently go over the socket rather than a local cache, so it does not yet beat `virtiofs=true` for
+`/mnt/c`. For fast Linux access to Windows files today, enable virtiofs; Direction B becomes a
+worthwhile replacement once the read-cache layer lands.
+
+Platform layers (Hyper-V socket transport) continue in later phases.
 
 ### Baseline micro-benchmarks
 

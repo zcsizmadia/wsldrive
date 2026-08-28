@@ -2,43 +2,54 @@
 
 #include "core/metadata_tree.hpp"
 #include "core/path.hpp"
-#include "core/win_names.hpp"
 
-#include <fuse3/fuse.h>
-
+// One implementation over the FUSE3 high-level API: WinFsp-FUSE on Windows
+// (Direction A) and libfuse3 on Linux (Direction B). The API is source-
+// compatible apart from a few types (fuse_stat vs stat) aliased below and the
+// Windows-only DLL load and filename escaping.
+#ifdef _WIN32
+#include <fuse3/fuse.h>  // FUSE_USE_VERSION comes from the winfsp::fuse3 target
 #include <windows.h>
+#include "core/win_names.hpp"
+using StatT = struct fuse_stat;
+using StatvfsT = struct fuse_statvfs;
+using OffT = fuse_off_t;
+using ModeT = fuse_mode_t;
+#ifndef S_IFLNK
+#define S_IFLNK 0120000
+#endif
+#else
+#define FUSE_USE_VERSION 31
+#include <fuse3/fuse.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+using StatT = struct stat;
+using StatvfsT = struct statvfs;
+using OffT = off_t;
+using ModeT = mode_t;
+#endif
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
-
-// WinFsp-FUSE reports POSIX mode bits and open flags; MSVC's headers omit a few.
-#ifndef S_IFLNK
-#define S_IFLNK 0120000
-#endif
-#ifndef O_RDONLY
-#define O_RDONLY 0
-#endif
-#ifndef O_ACCMODE
-#define O_ACCMODE 3
-#endif
 
 namespace wsld::mount {
 
 namespace {
 
-// Shared with the FUSE callbacks via fuse_context::private_data.
 struct Context {
   agent::RemoteRoot* root;
 };
 
 Context* ctx() { return static_cast<Context*>(fuse_get_context()->private_data); }
 
-// winfsp-x64.dll is delay-loaded; load it before the first WinFsp call. Try the
-// default search path, then the install directory recorded in the registry, so
-// the binary works without WinFsp's bin directory on PATH.
+#ifdef _WIN32
+// winfsp-x64.dll is delay-loaded; load it (default search path, then the
+// registry InstallDir) so the binary runs without WinFsp's bin dir on PATH.
 bool load_winfsp_dll() {
   if (::LoadLibraryW(L"winfsp-x64.dll") != nullptr) return true;
   HKEY key{};
@@ -55,29 +66,43 @@ bool load_winfsp_dll() {
   path += L"bin\\winfsp-x64.dll";
   return ::LoadLibraryW(path.c_str()) != nullptr;
 }
+#endif
+
+// Name shown in a directory listing: on Windows, escape characters illegal in
+// NTFS names; on Linux the raw name is already valid.
+std::string present_name(std::string_view raw) {
+#ifdef _WIN32
+  return escape_for_windows(raw);
+#else
+  return std::string(raw);
+#endif
+}
 
 // FUSE paths are absolute ("/", "/a/b"); the tree uses relative '/'-separated
-// keys. Windows delivers names in their escaped form, so decode back to the raw
-// ext4 names the tree and the agent use.
+// keys. On Windows, decode the escaped form back to the raw name.
 std::string to_rel(const char* path) {
   if (path == nullptr) return {};
   while (*path == '/') ++path;
+#ifdef _WIN32
   return unescape_from_windows(path);
+#else
+  return std::string(path);
+#endif
 }
 
-void fill_stat(const MetadataTree::Node& n, struct fuse_stat* st) {
+void fill_stat(const MetadataTree::Node& n, StatT* st) {
   std::memset(st, 0, sizeof(*st));
   if (n.attr.kind == NodeKind::Directory) {
-    st->st_mode = static_cast<fuse_mode_t>(S_IFDIR | 0755);
+    st->st_mode = static_cast<ModeT>(S_IFDIR | 0755);
     st->st_nlink = 2;
   } else if (n.attr.kind == NodeKind::Symlink) {
-    st->st_mode = static_cast<fuse_mode_t>(S_IFLNK | 0777);
+    st->st_mode = static_cast<ModeT>(S_IFLNK | 0777);
     st->st_nlink = 1;
-    st->st_size = static_cast<fuse_off_t>(n.attr.size);
+    st->st_size = static_cast<OffT>(n.attr.size);
   } else {
-    st->st_mode = static_cast<fuse_mode_t>(S_IFREG | 0644);
+    st->st_mode = static_cast<ModeT>(S_IFREG | 0644);
     st->st_nlink = 1;
-    st->st_size = static_cast<fuse_off_t>(n.attr.size);
+    st->st_size = static_cast<OffT>(n.attr.size);
   }
   st->st_mtim.tv_sec = static_cast<decltype(st->st_mtim.tv_sec)>(n.attr.mtime_ns / 1'000'000'000);
   st->st_mtim.tv_nsec = static_cast<decltype(st->st_mtim.tv_nsec)>(n.attr.mtime_ns % 1'000'000'000);
@@ -85,7 +110,7 @@ void fill_stat(const MetadataTree::Node& n, struct fuse_stat* st) {
   st->st_ctim = st->st_mtim;
 }
 
-int op_getattr(const char* path, struct fuse_stat* st, struct fuse_file_info*) {
+int op_getattr(const char* path, StatT* st, struct fuse_file_info*) {
   const std::string rel = to_rel(path);
   return ctx()->root->with_tree([&](const MetadataTree& t) -> int {
     const auto id = t.lookup(rel, LookupMode::CaseInsensitive);
@@ -95,7 +120,7 @@ int op_getattr(const char* path, struct fuse_stat* st, struct fuse_file_info*) {
   });
 }
 
-int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, fuse_off_t, struct fuse_file_info*,
+int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, OffT, struct fuse_file_info*,
                enum fuse_readdir_flags) {
   const std::string rel = to_rel(path);
   return ctx()->root->with_tree([&](const MetadataTree& t) -> int {
@@ -107,8 +132,8 @@ int op_readdir(const char* path, void* buf, fuse_fill_dir_t filler, fuse_off_t, 
     int rc = 0;
     t.for_each_child(*id, [&](NodeId c) {
       if (rc != 0) return;
-      const std::string name = escape_for_windows(t.name(c));  // present illegal chars safely
-      struct fuse_stat st;
+      const std::string name = present_name(t.name(c));
+      StatT st;
       fill_stat(t.node(c), &st);
       rc = filler(buf, name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
     });
@@ -140,24 +165,24 @@ int err_to_errno(Errc e) {
   }
 }
 
-int op_create(const char* path, fuse_mode_t mode, struct fuse_file_info*) {
+int op_create(const char* path, ModeT mode, struct fuse_file_info*) {
   auto r = ctx()->root->create_file(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
   return r ? 0 : err_to_errno(r.error());
 }
 
-int op_write(const char* path, const char* buf, size_t size, fuse_off_t offset, struct fuse_file_info*) {
+int op_write(const char* path, const char* buf, size_t size, OffT offset, struct fuse_file_info*) {
   auto r = ctx()->root->write(to_rel(path), static_cast<std::uint64_t>(offset),
                               std::as_bytes(std::span<const char>(buf, size)));
   if (!r) return err_to_errno(r.error());
   return static_cast<int>(*r);
 }
 
-int op_truncate(const char* path, fuse_off_t size, struct fuse_file_info*) {
+int op_truncate(const char* path, OffT size, struct fuse_file_info*) {
   auto r = ctx()->root->truncate(to_rel(path), static_cast<std::uint64_t>(size));
   return r ? 0 : err_to_errno(r.error());
 }
 
-int op_mkdir(const char* path, fuse_mode_t mode) {
+int op_mkdir(const char* path, ModeT mode) {
   auto r = ctx()->root->mkdir(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
   return r ? 0 : err_to_errno(r.error());
 }
@@ -177,25 +202,18 @@ int op_rename(const char* from, const char* to, unsigned int) {
   return r ? 0 : err_to_errno(r.error());
 }
 
-int op_read(const char* path, char* buf, size_t size, fuse_off_t offset, struct fuse_file_info*) {
+int op_read(const char* path, char* buf, size_t size, OffT offset, struct fuse_file_info*) {
   const std::string rel = to_rel(path);
   const std::uint32_t want = static_cast<std::uint32_t>(std::min<size_t>(size, 16u << 20));
   auto data = ctx()->root->read(rel, static_cast<std::uint64_t>(offset), want);
-  if (!data) {
-    switch (data.error()) {
-      case Errc::NotFound: return -ENOENT;
-      case Errc::InvalidPath: return -EINVAL;
-      case Errc::Timeout: return -ETIMEDOUT;
-      default: return -EIO;
-    }
-  }
+  if (!data) return err_to_errno(data.error());
   if (!data->empty()) std::memcpy(buf, data->data(), data->size());
   return static_cast<int>(data->size());
 }
 
-int op_statfs(const char*, struct fuse_statvfs* st) {
-  // WinFsp refuses writes ("device error") if the volume reports no free space,
-  // so advertise a large backing store. The real limit is the WSL ext4 volume.
+int op_statfs(const char*, StatvfsT* st) {
+  // WinFsp refuses writes ("device error") without free space reported; advertise
+  // a large backing store (the real limit is the served volume).
   std::memset(st, 0, sizeof(*st));
   st->f_bsize = 4096;
   st->f_frsize = 4096;
@@ -211,8 +229,6 @@ int op_statfs(const char*, struct fuse_statvfs* st) {
 int op_fsync(const char*, int, struct fuse_file_info*) { return 0; }
 
 void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
-  // Serve metadata from our mirror; short kernel caches keep it snappy while
-  // still reflecting pushed invalidations within the timeout.
   cfg->kernel_cache = 0;
   cfg->entry_timeout = 1.0;
   cfg->attr_timeout = 1.0;
@@ -244,7 +260,9 @@ fuse_operations make_ops() {
 FuseMount::~FuseMount() { unmount(); }
 
 Result<void> FuseMount::mount(const std::string& mountpoint) {
+#ifdef _WIN32
   if (!load_winfsp_dll()) return fail(Errc::Unsupported);
+#endif
 
   static Context context;  // FUSE keeps a single mount per process here
   context.root = &root_;
@@ -252,8 +270,10 @@ Result<void> FuseMount::mount(const std::string& mountpoint) {
 
   struct fuse_args args = FUSE_ARGS_INIT(0, nullptr);
   fuse_opt_add_arg(&args, "wsldrive");
+#ifdef _WIN32
   // uid/gid = -1 maps ownership to the caller; rellinks keeps symlinks relative.
   fuse_opt_add_arg(&args, "-ouid=-1,gid=-1,rellinks,FileSystemName=wsldrive,volname=wsldrive");
+#endif
   if (std::getenv("WSLDRIVE_FUSE_DEBUG") != nullptr) fuse_opt_add_arg(&args, "-d");
 
   struct fuse* f = fuse_new(&args, &ops, sizeof(ops), &context);
