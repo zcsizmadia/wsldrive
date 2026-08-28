@@ -79,7 +79,34 @@ wsldrive mount /tmp/win --win-root 'C:/project' --win-agent /mnt/c/.../wsldrived
 
 Direction A is also fast over plain loopback TCP and does not require hvsocket.
 
+## Cold reads — prefetch-on-mount
+
+Cold reads (the first touch of a file, before it is cached) used to pay the full
+boundary fetch. The client now **warms the cache in the background on mount** —
+it queues every directory whose small files fit the cache budget, so a tool's
+first reads are already hot. A/B on Direction A (loopback TCP, 3000 files,
+**first full read pass right after a fresh mount**, median of 5):
+
+| mount | cold first-read |
+|-------|----------------:|
+| `--no-prefetch` | 585 ms |
+| **prefetch-on-mount** (default) | **423 ms** |
+
+That is ~28 % faster, landing near the ~366 ms warm floor — i.e. warm-up removes
+most of the cold penalty that sits on top of the fixed per-file mount-serving
+cost. It is transport-agnostic (it warms the client cache regardless of
+transport) and on by default; disable with `--no-prefetch`. New `Stats`
+counters (`read_miss_fetch_ns`, `prefetch_files`, `prefetch_bytes`) expose the
+boundary-fetch time and prefetch coverage. Huge trees (small-file bytes beyond
+the cache cap) skip warm-up and fall back to lazy per-directory read-ahead;
+pipelined `ReadMany` and a persistent on-disk cache are the follow-ups for that
+case.
+
 ## Performance work landed
+
+- **Prefetch-on-mount**: after the snapshot the client bulk-fetches the tree's
+  small files in the background (bounded by the cache budget), so cold reads are
+  avoided for typical trees (see above). `--no-prefetch` opts out.
 
 - **Client-side read cache** (`RemoteRoot`): small files cached whole in RAM,
   validated by (mtime, size), LRU-evicted, invalidated on change. Repeat reads
