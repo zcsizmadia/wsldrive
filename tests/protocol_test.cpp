@@ -200,6 +200,36 @@ TEST(Messages, InvalidationRoundTrip) {
   EXPECT_TRUE(r.empty());
 }
 
+TEST(Messages, HugeClaimedCountsFailWithoutHugeAllocation) {
+  // A decoder must not size a container from a count it has not validated: a
+  // small frame claiming millions of elements would otherwise commit gigabytes
+  // before the first element is read. Each of these lies about its count and
+  // must fail cleanly (and promptly) instead.
+  {  // ReadManyRequest: count far beyond the bytes that follow
+    std::vector<std::byte> buf;
+    Writer w(buf);
+    w.varint(50'000'000);  // claimed paths
+    w.string("only-one");
+    Reader r(buf);
+    EXPECT_FALSE(read_read_many_request(r).has_value());
+  }
+  {  // Invalidation: same shape, decoded by the *client*
+    std::vector<std::byte> buf;
+    Writer w(buf);
+    w.u64(1);              // generation
+    w.varint(40'000'000);  // claimed ops
+    Reader r(buf);
+    EXPECT_FALSE(read_invalidation(r).has_value());
+  }
+  {  // ReadManyResponse: also client-side
+    std::vector<std::byte> buf;
+    Writer w(buf);
+    w.varint(40'000'000);  // claimed items
+    Reader r(buf);
+    EXPECT_FALSE(read_read_many_response(r).has_value());
+  }
+}
+
 TEST(Messages, ReadRequestAndResponse) {
   std::vector<std::byte> buf;
   Writer w(buf);

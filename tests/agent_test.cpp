@@ -291,6 +291,37 @@ TEST_F(AgentTest, ChunkedSnapshotReassembles) {
   EXPECT_GT(c->stats().snapshot_bytes, 256u);
 }
 
+TEST_F(AgentTest, RejectsPathsOutsideTheServedRoot) {
+  // A peer must not be able to name anything outside the root. `..` was already
+  // refused, but an absolute/drive-letter path contains no `..` at all and
+  // fs::path::operator/ REPLACES the left side when the right has a root name,
+  // so `C:/Windows/...` used to escape the root completely.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  for (const char* escape : {"../outside.txt", "a/../../outside.txt", "C:/Windows/win.ini",
+                             "C:\\Windows\\win.ini", "D:/x", "sub:stream"}) {
+    auto r = c->read(escape, 0, 64);
+    EXPECT_FALSE(r.has_value()) << "escaped the root: " << escape;
+  }
+  // Bulk reads use the same gate: an escaping path yields no data, and a legal
+  // sibling in the same request still succeeds.
+  auto many = c->read_many({"C:/Windows/win.ini", "../outside.txt", "README.md"});
+  ASSERT_TRUE(many.has_value());
+  EXPECT_FALSE((*many)[0].has_value());
+  EXPECT_FALSE((*many)[1].has_value());
+  ASSERT_TRUE((*many)[2].has_value());
+
+  // A name that merely contains ".." is legal and must still be served.
+  write_file(root_ / "foo..bar", "dots");
+  auto ok = c->read("foo..bar", 0, 64);
+  ASSERT_TRUE(ok.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(ok->data()), ok->size()), "dots");
+}
+
 TEST_F(AgentTest, WriteThroughMutations) {
   LoopbackServer srv(root_, /*watch=*/false);  // isolate the optimistic-update path
   auto c = connect_client(srv.endpoint());
