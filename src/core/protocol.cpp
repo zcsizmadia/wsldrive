@@ -427,4 +427,52 @@ Result<RenameRequest> read_rename_request(Reader& r) noexcept {
   return q;
 }
 
+void write_read_many_request(Writer& w, const ReadManyRequest& q) {
+  w.varint(q.paths.size());
+  for (const auto& p : q.paths) w.string(p);
+}
+
+Result<ReadManyRequest> read_read_many_request(Reader& r) {
+  auto count = r.varint();
+  if (!count) return fail(count.error());
+  if (*count > r.remaining()) return fail(Errc::Corrupt);  // each path is >= 1 byte
+  ReadManyRequest q;
+  q.paths.reserve(static_cast<std::size_t>(*count));
+  for (std::uint64_t i = 0; i < *count; ++i) {
+    auto p = r.string();
+    if (!p) return fail(p.error());
+    q.paths.push_back(*p);
+  }
+  return q;
+}
+
+void write_read_many_response(Writer& w, const ReadManyResponse& p) {
+  w.varint(p.items.size());
+  for (const auto& it : p.items) {
+    w.u8(it.ok ? 1 : 0);
+    if (it.ok) w.blob(it.data);
+  }
+}
+
+Result<ReadManyResponse> read_read_many_response(Reader& r) {
+  auto count = r.varint();
+  if (!count) return fail(count.error());
+  if (*count > r.remaining()) return fail(Errc::Corrupt);
+  ReadManyResponse p;
+  p.items.reserve(static_cast<std::size_t>(*count));
+  for (std::uint64_t i = 0; i < *count; ++i) {
+    auto ok = r.u8();
+    if (!ok) return fail(ok.error());
+    ReadManyItem item;
+    item.ok = *ok != 0;
+    if (item.ok) {
+      auto data = r.blob();
+      if (!data) return fail(data.error());
+      item.data = *data;
+    }
+    p.items.push_back(item);
+  }
+  return p;
+}
+
 }  // namespace wsld::proto

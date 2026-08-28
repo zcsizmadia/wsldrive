@@ -52,6 +52,7 @@ class RootServer {
   Result<void> handle(const net::Frame& f, net::FrameChannel& ch);
   Result<void> send_snapshot(std::uint64_t request_id, net::FrameChannel& ch);
   Result<void> send_read(const net::Frame& f, net::FrameChannel& ch);
+  Result<void> send_read_many(const net::Frame& f, net::FrameChannel& ch);
   Result<void> handle_mutation(const net::Frame& f, net::FrameChannel& ch);
   Result<void> send_error(std::uint64_t request_id, Errc code, std::string_view detail, net::FrameChannel& ch);
 

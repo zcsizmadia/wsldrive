@@ -51,6 +51,9 @@ enum class MsgType : std::uint16_t {
   RenameRequest = 18,
   TruncateRequest = 19,
   Ok = 20,  // generic success for mutations with no payload
+  // Bulk read for prefetch/read-ahead (Direction B cold-read latency).
+  ReadManyRequest = 21,
+  ReadManyResponse = 22,
 };
 
 struct FrameHeader {
@@ -176,6 +179,19 @@ struct RenameRequest {
   std::string_view to;
 };
 
+// Bulk read: request several files, get each one's whole contents (or a
+// not-found marker) back in a single frame.
+struct ReadManyRequest {
+  std::vector<std::string_view> paths;
+};
+struct ReadManyItem {
+  bool ok = false;
+  std::span<const std::byte> data;  // valid iff ok; view into the frame payload
+};
+struct ReadManyResponse {
+  std::vector<ReadManyItem> items;
+};
+
 void write_attributes(Writer& w, const Attributes& a);
 [[nodiscard]] Result<Attributes> read_attributes(Reader& r) noexcept;
 
@@ -238,6 +254,11 @@ void write_truncate_request(Writer& w, const TruncateRequest& q);
 
 void write_rename_request(Writer& w, const RenameRequest& q);
 [[nodiscard]] Result<RenameRequest> read_rename_request(Reader& r) noexcept;
+
+void write_read_many_request(Writer& w, const ReadManyRequest& q);
+[[nodiscard]] Result<ReadManyRequest> read_read_many_request(Reader& r);
+void write_read_many_response(Writer& w, const ReadManyResponse& p);
+[[nodiscard]] Result<ReadManyResponse> read_read_many_response(Reader& r);
 
 /// Reserves a frame header at the end of `buf`, lets `body(Writer&)` append the
 /// payload, then fills in the header with the actual payload length.

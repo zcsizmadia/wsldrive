@@ -8,13 +8,17 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wsld::agent {
@@ -58,6 +62,11 @@ class RemoteRoot {
 
   /// Largest file the read cache will hold whole; larger reads stream uncached.
   static constexpr std::uint64_t kMaxCacheableFile = 8u << 20;
+
+  /// Reads several files in one round-trip; each result is the whole file, or
+  /// nullopt if the server could not return it (caller may fetch individually).
+  [[nodiscard]] Result<std::vector<std::optional<std::vector<std::byte>>>> read_many(
+      const std::vector<std::string>& paths, std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
   [[nodiscard]] Result<std::chrono::nanoseconds> ping(std::chrono::milliseconds timeout = std::chrono::seconds(5));
 
@@ -117,6 +126,12 @@ class RemoteRoot {
   void apply_invalidation(std::span<const std::byte> payload);
   void fail_all_pending();
   void drop_cached(std::string_view path);  // evict one read-cache entry
+  void cache_put(std::string path, std::int64_t mtime_ns, std::uint64_t size, std::vector<std::byte> data);
+
+  // Background read-ahead: on a read miss, the file's directory is queued and a
+  // worker bulk-fetches its not-yet-cached siblings so later reads hit the cache.
+  void enqueue_prefetch(std::string dir);
+  void prefetch_loop();
 
   std::unique_ptr<net::FrameChannel> ch_;
   std::thread reader_;
@@ -147,6 +162,15 @@ class RemoteRoot {
   std::uint64_t rcache_bytes_ = 0;
   std::uint64_t rcache_tick_ = 0;
   std::uint64_t rcache_cap_ = 256u << 20;  // 256 MiB
+
+  std::thread prefetch_;
+  std::mutex pf_mu_;
+  std::condition_variable pf_cv_;
+  std::deque<std::string> pf_queue_;
+  std::unordered_set<std::string> pf_seen_;  // directories already queued/prefetched
+  std::atomic<bool> pf_stop_{false};
+  static constexpr std::size_t kPrefetchBatchBytes = 4u << 20;
+  static constexpr std::size_t kPrefetchBatchCount = 512;
 };
 
 }  // namespace wsld::agent

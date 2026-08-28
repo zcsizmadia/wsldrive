@@ -364,6 +364,50 @@ TEST_F(AgentTest, ReadCacheServesRepeatReads) {
   EXPECT_EQ(c->stats().read_cache_misses, 2u);
 }
 
+TEST_F(AgentTest, ReadManyBulkFetch) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  auto res = c->read_many({"README.md", "src/main.cpp", "does/not/exist", "src/include/a.hpp"});
+  ASSERT_TRUE(res.has_value());
+  ASSERT_EQ(res->size(), 4u);
+  ASSERT_TRUE((*res)[0].has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>((*res)[0]->data()), (*res)[0]->size()), "# readme\n");
+  ASSERT_TRUE((*res)[1].has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>((*res)[1]->data()), (*res)[1]->size()), "int main() {}\n");
+  EXPECT_FALSE((*res)[2].has_value());  // missing file reported as no-value
+  ASSERT_TRUE((*res)[3].has_value());
+}
+
+TEST_F(AgentTest, PrefetchWarmsSiblings) {
+  // Many files in one directory; reading one should prefetch the rest.
+  fs::create_directories(root_ / "pf");
+  for (int i = 0; i < 40; ++i) write_file(root_ / "pf" / ("f" + std::to_string(i) + ".txt"), "data" + std::to_string(i));
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  ASSERT_TRUE(c->read("pf/f0.txt", 0, 100).has_value());  // triggers directory prefetch
+  // Wait for the background prefetch to populate the cache.
+  bool warmed = false;
+  for (int t = 0; t < 100 && !warmed; ++t) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    warmed = c->stats().read_cache_bytes > 0 &&
+             c->with_tree([](const MetadataTree&) { return true; }) &&
+             c->read("pf/f39.txt", 0, 100).has_value() && c->stats().read_cache_hits >= 1;
+  }
+  // A sibling we never explicitly read should now be a cache hit.
+  const auto hits_before = c->stats().read_cache_hits;
+  auto r = c->read("pf/f20.txt", 0, 100);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->data()), r->size()), "data20");
+  EXPECT_GT(c->stats().read_cache_hits, hits_before) << "sibling should have been prefetched";
+}
+
 TEST_F(AgentTest, ServerDisconnectFailsPendingRequests) {
   auto srv = std::make_unique<LoopbackServer>(root_, false);
   auto client = connect_client(srv->endpoint());
