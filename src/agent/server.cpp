@@ -340,7 +340,8 @@ Result<void> RootServer::send_snapshot(std::uint64_t request_id, net::FrameChann
         if (entries.size() >= budget) send_rc = flush(/*more=*/true);
       },
       ignore_.empty() ? agent::SkipPredicate{}
-                      : [this](std::string_view rel, bool is_dir) { return ignore_.ignored(rel, is_dir); });
+                      : [this](std::string_view rel, bool is_dir) { return ignore_.ignored(rel, is_dir); },
+      opts_.one_file_system);
   if (!scanned) return send_error(request_id, scanned.error(), "scan failed", ch);
   if (!send_rc) return send_rc;
   return flush(/*more=*/false);  // final frame (possibly empty) terminates the stream

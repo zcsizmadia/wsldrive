@@ -7,6 +7,10 @@
 
 #ifdef _WIN32
 #include "platform/win/wide.hpp"
+
+#include <windows.h>
+#else
+#include <sys/stat.h>
 #endif
 
 namespace wsld::agent {
@@ -82,10 +86,35 @@ Result<Attributes> read_attributes(const fs::path& p) noexcept {
   return a;
 }
 
+std::optional<std::uint64_t> device_id(const fs::path& p) noexcept {
+#ifdef _WIN32
+  // The volume serial identifies the filesystem; a directory handle needs
+  // FILE_FLAG_BACKUP_SEMANTICS. Reparse points are followed on purpose: a
+  // junction to another volume reports that volume, which is what we compare.
+  const HANDLE h = ::CreateFileW(p.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return std::nullopt;
+  BY_HANDLE_FILE_INFORMATION info{};
+  const BOOL ok = ::GetFileInformationByHandle(h, &info);
+  ::CloseHandle(h);
+  if (!ok) return std::nullopt;
+  return static_cast<std::uint64_t>(info.dwVolumeSerialNumber);
+#else
+  struct ::stat st {};
+  if (::stat(p.c_str(), &st) != 0) return std::nullopt;
+  return static_cast<std::uint64_t>(st.st_dev);
+#endif
+}
+
 Result<ScanStats> scan_tree(const fs::path& root, const std::function<void(const SnapshotEntry&)>& on_entry,
-                            const SkipPredicate& skip) {
+                            const SkipPredicate& skip, bool one_file_system) {
   std::error_code ec;
   if (!fs::is_directory(root, ec)) return fail(Errc::NotADirectory);
+
+  // Filesystem the root lives on; directories on any other one are reported but
+  // not descended into. Unknown (nullopt) disables the check rather than
+  // silently pruning everything.
+  const std::optional<std::uint64_t> root_dev = one_file_system ? device_id(root) : std::nullopt;
 
   ScanStats stats;
   struct Pending {
@@ -126,10 +155,21 @@ Result<ScanStats> scan_tree(const fs::path& root, const std::function<void(const
       }
       on_entry(SnapshotEntry{dir.index, name, a});
       switch (a.kind) {
-        case NodeKind::Directory:
+        case NodeKind::Directory: {
           ++stats.directories;
-          queue.push_back(Pending{e.path(), std::move(rel), next_index});
+          // A directory on another filesystem (a mount point) is reported as an
+          // empty directory rather than traversed — see one_file_system.
+          bool descend = true;
+          if (root_dev) {
+            const auto dev = device_id(e.path());
+            if (dev && *dev != *root_dev) {
+              descend = false;
+              ++stats.skipped;
+            }
+          }
+          if (descend) queue.push_back(Pending{e.path(), std::move(rel), next_index});
           break;
+        }
         case NodeKind::File: ++stats.files; break;
         case NodeKind::Symlink: ++stats.symlinks; break;
         case NodeKind::Other: break;

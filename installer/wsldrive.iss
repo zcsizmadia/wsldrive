@@ -124,7 +124,7 @@ begin
     'wsldrive will map the WSL folder below to the drive letter.');
   PageA.Add('Drive letter (e.g. W):', False);
   PageA.Add('WSL distro:', False);
-  PageA.Add('Folder inside the distro:', False);
+  PageA.Add('Folder inside the distro (~ = home, / = whole distro):', False);
   PageA.Values[0] := 'W';
   PageA.Values[1] := distro;
   PageA.Values[2] := '~';

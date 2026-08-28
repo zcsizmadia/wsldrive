@@ -19,8 +19,11 @@ namespace {
 void usage() {
   std::fputs(
       "usage: wsldrived --root <dir> (--listen <endpoint> | --connect <endpoint>) [--no-watch] [--exit-when-idle]\n"
+      "                 [--cross-filesystems]\n"
       "  endpoints: tcp://host:port | vsock://cid:port | hv://port\n"
-      "  --exit-when-idle: serve a single client session then exit (used by auto-launch)\n",
+      "  --exit-when-idle:    serve a single client session then exit (used by auto-launch)\n"
+      "  --cross-filesystems: also descend into mount points below --root. Off by default, so\n"
+      "                       serving / skips /proc, /sys, /dev, /run and foreign mounts like /mnt/c.\n",
       stderr);
 }
 
@@ -31,6 +34,7 @@ int main(int argc, char** argv) {
   std::string listen, connect;
   bool watch = true;
   bool exit_when_idle = false;
+  bool one_file_system = true;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
     auto next = [&](std::string& out) {
@@ -52,6 +56,8 @@ int main(int argc, char** argv) {
       watch = false;
     } else if (a == "--exit-when-idle") {
       exit_when_idle = true;
+    } else if (a == "--cross-filesystems") {
+      one_file_system = false;
     } else {
       usage();
       return 2;
@@ -62,7 +68,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  wsld::agent::RootServer server({.root = root, .watch = watch});
+  wsld::agent::RootServer server({.root = root, .watch = watch, .one_file_system = one_file_system});
   if (auto r = server.start(); !r) {
     std::fprintf(stderr, "wsldrived: cannot start: %s\n", wsld::to_string(r.error()));
     return 1;
