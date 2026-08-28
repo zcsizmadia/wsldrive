@@ -6,3 +6,6 @@ out/
 *.user
 *.swp
 CMakeUserPresets.json
+
+# transient logs
+*.log
