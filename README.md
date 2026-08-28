@@ -1,5 +1,7 @@
 # wsldrive
 
+[![CI](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml/badge.svg)](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml)
+
 Native-speed file access across the WSL2 boundary, in both directions:
 
 - **Direction A (primary):** mount a WSL2 ext4 path as a real Windows drive letter so
