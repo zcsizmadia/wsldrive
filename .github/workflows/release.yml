@@ -82,7 +82,7 @@ jobs:
         shell: pwsh
         run: |
           cmake --preset msvc-release
-          cmake --build --preset msvc-release --target wsldrive wsldrived --parallel
+          cmake --build --preset msvc-release --target wsldrive wsldrived wsldrivew --parallel
 
       - name: Verify mount support was compiled in
         shell: pwsh
@@ -119,9 +119,9 @@ jobs:
           Copy-Item installer\dist\wsldrive-setup.exe staging\
           # Zip of raw binaries + the script installer, for the no-build script path.
           $z = 'staging\wsldrive-windows-x64.zip'
-          Copy-Item build\msvc-release\src\tools\wsldrive.exe,build\msvc-release\src\tools\wsldrived.exe .
+          Copy-Item build\msvc-release\src\tools\wsldrive.exe,build\msvc-release\src\tools\wsldrived.exe,build\msvc-release\src\tools\wsldrivew.exe .
           Compress-Archive -Force -DestinationPath $z -Path `
-            wsldrive.exe,wsldrived.exe,scripts\install.ps1,scripts\register-hvsocket.ps1,README.md,LICENSE
+            wsldrive.exe,wsldrived.exe,wsldrivew.exe,scripts\install.ps1,scripts\register-hvsocket.ps1,README.md,LICENSE
           Copy-Item build\linux-release\src\tools\wsldrive  staging\wsldrive-linux-x64
           Copy-Item build\linux-release\src\tools\wsldrived staging\wsldrived-linux-x64
 
