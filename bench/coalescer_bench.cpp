@@ -1,3 +1,4 @@
+#include "bench_util.hpp"
 #include "core/coalescer.hpp"
 
 #include <benchmark/benchmark.h>
@@ -33,7 +34,7 @@ void BM_CoalesceCheckoutBurst(benchmark::State& state) {
     auto ops = c.take();
     benchmark::DoNotOptimize(ops);
   }
-  state.SetItemsProcessed(state.iterations() * paths.size() * 3);
+  state.SetItemsProcessed(scaled(state.iterations(), paths.size() * 3));
 }
 BENCHMARK(BM_CoalesceCheckoutBurst)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
 
@@ -60,7 +61,7 @@ void BM_CoalesceRemoveTreeCollapse(benchmark::State& state) {
     auto ops = c.take();
     benchmark::DoNotOptimize(ops);
   }
-  state.SetItemsProcessed(state.iterations() * (paths.size() + 1));
+  state.SetItemsProcessed(scaled(state.iterations(), paths.size() + 1));
 }
 BENCHMARK(BM_CoalesceRemoveTreeCollapse)->Unit(benchmark::kMicrosecond);
 

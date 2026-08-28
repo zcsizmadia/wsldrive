@@ -1,3 +1,4 @@
+#include "bench_util.hpp"
 #include "core/flat_map.hpp"
 
 #include <benchmark/benchmark.h>
@@ -23,7 +24,7 @@ void BM_U64MapInsert(benchmark::State& state) {
     for (std::size_t i = 0; i < ks.size(); ++i) m.insert_or_assign(ks[i], static_cast<std::uint32_t>(i));
     benchmark::DoNotOptimize(m.size());
   }
-  state.SetItemsProcessed(state.iterations() * ks.size());
+  state.SetItemsProcessed(scaled(state.iterations(), ks.size()));
 }
 BENCHMARK(BM_U64MapInsert)->Arg(1 << 10)->Arg(1 << 17)->Arg(1 << 20)->Unit(benchmark::kMicrosecond);
 
@@ -34,7 +35,7 @@ void BM_StdUnorderedMapInsert(benchmark::State& state) {
     for (std::size_t i = 0; i < ks.size(); ++i) m.insert_or_assign(ks[i], static_cast<std::uint32_t>(i));
     benchmark::DoNotOptimize(m.size());
   }
-  state.SetItemsProcessed(state.iterations() * ks.size());
+  state.SetItemsProcessed(scaled(state.iterations(), ks.size()));
 }
 BENCHMARK(BM_StdUnorderedMapInsert)->Arg(1 << 10)->Arg(1 << 17)->Arg(1 << 20)->Unit(benchmark::kMicrosecond);
 

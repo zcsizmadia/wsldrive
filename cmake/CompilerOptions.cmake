@@ -21,7 +21,8 @@ if(MSVC)
     WIN32_LEAN_AND_MEAN
     UNICODE _UNICODE)
   target_link_options(wsldrive_options INTERFACE
-    $<$<CONFIG:Release,RelWithDebInfo>:/OPT:REF /OPT:ICF>)
+    $<$<CONFIG:Release,RelWithDebInfo>:/OPT:REF /OPT:ICF>
+    $<$<BOOL:${WSLDRIVE_WARNINGS_AS_ERRORS}>:/WX>)
 else()
   target_compile_options(wsldrive_options INTERFACE
     -Wall -Wextra -Wpedantic
@@ -29,6 +30,8 @@ else()
     -Wnon-virtual-dtor -Wold-style-cast -Wcast-align
     -Wnull-dereference -Wdouble-promotion -Wimplicit-fallthrough
     $<$<BOOL:${WSLDRIVE_WARNINGS_AS_ERRORS}>:-Werror>)
+  target_link_options(wsldrive_options INTERFACE
+    $<$<BOOL:${WSLDRIVE_WARNINGS_AS_ERRORS}>:-Wl,--fatal-warnings>)
 endif()
 
 # Link-time optimisation for optimised builds where the toolchain supports it.

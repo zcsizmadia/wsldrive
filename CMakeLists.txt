@@ -16,7 +16,7 @@ endif()
 
 option(WSLDRIVE_BUILD_TESTS "Build unit tests" ON)
 option(WSLDRIVE_BUILD_BENCHMARKS "Build micro-benchmarks" ON)
-option(WSLDRIVE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+option(WSLDRIVE_WARNINGS_AS_ERRORS "Treat compiler and linker warnings as errors" ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerOptions)

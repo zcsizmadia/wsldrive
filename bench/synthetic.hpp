@@ -22,7 +22,8 @@ struct SyntheticTree {
 
   static SyntheticTree build(int dirs, int sub, int files) {
     SyntheticTree s;
-    s.file_paths.reserve(static_cast<std::size_t>(dirs) * sub * files);
+    s.file_paths.reserve(static_cast<std::size_t>(dirs) * static_cast<std::size_t>(sub) *
+                         static_cast<std::size_t>(files));
     for (int d = 0; d < dirs; ++d) {
       const std::string dname = "module_" + std::to_string(d);
       const NodeId dn = *s.tree.insert(s.tree.root(), dname, kDirAttr);
