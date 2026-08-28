@@ -39,3 +39,19 @@ jobs:
         run: cmake --build --preset linux-release --parallel
       - name: Test
         run: ctest --preset linux-release
+
+  benchmarks:
+    name: Benchmarks (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev
+      - name: Configure
+        run: cmake --preset linux-release
+      - name: Build benchmarks
+        run: cmake --build --preset linux-release --target core_bench --parallel
+      # A tiny min-time keeps this fast; it verifies the benchmarks run, not their
+      # numbers (shared runners are too noisy to gate on timings).
+      - name: Run benchmarks
+        run: ./build/linux-release/bench/core_bench --benchmark_min_time=0.01s
