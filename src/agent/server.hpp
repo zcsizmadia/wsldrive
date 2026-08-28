@@ -48,7 +48,11 @@ class RootServer {
   Result<void> handle(const net::Frame& f, net::FrameChannel& ch);
   Result<void> send_snapshot(std::uint64_t request_id, net::FrameChannel& ch);
   Result<void> send_read(const net::Frame& f, net::FrameChannel& ch);
+  Result<void> handle_mutation(const net::Frame& f, net::FrameChannel& ch);
   Result<void> send_error(std::uint64_t request_id, Errc code, std::string_view detail, net::FrameChannel& ch);
+
+  // Resolves a client-supplied relative path against the root, rejecting escapes.
+  [[nodiscard]] Result<std::filesystem::path> resolve(std::string_view rel) const;
 
   void on_event(const FsEvent& ev);
   void flush_loop();

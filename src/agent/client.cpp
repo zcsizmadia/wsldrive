@@ -1,5 +1,6 @@
 #include "agent/client.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace wsld::agent {
@@ -94,6 +95,115 @@ Result<std::chrono::nanoseconds> RemoteRoot::ping(std::chrono::milliseconds time
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Pong) return fail(Errc::ProtocolError);
   return std::chrono::steady_clock::now() - t0;
+}
+
+Result<void> RemoteRoot::create_file(std::string_view path, std::uint32_t mode, std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_create_request(w, proto::CreateRequest{.path = path, .mode = mode});
+  auto p = request(proto::MsgType::CreateRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::CreateResponse) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto attr = proto::read_attributes(r);
+  if (!attr) return fail(attr.error());
+  std::unique_lock lock(tree_mu_);
+  (void)tree_.upsert_path(path, *attr);
+  return {};
+}
+
+Result<std::uint64_t> RemoteRoot::write(std::string_view path, std::uint64_t offset, std::span<const std::byte> data,
+                                        std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_write_request(w, proto::WriteRequest{.path = path, .offset = offset, .data = data});
+  auto p = request(proto::MsgType::WriteRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::WriteResponse) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto resp = proto::read_write_response(r);
+  if (!resp) return fail(resp.error());
+  const std::uint64_t end = offset + resp->written;
+  std::unique_lock lock(tree_mu_);
+  if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
+    Attributes a = tree_.node(*id).attr;
+    a.size = std::max(a.size, end);
+    (void)tree_.set_attributes(*id, a);
+  } else {
+    (void)tree_.upsert_path(path, Attributes{.size = end, .mtime_ns = 0, .mode = 0644, .kind = NodeKind::File});
+  }
+  return resp->written;
+}
+
+Result<void> RemoteRoot::truncate(std::string_view path, std::uint64_t size, std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_truncate_request(w, proto::TruncateRequest{.path = path, .size = size});
+  auto p = request(proto::MsgType::TruncateRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  std::unique_lock lock(tree_mu_);
+  if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
+    Attributes a = tree_.node(*id).attr;
+    a.size = size;
+    (void)tree_.set_attributes(*id, a);
+  }
+  return {};
+}
+
+Result<void> RemoteRoot::mkdir(std::string_view path, std::uint32_t mode, std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_mkdir_request(w, proto::MkdirRequest{.path = path, .mode = mode});
+  auto p = request(proto::MsgType::MkdirRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  std::unique_lock lock(tree_mu_);
+  (void)tree_.upsert_path(path, Attributes{.size = 0, .mtime_ns = 0, .mode = mode, .kind = NodeKind::Directory});
+  return {};
+}
+
+Result<void> RemoteRoot::unlink(std::string_view path, std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_path_request(w, proto::PathRequest{.path = path});
+  auto p = request(proto::MsgType::UnlinkRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  std::unique_lock lock(tree_mu_);
+  (void)tree_.remove_path(path);
+  return {};
+}
+
+Result<void> RemoteRoot::rmdir(std::string_view path, std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_path_request(w, proto::PathRequest{.path = path});
+  auto p = request(proto::MsgType::RmdirRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  std::unique_lock lock(tree_mu_);
+  (void)tree_.remove_path(path);
+  return {};
+}
+
+Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std::chrono::milliseconds timeout) {
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_rename_request(w, proto::RenameRequest{.from = from, .to = to});
+  auto p = request(proto::MsgType::RenameRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  std::unique_lock lock(tree_mu_);
+  Attributes moved{.size = 0, .mtime_ns = 0, .mode = 0644, .kind = NodeKind::File};
+  bool have = false;
+  if (const auto id = tree_.lookup(from, LookupMode::Exact)) {
+    moved = tree_.node(*id).attr;
+    have = true;
+  }
+  (void)tree_.remove_path(from);
+  if (have) (void)tree_.upsert_path(to, moved);
+  return {};
 }
 
 Result<std::shared_ptr<RemoteRoot::Pending>> RemoteRoot::request(proto::MsgType type, std::span<const std::byte> payload,

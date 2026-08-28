@@ -325,4 +325,106 @@ Result<ErrorMessage> read_error(Reader& r) noexcept {
   return e;
 }
 
+void write_write_request(Writer& w, const WriteRequest& q) {
+  w.u64(q.offset);
+  w.string(q.path);
+  w.blob(q.data);
+}
+
+Result<WriteRequest> read_write_request(Reader& r) noexcept {
+  WriteRequest q;
+  auto off = r.u64();
+  if (!off) return fail(off.error());
+  q.offset = *off;
+  auto path = r.string();
+  if (!path) return fail(path.error());
+  q.path = *path;
+  auto data = r.blob();
+  if (!data) return fail(data.error());
+  q.data = *data;
+  return q;
+}
+
+void write_write_response(Writer& w, const WriteResponse& p) { w.u64(p.written); }
+
+Result<WriteResponse> read_write_response(Reader& r) noexcept {
+  auto n = r.u64();
+  if (!n) return fail(n.error());
+  return WriteResponse{*n};
+}
+
+void write_create_request(Writer& w, const CreateRequest& q) {
+  w.varint(q.mode);
+  w.string(q.path);
+}
+
+Result<CreateRequest> read_create_request(Reader& r) noexcept {
+  CreateRequest q;
+  auto mode = r.varint();
+  if (!mode) return fail(mode.error());
+  if (*mode > 0xFFFFFFFFULL) return fail(Errc::Corrupt);
+  q.mode = static_cast<std::uint32_t>(*mode);
+  auto path = r.string();
+  if (!path) return fail(path.error());
+  q.path = *path;
+  return q;
+}
+
+void write_mkdir_request(Writer& w, const MkdirRequest& q) {
+  w.varint(q.mode);
+  w.string(q.path);
+}
+
+Result<MkdirRequest> read_mkdir_request(Reader& r) noexcept {
+  MkdirRequest q;
+  auto mode = r.varint();
+  if (!mode) return fail(mode.error());
+  if (*mode > 0xFFFFFFFFULL) return fail(Errc::Corrupt);
+  q.mode = static_cast<std::uint32_t>(*mode);
+  auto path = r.string();
+  if (!path) return fail(path.error());
+  q.path = *path;
+  return q;
+}
+
+void write_path_request(Writer& w, const PathRequest& q) { w.string(q.path); }
+
+Result<PathRequest> read_path_request(Reader& r) noexcept {
+  auto path = r.string();
+  if (!path) return fail(path.error());
+  return PathRequest{*path};
+}
+
+void write_truncate_request(Writer& w, const TruncateRequest& q) {
+  w.u64(q.size);
+  w.string(q.path);
+}
+
+Result<TruncateRequest> read_truncate_request(Reader& r) noexcept {
+  TruncateRequest q;
+  auto size = r.u64();
+  if (!size) return fail(size.error());
+  q.size = *size;
+  auto path = r.string();
+  if (!path) return fail(path.error());
+  q.path = *path;
+  return q;
+}
+
+void write_rename_request(Writer& w, const RenameRequest& q) {
+  w.string(q.from);
+  w.string(q.to);
+}
+
+Result<RenameRequest> read_rename_request(Reader& r) noexcept {
+  RenameRequest q;
+  auto from = r.string();
+  if (!from) return fail(from.error());
+  q.from = *from;
+  auto to = r.string();
+  if (!to) return fail(to.error());
+  q.to = *to;
+  return q;
+}
+
 }  // namespace wsld::proto
