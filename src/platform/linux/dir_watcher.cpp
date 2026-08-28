@@ -9,6 +9,7 @@
 #include "platform/watcher.hpp"
 
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <unistd.h>
 
@@ -49,6 +50,7 @@ class InotifyWatcher final : public Watcher {
 
   Result<void> start() {
     if (::pipe(stop_pipe_) != 0) return fail(Errc::IoError);
+    root_dev_ = device_of(root_);
     add_watch_recursive(root_, "");
     if (wd_to_dir_.empty()) return fail(Errc::IoError);  // could not watch even the root
     thread_ = std::thread([this] { run(); });
@@ -71,6 +73,13 @@ class InotifyWatcher final : public Watcher {
   }
 
  private:
+  // Filesystem a path lives on; 0 when it cannot be determined.
+  static dev_t device_of(const std::filesystem::path& p) noexcept {
+    struct ::stat st {};
+    if (::stat(p.c_str(), &st) != 0) return 0;
+    return st.st_dev;
+  }
+
   void add_watch_recursive(const std::filesystem::path& abs, const std::string& rel) {
     const int wd = ::inotify_add_watch(fd_, abs.c_str(), kMask);
     if (wd < 0) return;
@@ -80,8 +89,12 @@ class InotifyWatcher final : public Watcher {
     for (const auto& e : std::filesystem::directory_iterator(abs, std::filesystem::directory_options::skip_permission_denied, ec)) {
       if (ec) break;
       std::error_code ec2;
-      if (e.is_directory(ec2) && !e.is_symlink(ec2))
-        add_watch_recursive(e.path(), join_rel(rel, e.path().filename().c_str()));
+      if (!e.is_directory(ec2) || e.is_symlink(ec2)) continue;
+      // Stay on the root's filesystem, exactly like the scanner: descending into
+      // mount points would walk /proc and /sys, and — far worse — recursively
+      // enumerate /mnt/c (the whole Windows drive) back across the boundary.
+      if (root_dev_ != 0 && device_of(e.path()) != root_dev_) continue;
+      add_watch_recursive(e.path(), join_rel(rel, e.path().filename().c_str()));
     }
   }
 
@@ -158,6 +171,7 @@ class InotifyWatcher final : public Watcher {
 
   int fd_;
   std::filesystem::path root_;
+  dev_t root_dev_ = 0;  // filesystem of root_; watches never leave it
   WatchCallback cb_;
   int stop_pipe_[2];
   std::unordered_map<int, std::string> wd_to_dir_;   // watch descriptor -> dir rel path
