@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="wsldrive logo" width="120" height="120">
+</p>
+
 # wsldrive
 
 [![CI](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml/badge.svg)](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml)
