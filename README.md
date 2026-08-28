@@ -34,28 +34,37 @@ has neither problem and is unsupported by design.
 
 ## Install
 
-However you install it, the outcome is the same: the installer confirms each choice with you first —
-drive letter, distro, paths, and whether to restart WSL — then does *everything else itself* (installs
-the binaries, checks for / chain-installs WinFsp, registers the Hyper-V socket services, restarts WSL
-once with your OK, and registers an at-logon task that mounts on every boot and re-discovers the dynamic
-WSL VM GUID each time). The one-time elevation steps and the single `wsl --shutdown` are the installer's
-job — the only thing you supply is what to mount where. Pick whichever route below suits you.
+The installer confirms each choice with you first, then does *everything else itself* — installs the
+binaries, checks for / chain-installs WinFsp, creates an at-logon task that mounts on every boot, and
+tears it all down cleanly on uninstall. The only thing you supply is what to mount where.
+
+**Two modes:**
+
+- **Easy (default) — Direction A only.** Mounts a WSL folder as a Windows drive letter over loopback TCP.
+  No elevation for the mount, no registry changes, no WSL restart; the drive is visible to your normal
+  apps and comes back on every reboot. This is the common case and the biggest WSL2 pain.
+- **Advanced — Direction A *and* B, side by side.** Adds a Windows folder mounted *inside* WSL
+  (a Linux path, not a drive letter). Direction B uses the Hyper-V socket transport, which needs a
+  one-time elevated registration and a single `wsl --shutdown` — the installer does both.
 
 ### 1. Download the installer (easiest — no build)
 
 Grab **`wsldrive-setup.exe`** from the [latest release](https://github.com/zcsizmadia/wsldrive/releases/latest)
-and run it. It's a wizard: choose the direction(s), confirm the details, done. Each release also ships
-`wsldrive-windows-x64.zip` (raw binaries + the install script, for the route below) and
-`wsldrive-linux-x64` (the Direction B client).
+and run it. The wizard sets up Direction A by default; tick **Advanced** to also add Direction B. Each
+release also ships `wsldrive-windows-x64.zip` (raw binaries + the install script) and `wsldrive-linux-x64`
+(the Direction B client).
 
 ### 2. Run the script (no packaging — for CI, locked-down machines, or preference)
 
-Download `wsldrive-windows-x64.zip` (or clone the repo), then from an **elevated** PowerShell:
+Download `wsldrive-windows-x64.zip` from the [latest release](https://github.com/zcsizmadia/wsldrive/releases/latest)
+(or clone the repo), then from an **elevated** PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1   # interactive: asks + confirms
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1   # interactive: Direction A (easy)
+scripts\install.ps1 -Advanced        # also offer Direction B
 scripts\install.ps1 -DryRun          # print the full plan, change nothing
-scripts\install.ps1 -Unattended -DriveLetter W -Distro Ubuntu -WslRoot '~' -Yes
+scripts\install.ps1 -Unattended -DriveLetter W -Distro Ubuntu -WslRoot '~' -Yes          # Direction A
+scripts\install.ps1 -Unattended -DriveLetter W -WinRoot C:\projects -Mountpoint '~/win' -Yes  # A + B
 scripts\install.ps1 -Uninstall       # remove tasks + registration + binaries
 ```
 
