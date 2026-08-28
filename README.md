@@ -45,6 +45,12 @@ With `--distro`, `wsldrive` starts `wsldrived` in the distro over `wsl.exe`, wai
 listen, mounts, and tears the agent down on exit (the agent also self-terminates if the Windows
 side goes away). Ctrl+C unmounts cleanly.
 
+Add `--hvsocket` to use the **Hyper-V socket transport** instead of loopback TCP — the agent listens
+on `vsock` and the client connects over `AF_HYPERV`, bypassing the localhost relay. This is what makes
+the WSL→Windows direction fast (see `bench/RESULTS.md`). One-time setup: run
+`scripts/register-hvsocket.ps1` elevated and `wsl --shutdown`. The WSL VM GUID is discovered via
+`hcsdiag` (Hyper-V admin) or passed with `--vm-guid`.
+
 Drop a `.wsldriveignore` at the served root (gitignore-style: `node_modules/`, `*.log`, `/build`, ...)
 to exclude directories from the mounted view and from sync — handy for keeping build output and vendored
 trees off the drive.

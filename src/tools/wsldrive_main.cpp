@@ -45,6 +45,7 @@ void usage() {
 #ifdef WSLDRIVE_HAVE_WINFSP
       "  wsldrive mount <drive> --distro <name> --wsl-root <path> [--agent <path>] [--port N]\n"
       "                                                       (auto-launch the agent in the distro)\n"
+      "     add --hvsocket [--vm-guid <guid>]                 (use the Hyper-V socket transport)\n"
 #endif
       ,
       stderr);
@@ -157,6 +158,8 @@ int main(int argc, char** argv) {
     std::uint32_t port = 51789;
     bool have_distro = false;
     bool writeback = false;
+    bool hvsocket = false;
+    std::string vm_guid;
     for (int i = 3; i < argc; ++i) {
       const std::string_view a = argv[i];
       auto val = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
@@ -164,6 +167,10 @@ int main(int argc, char** argv) {
         connect = val();
       else if (a == "--listen")
         listen = val();
+      else if (a == "--hvsocket")
+        hvsocket = true;
+      else if (a == "--vm-guid")
+        vm_guid = val();
       else if (a == "--writeback")
         writeback = true;
       else if (a == "--distro") {
@@ -189,12 +196,33 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "wsldrive: --wsl-root is required with --distro\n");
         return 2;
       }
-      if (auto r = agent.start({.distro = distro, .agent_path = agent_path, .wsl_root = wsl_root, .port = port}); !r) {
+      // WSL2 routes hvsocket host->guest: the agent listens on vsock and this
+      // client connects to the guest VM over AF_HYPERV. Needs a registered vsock
+      // port (scripts/register-hvsocket.ps1) and the VM's GUID.
+      if (hvsocket && port == 51789) port = 5700;  // a registered vsock port by default
+      wsld::platform::WslAgentSpec spec{.distro = distro, .agent_path = agent_path, .wsl_root = wsl_root, .port = port};
+      if (hvsocket) {
+        std::string guid = vm_guid.empty() ? wsld::platform::discover_wsl_vm_guid() : vm_guid;
+        if (guid.empty()) {
+          std::fprintf(stderr,
+                       "wsldrive: could not determine the WSL VM GUID for --hvsocket.\n"
+                       "  Pass --vm-guid <guid> (from an elevated `hcsdiag list`), or run elevated.\n");
+          return 2;
+        }
+        spec.listen = "vsock://any:" + std::to_string(port);
+        connect = "hv://{" + guid + "}:" + std::to_string(port);
+      }
+      if (auto r = agent.start(spec); !r) {
         std::fprintf(stderr, "wsldrive: failed to launch agent in distro '%s'\n", distro.c_str());
         return 1;
       }
-      connect = "tcp://127.0.0.1:" + std::to_string(port);
-      std::printf("launched agent in %s, waiting for it to listen...\n", distro.empty() ? "(default distro)" : distro.c_str());
+      if (!hvsocket) connect = "tcp://127.0.0.1:" + std::to_string(port);
+      std::printf("launched agent in %s over %s, waiting for it to listen...\n",
+                  distro.empty() ? "(default distro)" : distro.c_str(), hvsocket ? "hvsocket" : "tcp");
+      std::fflush(stdout);
+      // A hvsocket connect() blocks for a long OS timeout if the service is not
+      // yet listening (unlike TCP's fast refusal), so let the agent bind first.
+      if (hvsocket) std::this_thread::sleep_for(std::chrono::milliseconds(2500));
     } else
 #endif
         if (connect.empty() && listen.empty()) {
@@ -214,6 +242,8 @@ int main(int argc, char** argv) {
     (void)wsl_root;
     (void)agent_path;
     (void)port;
+    (void)hvsocket;
+    (void)vm_guid;
     (void)have_distro;
     std::string source;
     wsld::Result<wsld::net::Socket> sock = wsld::fail(wsld::Errc::ConnectionClosed);
