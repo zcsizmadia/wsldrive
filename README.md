@@ -2,17 +2,32 @@
 
 [![CI](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml/badge.svg)](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml)
 
-Native-speed file access across the **WSL2** boundary, in both directions:
+**Cross the WSL2 filesystem boundary at native speed — in both directions.**
+
+Anyone doing real work in WSL2 hits the same wall: files on the *other* side of the VM boundary are
+slow. Opening a WSL source tree from Visual Studio or Explorer crawls over `\\wsl.localhost`; a Linux
+build reading `/mnt/c` stalls on every file. It's the single most common WSL2 complaint, and it taxes
+every edit-build-test loop that spans the two worlds.
+
+`wsldrive` makes that boundary disappear. It keeps the whole directory tree's metadata in RAM on the
+side that's reading, caches file contents, and moves bytes over a **Hyper-V socket** instead of the OS's
+network filesystem — so cross-boundary access runs **5–15× faster on reads** (more on metadata) than the
+paths Windows and WSL ship:
+
+|   | today (OS path) | with wsldrive | speedup |
+|---|--:|--:|--:|
+| **Windows reading WSL files** (read 3000 files) | 2856 ms (`\\wsl.localhost`) | 366 ms | **~8×** |
+| **WSL reading Windows files** (read 3000 files) | 5853 ms (`/mnt/c`) | 383 ms | **~15×** |
+| directory walk, either direction | 100–400 ms | ~12–39 ms | **~3–30×** |
+
+Both directions are read-write and mount *alongside* the built-in paths — nothing to replace, no kernel
+driver of its own (WinFsp on Windows, libfuse3 in WSL). Full numbers in [`bench/RESULTS.md`](bench/RESULTS.md).
 
 - **Direction A — WSL2 ext4 as a Windows drive letter.** Windows-only tools (Visual Studio, GitHub
   Desktop, Explorer/Search, Unity, Office) reach a WSL source tree without paying the `\\wsl.localhost`
   Plan 9 tax.
 - **Direction B — a Windows drive mounted inside WSL2.** Linux tools read/write an NTFS tree without the
   `/mnt/c` 9P/virtiofs tax.
-
-Both are read-write, keep all metadata in RAM on the accessing side, cache file contents, and (over the
-Hyper-V socket transport) are **~10× faster than the OS cross-boundary paths** — see
-[`bench/RESULTS.md`](bench/RESULTS.md).
 
 WSL2 only. WSL1 has no VM boundary (DrvFs runs in the NT kernel, `\\wsl$` is served in-process), so it
 has neither problem and is unsupported by design.
