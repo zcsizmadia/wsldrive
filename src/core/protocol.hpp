@@ -54,6 +54,10 @@ enum class MsgType : std::uint16_t {
   // Bulk read for prefetch/read-ahead (Direction B cold-read latency).
   ReadManyRequest = 21,
   ReadManyResponse = 22,
+  // Symlink target, so a link listed in the tree can be followed from the other
+  // side. Request payload is a PathRequest.
+  ReadlinkRequest = 23,
+  ReadlinkResponse = 24,
 };
 
 struct FrameHeader {
@@ -195,6 +199,10 @@ struct ReadManyResponse {
   std::vector<ReadManyItem> items;
 };
 
+struct ReadlinkResponse {
+  std::string_view target;  // as stored in the link, '/'-separated
+};
+
 void write_attributes(Writer& w, const Attributes& a);
 [[nodiscard]] Result<Attributes> read_attributes(Reader& r) noexcept;
 
@@ -262,6 +270,9 @@ void write_read_many_request(Writer& w, const ReadManyRequest& q);
 [[nodiscard]] Result<ReadManyRequest> read_read_many_request(Reader& r);
 void write_read_many_response(Writer& w, const ReadManyResponse& p);
 [[nodiscard]] Result<ReadManyResponse> read_read_many_response(Reader& r);
+
+void write_readlink_response(Writer& w, const ReadlinkResponse& p);
+[[nodiscard]] Result<ReadlinkResponse> read_readlink_response(Reader& r) noexcept;
 
 /// Reserves a frame header at the end of `buf`, lets `body(Writer&)` append the
 /// payload, then fills in the header with the actual payload length.

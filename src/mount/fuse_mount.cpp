@@ -286,6 +286,21 @@ int op_read(const char* path, char* buf, size_t size, OffT offset, struct fuse_f
   return static_cast<int>(*n);
 }
 
+// The target is handed over as stored on the serving side. A relative target
+// resolves against the link's directory on the mount, which is what makes
+// `.cache -> ../var/cache` or `python -> python3.12` work from the other side.
+// An absolute Linux target seen from Windows (or vice versa) names a path that
+// does not exist there - the link is then a dangling one, which is honest.
+int op_readlink(const char* path, char* buf, size_t size) {
+  if (size == 0) return -EINVAL;
+  auto target = ctx()->root->readlink(to_rel(path));
+  if (!target) return err_to_errno(target.error());
+  const std::size_t n = std::min(target->size(), size - 1);  // FUSE wants a NUL-terminated string
+  std::memcpy(buf, target->data(), n);
+  buf[n] = '\0';
+  return 0;
+}
+
 int op_statfs(const char*, StatvfsT* st) {
   // WinFsp refuses writes ("device error") without free space reported; advertise
   // a large backing store (the real limit is the served volume).
@@ -346,6 +361,7 @@ fuse_operations make_ops() {
   ops.rmdir = op_rmdir;
   ops.rename = op_rename;
   ops.statfs = op_statfs;
+  ops.readlink = op_readlink;  // without it every symlink in the tree shows as broken
   ops.fsync = op_fsync;
   ops.chmod = op_chmod;      // accepted (not persisted) - git aborts a clone without it
   ops.utimens = op_utimens;  // likewise, so `touch` and build tools work

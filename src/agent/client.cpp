@@ -506,6 +506,27 @@ Result<std::chrono::nanoseconds> RemoteRoot::ping(std::chrono::milliseconds time
 void RemoteRoot::drop_cached(std::string_view path) {
   std::lock_guard lock(rcache_mu_);
   if (const auto it = rcache_.find(path); it != rcache_.end()) cache_erase(it);
+  if (const auto it = link_cache_.find(path); it != link_cache_.end()) link_cache_.erase(it);
+}
+
+Result<std::string> RemoteRoot::readlink(std::string_view path, std::chrono::milliseconds timeout) {
+  {
+    std::lock_guard lock(rcache_mu_);
+    if (const auto it = link_cache_.find(path); it != link_cache_.end()) return it->second;
+  }
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_path_request(w, proto::PathRequest{.path = path});
+  auto p = request(proto::MsgType::ReadlinkRequest, pl, timeout);
+  if (!p) return fail(p.error());
+  if ((*p)->type != proto::MsgType::ReadlinkResponse) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto resp = proto::read_readlink_response(r);
+  if (!resp) return fail(resp.error());
+  std::string target(resp->target);
+  std::lock_guard lock(rcache_mu_);
+  link_cache_.insert_or_assign(std::string(path), target);
+  return target;
 }
 
 Result<void> RemoteRoot::create_file(std::string_view path, std::uint32_t mode, std::chrono::milliseconds timeout) {
@@ -763,12 +784,15 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
     rs_requested_ = true;
     rs_cv_.notify_one();
   }
-  // Drop cached contents for any changed path so the next read refetches.
+  // Drop cached contents (and link targets) for any changed path so the next
+  // read refetches. A Rescan means anything may have changed: drop every target.
   {
     std::lock_guard lock(rcache_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
       if (const auto it = rcache_.find(op.path); it != rcache_.end()) cache_erase(it);
+      if (const auto it = link_cache_.find(op.path); it != link_cache_.end()) link_cache_.erase(it);
     }
+    if (rescan) link_cache_.clear();
   }
   // Let a changed directory be re-prefetched on the next read there.
   {

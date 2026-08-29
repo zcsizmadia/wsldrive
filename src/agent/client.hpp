@@ -89,6 +89,12 @@ class RemoteRoot {
   [[nodiscard]] Result<std::vector<std::optional<std::vector<std::byte>>>> read_many(
       const std::vector<std::string>& paths, std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
+  /// Target of a symlink in the tree, as stored ('/'-separated). Cached per path
+  /// until an invalidation touches it, so listing a directory full of links costs
+  /// one round-trip per link, once.
+  [[nodiscard]] Result<std::string> readlink(std::string_view path,
+                                             std::chrono::milliseconds timeout = std::chrono::seconds(30));
+
   [[nodiscard]] Result<std::chrono::nanoseconds> ping(std::chrono::milliseconds timeout = std::chrono::seconds(5));
 
   /// Proactively warm the read cache after mount: queue every directory whose
@@ -220,6 +226,9 @@ class RemoteRoot {
   std::list<std::string> lru_;  // most-recently-used first
   std::uint64_t rcache_bytes_ = 0;
   std::uint64_t rcache_cap_ = 256u << 20;  // 256 MiB
+  // Symlink targets by path; tiny strings, so no budget. Also under rcache_mu_
+  // and dropped by the same invalidation path as file contents.
+  std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> link_cache_;
 
   // Erases one entry, keeping `lru_` and the byte count in step. Call under
   // rcache_mu_.

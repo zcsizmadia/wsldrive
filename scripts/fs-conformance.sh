@@ -34,6 +34,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Symlinks the AGENT serves (created on the backing store before the scan): a
+# served home directory is full of these, and a mount that lists them but cannot
+# read them shows every one as broken.
+echo target-content > "$WORK/lt.txt"
+ln -s lt.txt "$WORK/lnk"
+ln -s /nowhere/at/all "$WORK/dangling"
+
 echo "serving $WORK -> $MNT"
 "$AGENT" --root "$WORK" --listen "tcp://127.0.0.1:$PORT" >/tmp/fsconf-agent.log 2>&1 &
 AGENT_PID=$!
@@ -69,6 +76,12 @@ check "chmod on a directory"   "chmod 700 '$MNT/d'"
 check "touch (utimens)"        "touch '$MNT/d/b.txt'"
 check "touch creates a file"   "touch '$MNT/new.txt' && [ -f '$MNT/new.txt' ]"
 
+echo "== symlinks served by the agent =="
+check "symlink is a symlink"      "[ -L '$MNT/lnk' ]"
+check "readlink gives the target" "[ \"\$(readlink '$MNT/lnk')\" = lt.txt ]"
+check "following the link works"  "[ \"\$(cat '$MNT/lnk')\" = target-content ]"
+check "dangling link keeps its target" "[ \"\$(readlink '$MNT/dangling')\" = /nowhere/at/all ] && ! cat '$MNT/dangling'"
+
 echo "== data integrity =="
 check "1 MiB round-trip"       "head -c 1048576 /dev/urandom > '$MNT/big.bin' && [ \$(stat -c%s '$MNT/big.bin') -eq 1048576 ]"
 check "content matches"        "cp '$MNT/big.bin' '$WORK/../cmp.bin' 2>/dev/null; cmp -s '$MNT/big.bin' '$WORK/big.bin'"
@@ -88,7 +101,7 @@ check "git log reads back"     "cd '$MNT/repo' && git log --oneline | grep -q fi
 check "git checkout -b"        "cd '$MNT/repo' && git checkout -qb feature && echo y >> f.txt && git add . && git -c user.email=a@b -c user.name=c commit -qm second"
 
 echo "== knowingly unsupported (documented limitations) =="
-known "symlink"                "ln -s b.txt '$MNT/d/link'"
+known "creating a symlink"     "ln -s b.txt '$MNT/d/link'"
 known "hard link"              "ln '$MNT/d/b.txt' '$MNT/d/hard'"
 
 echo

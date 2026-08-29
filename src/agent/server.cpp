@@ -2,6 +2,9 @@
 
 #include "agent/scanner.hpp"
 #include "core/path.hpp"
+#ifdef _WIN32
+#include "platform/win/wide.hpp"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -241,6 +244,7 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch, bool
     case proto::MsgType::SnapshotRequest: return send_snapshot(f.header.request_id, ch);
     case proto::MsgType::ReadRequest: return send_read(f, ch);
     case proto::MsgType::ReadManyRequest: return send_read_many(f, ch);
+    case proto::MsgType::ReadlinkRequest: return send_readlink(f, ch);
     case proto::MsgType::WriteRequest:
     case proto::MsgType::CreateRequest:
     case proto::MsgType::MkdirRequest:
@@ -566,6 +570,32 @@ Result<void> RootServer::send_read_many(const net::Frame& f, net::FrameChannel& 
     }
     proto::write_read_many_response(w, resp);
   });
+}
+
+Result<void> RootServer::send_readlink(const net::Frame& f, net::FrameChannel& ch) {
+  proto::Reader r(f.payload);
+  auto q = proto::read_path_request(r);
+  if (!q) return fail(q.error());
+  auto resolved = resolve(q->path);  // same gate as every other path
+  if (!resolved) return send_error(f.header.request_id, Errc::InvalidPath, "path outside the served root", ch);
+  std::error_code ec;
+  const fs::path target = fs::read_symlink(*resolved, ec);
+  if (ec) {
+    // EINVAL is "exists but is not a symlink"; everything else is treated as absent.
+    return send_error(f.header.request_id,
+                      ec == std::errc::invalid_argument ? Errc::InvalidArgument : map_fs_error(ec), q->path, ch);
+  }
+  // The target is sent as stored, only with the separator the protocol uses
+  // everywhere; the mount decides what it means on its side.
+#ifdef _WIN32
+  std::string text = platform::win::to_utf8(target.native());
+  for (char& c : text)
+    if (c == '\\') c = '/';
+#else
+  const std::string& text = target.native();
+#endif
+  return ch.send_with(proto::MsgType::ReadlinkResponse, f.header.request_id,
+                      [&](proto::Writer& w) { proto::write_readlink_response(w, proto::ReadlinkResponse{text}); });
 }
 
 Result<void> RootServer::send_error(std::uint64_t request_id, Errc code, std::string_view detail, net::FrameChannel& ch) {
