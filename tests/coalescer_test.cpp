@@ -111,5 +111,34 @@ TEST(Coalescer, OverflowCollapsesToRescan) {
   EXPECT_TRUE(c.empty());
 }
 
+TEST(Coalescer, MarksEntriesThatAppeared) {
+  // A renamed directory brings a subtree the watcher never reports, so the
+  // sender needs to know which upserts are NEW entries (worth enumerating) and
+  // which are mere modifications of something the peers already have.
+  Coalescer c;
+  c.push({FsEventKind::Created, "new"}, t0);
+  c.push({FsEventKind::RenamedTo, "moved"}, t0);
+  c.push({FsEventKind::Modified, "touched"}, t0);
+  c.push({FsEventKind::Created, "new-then-touched"}, t0);
+  c.push({FsEventKind::Modified, "new-then-touched"}, t0);  // still new: nothing removed it
+  c.push({FsEventKind::Created, "gone"}, t0);
+  c.push({FsEventKind::Removed, "gone"}, t0);  // a removal resets it
+  c.push({FsEventKind::Removed, "gone"}, t0);
+  c.push({FsEventKind::Created, "gone"}, t0);  // re-created after removal: new again
+  auto out = c.take();
+  auto find = [&](std::string_view p) -> const PlannedOp& {
+    for (const auto& op : out)
+      if (op.path == p) return op;
+    static const PlannedOp none{InvalidationKind::Rescan, "?"};
+    return none;
+  };
+  EXPECT_TRUE(find("new").appeared);
+  EXPECT_TRUE(find("moved").appeared);
+  EXPECT_FALSE(find("touched").appeared);
+  EXPECT_TRUE(find("new-then-touched").appeared);
+  EXPECT_EQ(find("gone").kind, InvalidationKind::Upsert);
+  EXPECT_TRUE(find("gone").appeared);
+}
+
 }  // namespace
 }  // namespace wsld

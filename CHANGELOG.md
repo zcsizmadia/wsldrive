@@ -20,6 +20,10 @@ installer that leaves you with a drive that comes back after every reboot.
   to click. Uninstall removes all of it.
 - **Multiple mounts.** `install.ps1 -Config wsldrive.json` sets up several
   drives and distros side by side, each with its own port and logon task.
+- **Tested end to end on both platforms.** CI mounts a real filesystem on Linux
+  (libfuse3) and a real drive letter on Windows (WinFsp) and runs a conformance
+  battery against each — file operations, metadata, names, data integrity, the
+  write-back path, changes made behind the mount's back, and a git workload.
 
 ### Performance
 
@@ -32,6 +36,20 @@ installer that leaves you with a drive that comes back after every reboot.
   first-read 585 → 423 ms on the reference tree).
 - O(1) LRU eviction, the cached-read copy taken outside the cache lock, and FUSE
   reads served straight into the kernel's buffer.
+
+### Fixed before release (found by the mounted conformance batteries)
+
+- **Renaming a directory lost its contents** in the mirror until remount: the
+  client moved only the node, and a directory renamed behind the mount's back
+  arrived as a single bare `Upsert`. The client now moves the whole subtree, and
+  the agent enumerates a directory that has just appeared so peers see what it
+  brought along.
+- **`git init` on a Windows-served tree aborted about one run in three.** A
+  just-written backing file is briefly held open by the search indexer or an
+  antivirus scanner, so the rename right behind the write (git's lock-file
+  dance) failed with a sharing violation. The agent now retries rename, delete,
+  truncate and open on transient share errors for about a second, as Git for
+  Windows itself does.
 
 ### Security
 

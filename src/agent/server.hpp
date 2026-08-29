@@ -83,6 +83,9 @@ class RootServer {
 
   void on_event(const FsEvent& ev);
   void flush_loop();
+  // Appends an Upsert for every entry below the directory `rel` (which has just
+  // appeared, typically by rename) so the peers' mirrors do not show it empty.
+  void append_subtree(const std::string& rel, std::vector<proto::InvalidationOp>& ops);
   // Adds a session to the invalidation broadcast set. Returns false when the
   // server is stopping, in which case the caller must not serve the session.
   bool add_peer(net::FrameChannel& ch);

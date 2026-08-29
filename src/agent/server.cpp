@@ -8,9 +8,18 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <system_error>
+#include <thread>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace wsld::agent {
 
@@ -123,7 +132,14 @@ void RootServer::flush_loop() {
           out.attr = *attr;
         }
       }
+      // A directory that has just appeared (mkdir, or - the case that matters -
+      // a rename) is reported by the watcher as one entry, yet a renamed one
+      // brings its whole subtree along. Without this the peers would show it
+      // empty until the next remount.
+      const bool expand = op.appeared && out.kind == InvalidationKind::Upsert && out.attr.kind == NodeKind::Directory;
+      const std::string dir = out.path;
       batch.ops.push_back(std::move(out));
+      if (expand) append_subtree(dir, batch.ops);
     }
     if (!batch.ops.empty()) {
       std::vector<std::byte> frame;
@@ -132,6 +148,24 @@ void RootServer::flush_loop() {
     }
     lock.lock();
   }
+}
+
+void RootServer::append_subtree(const std::string& rel, std::vector<proto::InvalidationOp>& ops) {
+  // scan_tree() hands out entries with a parent INDEX (0 = the scanned root, k =
+  // the k-th entry), so keep every entry's path by index to build the children's.
+  std::vector<std::string> rels{rel};
+  const std::string prefix = rel + "/";
+  (void)scan_tree(
+      join_relative(opts_.root, rel),
+      [&](const SnapshotEntry& e) {
+        std::string p = rels[e.parent] + "/" + std::string(e.name);
+        ops.push_back(proto::InvalidationOp{InvalidationKind::Upsert, p, e.attr});
+        rels.push_back(std::move(p));
+      },
+      // Ignore rules are relative to the served root, not to this subtree.
+      ignore_.empty() ? agent::SkipPredicate{}
+                      : [&](std::string_view sub, bool is_dir) { return ignore_.ignored(prefix + std::string(sub), is_dir); },
+      opts_.one_file_system);
 }
 
 bool RootServer::add_peer(net::FrameChannel& ch) {
@@ -336,6 +370,57 @@ Errc map_fs_error(const std::error_code& ec) {
   if (ec == std::errc::invalid_argument) return Errc::InvalidArgument;
   return Errc::IoError;
 }
+
+// On Windows a file that was just written is often held open for a moment by
+// software that is not the writer - the search indexer, an antivirus scanner -
+// without FILE_SHARE_DELETE. A rename, delete or truncate arriving right behind
+// the write then fails with a sharing violation, which is exactly the shape of
+// git's lock-file dance (write config.lock, rename over config): git init aborted
+// mid-way on the mount about one run in three. Git for Windows retries this
+// itself; so does the agent, for about a second.
+bool is_transient_share_error(const std::error_code& ec) noexcept {
+#ifdef _WIN32
+  return ec.category() == std::system_category() &&
+         (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_LOCK_VIOLATION ||
+          ec.value() == ERROR_ACCESS_DENIED);
+#else
+  (void)ec;
+  return false;
+#endif
+}
+
+template <class Op>
+std::error_code with_share_retry(Op&& op) {
+  std::error_code ec = op();
+  for (int delay_ms = 1; ec && is_transient_share_error(ec) && delay_ms <= 512; delay_ms *= 2) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    ec = op();
+  }
+  return ec;
+}
+
+// fopen() reports the same condition through errno (EACCES); same remedy.
+std::FILE* fopen_with_retry(const std::filesystem::path& p, const char* mode) {
+  std::FILE* fp = nullptr;
+  for (int delay_ms = 1;; delay_ms *= 2) {
+#ifdef _WIN32
+    const std::wstring wmode(mode, mode + std::strlen(mode));
+    fp = _wfopen(p.c_str(), wmode.c_str());
+#else
+    fp = std::fopen(p.c_str(), mode);
+#endif
+    if (fp != nullptr || errno != EACCES || delay_ms > 512) return fp;
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+  }
+}
+
+// Failures the peer cannot reason about (not "missing", not "exists") are worth
+// a line here: they are what an operator sees when a tool gives up on the mount.
+void log_io_failure(const char* op, std::string_view path, const std::error_code& ec) {
+  if (map_fs_error(ec) == Errc::IoError)
+    std::fprintf(stderr, "wsldrived: %s '%.*s' failed: %s (%d)\n", op, static_cast<int>(path.size()), path.data(),
+                 ec.message().c_str(), ec.value());
+}
 }  // namespace
 
 Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel& ch) {
@@ -351,12 +436,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       auto full = resolve(q->path);
       if (!full) return reject(full.error(), q->path);
       {
-        std::FILE* fp =
-#ifdef _WIN32
-            _wfopen(full->c_str(), L"wb");
-#else
-            std::fopen(full->c_str(), "wb");
-#endif
+        std::FILE* fp = fopen_with_retry(*full, "wb");
         if (fp == nullptr) return reject(Errc::IoError, q->path);
         std::fclose(fp);
       }
@@ -369,14 +449,8 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!q) return fail(q.error());
       auto full = resolve(q->path);
       if (!full) return reject(full.error(), q->path);
-      std::FILE* fp =
-#ifdef _WIN32
-          _wfopen(full->c_str(), L"r+b");
-      if (fp == nullptr) fp = _wfopen(full->c_str(), L"w+b");
-#else
-          std::fopen(full->c_str(), "r+b");
-      if (fp == nullptr) fp = std::fopen(full->c_str(), "w+b");
-#endif
+      std::FILE* fp = fopen_with_retry(*full, "r+b");
+      if (fp == nullptr && errno == ENOENT) fp = fopen_with_retry(*full, "w+b");
       if (fp == nullptr) return reject(Errc::IoError, q->path);
 #ifdef _WIN32
       _fseeki64(fp, static_cast<long long>(q->offset), SEEK_SET);
@@ -394,9 +468,15 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!q) return fail(q.error());
       auto full = resolve(q->path);
       if (!full) return reject(full.error(), q->path);
-      std::error_code ec;
-      fs::resize_file(*full, q->size, ec);
-      if (ec) return reject(map_fs_error(ec), q->path);
+      const std::error_code ec = with_share_retry([&] {
+        std::error_code e;
+        fs::resize_file(*full, q->size, e);
+        return e;
+      });
+      if (ec) {
+        log_io_failure("truncate", q->path, ec);
+        return reject(map_fs_error(ec), q->path);
+      }
       return ch.send(proto::MsgType::Ok, id, {});
     }
     case proto::MsgType::MkdirRequest: {
@@ -415,7 +495,17 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!full) return reject(full.error(), q->path);
       std::error_code ec;
       if (fs::is_directory(*full, ec)) return reject(Errc::IsADirectory, q->path);
-      if (!fs::remove(*full, ec) || ec) return reject(ec ? map_fs_error(ec) : Errc::NotFound, q->path);
+      bool removed = false;
+      ec = with_share_retry([&] {
+        std::error_code e;
+        removed = fs::remove(*full, e);
+        return e;
+      });
+      if (ec) {
+        log_io_failure("unlink", q->path, ec);
+        return reject(map_fs_error(ec), q->path);
+      }
+      if (!removed) return reject(Errc::NotFound, q->path);
       return ch.send(proto::MsgType::Ok, id, {});
     }
     case proto::MsgType::RmdirRequest: {
@@ -435,9 +525,15 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       auto to = resolve(q->to);
       if (!from) return reject(from.error(), q->from);
       if (!to) return reject(to.error(), q->to);
-      std::error_code ec;
-      fs::rename(*from, *to, ec);
-      if (ec) return reject(map_fs_error(ec), q->to);
+      const std::error_code ec = with_share_retry([&] {
+        std::error_code e;
+        fs::rename(*from, *to, e);
+        return e;
+      });
+      if (ec) {
+        log_io_failure("rename", q->to, ec);
+        return reject(map_fs_error(ec), q->to);
+      }
       return ch.send(proto::MsgType::Ok, id, {});
     }
     default:

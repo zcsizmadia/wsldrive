@@ -403,8 +403,20 @@ int main(int argc, char** argv) {
     install_mount_signal_handler();
     std::printf("mounted. Ctrl+C to unmount.\n");
     std::fflush(stdout);
-    while (fm.mounted() && root.connected() && !g_mount_stop.load())
+    std::uint64_t rescans_seen = 0, rescan_failures_seen = 0;
+    while (fm.mounted() && root.connected() && !g_mount_stop.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      // A rescan means the agent's watcher lost events and the mirror was
+      // rebuilt from a fresh snapshot; worth a line in the log, since heavy
+      // churn on the served tree is exactly when someone would look here.
+      const auto st = root.stats();
+      if (st.rescans != rescans_seen || st.rescan_failures != rescan_failures_seen) {
+        rescans_seen = st.rescans;
+        rescan_failures_seen = st.rescan_failures;
+        std::fprintf(stderr, "wsldrive: watcher overflow on the agent; snapshot re-fetched (%llu ok, %llu failed)\n",
+                     static_cast<unsigned long long>(st.rescans), static_cast<unsigned long long>(st.rescan_failures));
+      }
+    }
     std::printf("unmounting...\n");
     std::fflush(stdout);
     fm.unmount();  // agent (if auto-launched) is stopped by its destructor on return

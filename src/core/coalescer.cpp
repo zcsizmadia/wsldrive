@@ -18,10 +18,14 @@ void Coalescer::push(const FsEvent& ev, clock::time_point now) {
   if (overflow_) return;  // the rescan will cover it
 
   InvalidationKind kind;
+  bool appeared = false;
   switch (ev.kind) {
     case FsEventKind::Created:
-    case FsEventKind::Modified:
     case FsEventKind::RenamedTo:
+      kind = InvalidationKind::Upsert;
+      appeared = true;
+      break;
+    case FsEventKind::Modified:
       kind = InvalidationKind::Upsert;
       break;
     case FsEventKind::Removed:
@@ -33,11 +37,12 @@ void Coalescer::push(const FsEvent& ev, clock::time_point now) {
       return;
   }
 
-  const Entry e{kind, ++seq_};
   if (auto it = pending_.find(ev.path); it != pending_.end()) {
-    it->second = e;
+    // A Modified after a Created keeps the entry "new"; a removal resets it.
+    const bool still_new = kind == InvalidationKind::Upsert && (appeared || it->second.appeared);
+    it->second = Entry{kind, ++seq_, still_new};
   } else {
-    pending_.emplace(std::string(ev.path), e);
+    pending_.emplace(std::string(ev.path), Entry{kind, ++seq_, appeared});
   }
 }
 
@@ -69,10 +74,11 @@ std::vector<PlannedOp> Coalescer::take() {
     std::string_view path;
     InvalidationKind kind;
     std::uint64_t seq;
+    bool appeared;
   };
   std::vector<Item> items;
   items.reserve(pending_.size());
-  for (const auto& [path, e] : pending_) items.push_back(Item{path, e.kind, e.seq});
+  for (const auto& [path, e] : pending_) items.push_back(Item{path, e.kind, e.seq, e.appeared});
 
   // Sort by path so that a removed directory is immediately followed by its
   // descendants; drop descendants whose last event predates the removal.
@@ -94,7 +100,7 @@ std::vector<PlannedOp> Coalescer::take() {
   // Emit in arrival order of each path's final event.
   std::sort(kept.begin(), kept.end(), [](const Item& a, const Item& b) { return a.seq < b.seq; });
   out.reserve(kept.size());
-  for (const Item& it : kept) out.push_back(PlannedOp{it.kind, std::string(it.path)});
+  for (const Item& it : kept) out.push_back(PlannedOp{it.kind, std::string(it.path), it.appeared});
 
   pending_.clear();
   return out;

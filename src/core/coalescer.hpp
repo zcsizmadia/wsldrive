@@ -35,8 +35,15 @@ struct FsEvent {
 struct PlannedOp {
   InvalidationKind kind;
   std::string path;
+  // The entry is new at this path (a Created or RenamedTo was seen, and no
+  // removal since). A directory that appears by rename brings a whole subtree
+  // the watcher never reports, so the sender enumerates it; a Modified on a
+  // directory the peers already know must not trigger that scan.
+  bool appeared = false;
 
-  friend bool operator==(const PlannedOp&, const PlannedOp&) = default;
+  friend bool operator==(const PlannedOp& a, const PlannedOp& b) noexcept {
+    return a.kind == b.kind && a.path == b.path;  // `appeared` is advisory
+  }
 };
 
 /// Collapses bursts of watcher events into a minimal ordered batch.
@@ -80,6 +87,7 @@ class Coalescer {
   struct Entry {
     InvalidationKind kind;
     std::uint64_t seq;
+    bool appeared;
   };
 
   Options opts_;

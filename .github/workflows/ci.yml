@@ -60,6 +60,40 @@ jobs:
           git config --global user.name CI
           bash scripts/fs-conformance.sh
 
+  # The same idea for Direction A - the feature the product is named for. Mounts
+  # a real drive letter through WinFsp on the Windows runner and runs the Windows
+  # battery twice: write-through, and the write-back buffering path.
+  conformance-windows:
+    name: Filesystem conformance (WinFsp mount)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install WinFsp (runtime + SDK)
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }   # 3010 = success, reboot pending
+          if ($LASTEXITCODE -ne 0) { throw "winfsp install failed ($LASTEXITCODE)" }
+          if (-not (Test-Path 'C:\Program Files (x86)\WinFsp\lib\winfsp-x64.lib')) { throw 'WinFsp SDK not found after install' }
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --preset msvc-release
+          cmake --build --preset msvc-release --target wsldrive wsldrived --parallel
+          $u = & '.\build\msvc-release\src\tools\wsldrive.exe' 2>&1 | Out-String
+          if ($u -notmatch 'mount') { throw "wsldrive.exe has no 'mount' command - WinFsp was not linked." }
+          exit 0
+      - name: Conformance (write-through)
+        shell: pwsh
+        run: .\scripts\fs-conformance.ps1
+      - name: Conformance (write-back)
+        shell: pwsh
+        run: .\scripts\fs-conformance.ps1 -Writeback -Port 51997
+
   benchmarks:
     name: Benchmarks (smoke)
     runs-on: ubuntu-latest
