@@ -94,6 +94,82 @@ jobs:
         shell: pwsh
         run: .\scripts\fs-conformance.ps1 -Writeback -Port 51997
 
+  # The installer is how everyone gets the product, and nothing else runs it:
+  # a completely broken -Uninstall shipped unnoticed because the file parsed
+  # fine and the bug only existed at runtime. -DryRun changes nothing, so every
+  # code path can run here against a release-zip layout, without elevation or
+  # WSL. The Inno Setup script is compiled too. Placeholder binaries are enough:
+  # a dry run only checks that they exist, and ISCC only packs bytes (the real
+  # binaries are compiled in by release.yml).
+  installer:
+    name: Installer (dry-run + compile)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Parse every PowerShell script
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem scripts -Filter *.ps1 -Recurse) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { $bad++; Write-Host "::error file=$($f.FullName)::$($errors[0].Message)" } else { Write-Host "ok  $($f.Name)" }
+          }
+          if ($bad) { throw "$bad script(s) do not parse" }
+      - name: Stage a release-zip layout (placeholder binaries)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path rel\scripts | Out-Null
+          foreach ($f in 'wsldrive.exe','wsldrived.exe','wsldrivew.exe','wsldrive-linux-x64','wsldrived-linux-x64') { Set-Content -Path "rel\$f" -Value 'placeholder' }
+          Copy-Item scripts\install.ps1, scripts\register-hvsocket.ps1 rel\scripts\
+          Copy-Item wsldrive.example.json, README.md, LICENSE, CHANGELOG.md rel\
+      - name: Dry run - Direction A (easy mode)
+        shell: pwsh
+        run: |
+          $out = & pwsh -NoProfile -File rel\scripts\install.ps1 -DryRun -Unattended -DriveLetter W -Distro Ubuntu -WslRoot '~' 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+          if ($out -notmatch "would register logon task 'wsldrive-mount-W'") { throw 'the plan does not register the W: task' }
+          if ($out -notmatch 'would start wsldrive-mount-W') { throw 'the plan does not start the mount' }
+      - name: Dry run - several mounts from the example config
+        shell: pwsh
+        run: |
+          $out = & pwsh -NoProfile -File rel\scripts\install.ps1 -DryRun -Unattended -Config rel\wsldrive.example.json 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+          foreach ($t in "wsldrive-mount-W", "wsldrive-mount-Y", "wsldrive-mount-ubuntu-win") {
+            if ($out -notmatch [regex]::Escape("would register logon task '$t'")) { throw "the plan lacks task $t" }
+          }
+          if ($out -notmatch 'would register service GUIDs') { throw 'Direction B over hvsocket must register the service GUIDs' }
+      - name: Dry run - a colliding config is rejected
+        shell: pwsh
+        run: |
+          '{ "mounts": [ { "drive": "W", "distro": "Ubuntu" }, { "drive": "W", "distro": "Debian" } ] }' | Set-Content rel\collide.json
+          $out = & pwsh -NoProfile -File rel\scripts\install.ps1 -DryRun -Unattended -Config rel\collide.json 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -eq 0) { throw 'two mounts on one drive letter must be rejected' }
+          if ($out -notmatch 'same drive letter') { throw 'the rejection must say why' }
+      - name: Dry run - uninstall
+        shell: pwsh
+        run: |
+          $out = & pwsh -NoProfile -File rel\scripts\install.ps1 -Uninstall -DryRun 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+          if ($out -notmatch 'would unregister hvsocket service GUIDs') { throw 'uninstall plan is incomplete' }
+          if ($out -notmatch 'Uninstalled') { throw 'uninstall did not run to the end' }
+      - name: Compile the GUI installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }
+          if ($LASTEXITCODE -ne 0) { throw "innosetup install failed ($LASTEXITCODE)" }
+          # build-installer.ps1 expects the source-tree layout; placeholders again.
+          New-Item -ItemType Directory -Force -Path build\msvc-release\src\tools, build\linux-release\src\tools | Out-Null
+          foreach ($f in 'wsldrive.exe','wsldrived.exe','wsldrivew.exe') { Set-Content -Path "build\msvc-release\src\tools\$f" -Value 'placeholder' }
+          foreach ($f in 'wsldrive','wsldrived') { Set-Content -Path "build\linux-release\src\tools\$f" -Value 'placeholder' }
+          .\scripts\build-installer.ps1 -Version 0.0.0-ci
+          if (-not (Test-Path installer\dist\wsldrive-setup.exe)) { throw 'ISCC produced no installer' }
+
   benchmarks:
     name: Benchmarks (smoke)
     runs-on: ubuntu-latest

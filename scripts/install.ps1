@@ -224,6 +224,9 @@ function Get-WslHome([string]$d) {
   $h = ''
   try { $h = (& wsl.exe -d $d -- bash -lc 'echo $HOME' 2>$null | Select-Object -First 1) } catch { $h = '' }
   if ($h) { $h = $h.Trim() }
+  # wsl.exe reports "there is no distribution with the supplied name" on STDOUT,
+  # so anything that is not an absolute Linux path is an error message, not a home.
+  if ($h -notmatch '^/') { $h = '' }
   $script:WslHomeCache[$d] = $h
   return $h
 }
@@ -386,15 +389,17 @@ foreach ($m in @($mounts | Where-Object { $_.Direction -eq 'A' })) {
 $doA = @($mounts | Where-Object { $_.Direction -eq 'A' }).Count -gt 0
 $doB = @($mounts | Where-Object { $_.Direction -eq 'B' }).Count -gt 0
 
+# A dry run keeps going past a missing prerequisite (it changes nothing and the
+# point is to see the whole plan); a real run stops unless told otherwise.
 if ($doA -and -not ($linuxAgent -and (Test-Path $linuxAgent))) {
   Warn "Direction A needs the Linux build of the agent (wsldrived) at:`n         $linuxAgent"
   Warn "Build it in WSL:  cmake --preset linux-release && cmake --build --preset linux-release"
-  if (-not (AskYN 'Continue anyway (the task will fail until it exists)?' $false)) { exit 1 }
+  if (-not $DryRun -and -not (AskYN 'Continue anyway (the task will fail until it exists)?' $false)) { exit 1 }
 }
 if ($doB -and -not ($linuxCli -and (Test-Path $linuxCli))) {
   Warn "Direction B needs the Linux build of wsldrive at:`n         $linuxCli"
   Warn "Build it in WSL:  cmake --preset linux-release && cmake --build --preset linux-release"
-  if (-not (AskYN 'Continue anyway (the task will fail until it exists)?' $false)) { exit 1 }
+  if (-not $DryRun -and -not (AskYN 'Continue anyway (the task will fail until it exists)?' $false)) { exit 1 }
 }
 
 # WSL restart is only needed the first time we register hvsocket services, which
@@ -444,8 +449,13 @@ if ($doA) {
   } else {
     Warn 'WinFsp is required for Direction A and is not installed.'
     Warn 'Install it from https://winfsp.dev (or re-run with -WinFspMsi <path>), then run this installer again.'
-    if (-not (AskYN 'Skip Direction A for now and continue?' $false)) { throw 'WinFsp missing.' }
-    $doA = $false
+    if ($DryRun) {
+      Plan 'stop here until WinFsp is installed (this dry run continues to show the rest of the plan)'
+    } elseif (-not (AskYN 'Skip Direction A for now and continue?' $false)) {
+      throw 'WinFsp missing.'
+    } else {
+      $doA = $false
+    }
   }
 }
 
