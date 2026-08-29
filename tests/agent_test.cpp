@@ -322,6 +322,44 @@ TEST_F(AgentTest, RejectsAPeerWithoutTheSharedSecret) {
   EXPECT_TRUE(good->read("README.md", 0, 16).has_value());
 }
 
+TEST_F(AgentTest, ServesNothingBeforeAuthentication) {
+  // Checking the token inside the Hello handler is not enough on its own: a peer
+  // that never sends a Hello must not reach the read or mutation handlers with
+  // its first frame, or the token is defeated entirely.
+  LoopbackServer srv(root_, /*watch=*/false, 4u << 20, "s3cret-token");
+
+  auto sock = net::connect(srv.endpoint());
+  ASSERT_TRUE(sock.has_value());
+  net::FrameChannel ch(std::move(*sock));
+
+  // First frame is a read — no handshake at all.
+  std::vector<std::byte> payload;
+  proto::Writer w(payload);
+  proto::write_read_request(w, proto::ReadRequest{.path = "README.md", .offset = 0, .length = 64});
+  ASSERT_TRUE(ch.send(proto::MsgType::ReadRequest, 1, payload).has_value());
+
+  auto reply = ch.receive(5s);
+  ASSERT_TRUE(reply.has_value()) << "expected a refusal, not silence";
+  EXPECT_EQ(reply->header.type, proto::MsgType::Error) << "an unauthenticated read must not be served";
+  proto::Reader r(reply->payload);
+  auto err = proto::read_error(r);
+  ASSERT_TRUE(err.has_value());
+  EXPECT_EQ(static_cast<Errc>(err->code), Errc::Unauthorized);
+
+  // The same applies to a destructive request.
+  auto sock2 = net::connect(srv.endpoint());
+  ASSERT_TRUE(sock2.has_value());
+  net::FrameChannel ch2(std::move(*sock2));
+  std::vector<std::byte> p2;
+  proto::Writer w2(p2);
+  proto::write_path_request(w2, proto::PathRequest{.path = "README.md"});
+  ASSERT_TRUE(ch2.send(proto::MsgType::UnlinkRequest, 1, p2).has_value());
+  auto reply2 = ch2.receive(5s);
+  ASSERT_TRUE(reply2.has_value());
+  EXPECT_EQ(reply2->header.type, proto::MsgType::Error) << "an unauthenticated unlink must not be served";
+  EXPECT_TRUE(fs::exists(root_ / "README.md")) << "the file must still be there";
+}
+
 TEST(AuthToken, GeneratesDistinctHexSecrets) {
   const std::string a = generate_auth_token();
   const std::string b = generate_auth_token();

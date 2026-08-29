@@ -4,6 +4,7 @@
 #include "core/path.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <memory>
 #include <system_error>
@@ -148,6 +149,9 @@ void RootServer::broadcast(const std::vector<std::byte>& frame) {
 }
 
 void RootServer::serve(net::FrameChannel& ch) {
+  // Per-session authentication state. With no token configured the operator has
+  // explicitly opted out (--insecure-no-auth), so the session starts open.
+  bool authed = opts_.token.empty();
   {
     std::lock_guard lock(peers_mu_);
     if (stopping_) return;
@@ -162,7 +166,7 @@ void RootServer::serve(net::FrameChannel& ch) {
       }
       break;  // peer disconnected or I/O error
     }
-    if (auto r = handle(*f, ch); !r) break;
+    if (auto r = handle(*f, ch, authed); !r) break;
   }
   {
     // Deregister, then wait for any in-flight broadcast to finish: it holds a
@@ -174,7 +178,15 @@ void RootServer::serve(net::FrameChannel& ch) {
   }
 }
 
-Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch) {
+Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch, bool& authed) {
+  // Nothing is served before the peer has authenticated. Checking the token only
+  // inside the Hello handler is not enough on its own: a peer that never sends a
+  // Hello would otherwise reach the read and mutation handlers with its first
+  // frame, which defeats the token entirely.
+  if (f.header.type != proto::MsgType::Hello && !authed) {
+    (void)send_error(f.header.request_id, Errc::Unauthorized, "authenticate first", ch);
+    return fail(Errc::Unauthorized);  // drops the session
+  }
   switch (f.header.type) {
     case proto::MsgType::Hello: {
       proto::Reader r(f.payload);
@@ -192,6 +204,7 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch) {
         (void)send_error(f.header.request_id, Errc::Unauthorized, "authentication failed", ch);
         return fail(Errc::Unauthorized);  // drops the session
       }
+      authed = true;  // only now may this session issue anything else
       return ch.send_with(proto::MsgType::HelloAck, f.header.request_id, [&](proto::Writer& w) {
         proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
                                            .capabilities = watching() ? 1u : 0u,
@@ -245,6 +258,20 @@ bool is_contained_relative(std::string_view norm) {
     // A component carrying a root name (drive letter, and on Windows also an
     // alternate data stream) would re-anchor the join.
     if (comp.find(':') != std::string_view::npos) return false;
+#ifdef _WIN32
+    // Reserved DOS device names resolve to devices, not files, whatever
+    // directory they appear in. Only on Windows: these are legal filenames on
+    // Linux, and rejecting them there would deny access to real files.
+    {
+      std::string stem(comp.substr(0, comp.find('.')));
+      for (char& c : stem) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      static constexpr std::string_view kReserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                                                       "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+                                                       "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+      for (const std::string_view r : kReserved)
+        if (stem == r) return false;
+    }
+#endif
     if (j == std::string_view::npos) break;
     i = j + 1;
   }
