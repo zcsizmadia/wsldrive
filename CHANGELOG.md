@@ -63,7 +63,10 @@ installer that leaves you with a drive that comes back after every reboot.
   otherwise); snapshot fetches are serialised so a rescan during the initial
   fetch cannot lose invalidations; an unauthenticated peer's frames are capped
   at 4 KiB and must complete within the handshake window, so a half-sent frame
-  can no longer pin a session thread and 64 MiB of buffer.
+  can no longer pin a session thread and 64 MiB of buffer; a `Remove` event is
+  resolved against the disk at flush time like an `Upsert`, so the watcher's
+  late removal of a lock file git has already re-created no longer deletes the
+  new one from the mirror (git's next `chmod` failed with ENOENT in CI).
 
 - **Install routes, from the same review:** the release zip now keeps its
   `scripts\` folder (it was flattened, so the documented `scripts\install.ps1`
