@@ -13,6 +13,8 @@ struct WinAgentSpec {
   std::string exe;      // Linux-visible path to wsldrived.exe, e.g. /mnt/c/.../wsldrived.exe
   std::string win_root; // the Windows path to serve, e.g. C:\project
   std::string connect;  // endpoint the agent connects to (this client's listener)
+  // Per-mount shared secret, passed via the environment rather than argv.
+  std::string token;
 };
 
 /// Builds the argv (space-joined, for logging/tests) used to launch the agent.

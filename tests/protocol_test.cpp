@@ -106,7 +106,7 @@ TEST(Primitives, StringLengthBeyondBufferIsTruncated) {
 TEST(Messages, Hello) {
   std::vector<std::byte> buf;
   Writer w(buf);
-  write_hello(w, Hello{.protocol_version = 1, .capabilities = 0xF0F0, .agent = "wsldrived/0.1"});
+  write_hello(w, Hello{.protocol_version = 1, .capabilities = 0xF0F0, .agent = "wsldrived/0.1", .token = {}});
   Reader r(buf);
   auto h = read_hello(r);
   ASSERT_TRUE(h.has_value());
@@ -299,13 +299,14 @@ TEST(Fuzz, DecodersAreBounded) {
 
 TEST(Frame, WriteFrameFillsHeader) {
   std::vector<std::byte> buf;
-  write_frame(buf, MsgType::Hello, 42, [](Writer& w) { write_hello(w, Hello{.agent = "t"}); });
+  write_frame(buf, MsgType::Hello, 42, [](Writer& w) { write_hello(w, Hello{.agent = "t", .token = {}}); });
   write_frame(buf, MsgType::Ping, 43, [](Writer&) {});
   auto h1 = decode_header(buf);
   ASSERT_TRUE(h1.has_value());
   EXPECT_EQ(h1->type, MsgType::Hello);
   EXPECT_EQ(h1->request_id, 42u);
-  EXPECT_EQ(h1->payload_len, 4u + 8u + 1u + 1u);
+  // version + capabilities + agent (len + "t") + token (len, empty here)
+  EXPECT_EQ(h1->payload_len, 4u + 8u + 1u + 1u + 1u);
   Reader body{std::span<const std::byte>(buf).subspan(kHeaderSize, h1->payload_len)};
   EXPECT_EQ(read_hello(body)->agent, "t");
   auto h2 = decode_header(std::span(buf).subspan(kHeaderSize + h1->payload_len));

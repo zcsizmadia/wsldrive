@@ -13,6 +13,18 @@ namespace wsld::agent {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
+namespace {
+// Compares without an early exit, so a peer cannot learn the token a byte at a
+// time from response timing.
+bool constant_time_equal(std::string_view a, std::string_view b) noexcept {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    diff = static_cast<unsigned char>(diff | (static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i])));
+  return diff == 0;
+}
+}  // namespace
+
 RootServer::RootServer(Options opts) : opts_(std::move(opts)), coalescer_(opts_.coalescer) {
   // Load .wsldriveignore from the served root, if present.
   std::error_code ec;
@@ -118,8 +130,21 @@ void RootServer::flush_loop() {
 }
 
 void RootServer::broadcast(const std::vector<std::byte>& frame) {
-  std::lock_guard lock(peers_mu_);
-  for (net::FrameChannel* peer : peers_) (void)peer->send_raw(frame);
+  // Copy the peer list, then send outside the lock: holding peers_mu_ across
+  // socket writes let one slow or stuck peer stall invalidation delivery to
+  // everyone and block new sessions registering in serve(). Each channel
+  // serialises its own writes, so per-peer sends stay safe.
+  std::vector<net::FrameChannel*> targets;
+  {
+    std::lock_guard lock(peers_mu_);
+    targets = peers_;
+    ++broadcasts_in_flight_;  // keeps a departing session from destroying a channel mid-send
+  }
+  for (net::FrameChannel* peer : targets) (void)peer->send_raw(frame);
+  {
+    std::lock_guard lock(peers_mu_);
+    if (--broadcasts_in_flight_ == 0) peers_cv_.notify_all();
+  }
 }
 
 void RootServer::serve(net::FrameChannel& ch) {
@@ -140,8 +165,12 @@ void RootServer::serve(net::FrameChannel& ch) {
     if (auto r = handle(*f, ch); !r) break;
   }
   {
-    std::lock_guard lock(peers_mu_);
+    // Deregister, then wait for any in-flight broadcast to finish: it holds a
+    // raw pointer to this channel, which the caller destroys once serve()
+    // returns.
+    std::unique_lock lock(peers_mu_);
     peers_.erase(std::remove(peers_.begin(), peers_.end(), &ch), peers_.end());
+    peers_cv_.wait(lock, [this] { return broadcasts_in_flight_ == 0; });
   }
 }
 
@@ -155,10 +184,18 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch) {
         (void)send_error(f.header.request_id, Errc::UnsupportedVersion, "protocol version mismatch", ch);
         return fail(Errc::UnsupportedVersion);
       }
+      // The agent serves reads AND write-through mutations, so an unauthenticated
+      // peer could read or destroy the whole tree. Require the shared secret the
+      // launcher gave both ends; an empty configured token means the operator
+      // opted out explicitly (--insecure-no-auth).
+      if (!opts_.token.empty() && !constant_time_equal(hello->token, opts_.token)) {
+        (void)send_error(f.header.request_id, Errc::Unauthorized, "authentication failed", ch);
+        return fail(Errc::Unauthorized);  // drops the session
+      }
       return ch.send_with(proto::MsgType::HelloAck, f.header.request_id, [&](proto::Writer& w) {
         proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
                                            .capabilities = watching() ? 1u : 0u,
-                                           .agent = "wsldrived/0.1"});
+                                           .agent = "wsldrived/0.1", .token = {}});
       });
     }
     case proto::MsgType::Ping: return ch.send(proto::MsgType::Pong, f.header.request_id, {});

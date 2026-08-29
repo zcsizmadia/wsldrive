@@ -156,6 +156,22 @@ WslAgent::~WslAgent() { stop(); }
 
 Result<void> WslAgent::start(const WslAgentSpec& spec) {
   spec_ = spec;
+  // Hand the token to wsl.exe through our own environment and ask WSL to forward
+  // it into the distro (WSLENV). It therefore never appears in any command line,
+  // which /proc and the Windows process list expose to other local users.
+  if (!spec.token.empty()) {
+    ::SetEnvironmentVariableW(L"WSLDRIVE_TOKEN", win::to_wide(spec.token).c_str());
+    std::wstring wslenv;
+    wchar_t existing[32767];
+    const DWORD n = ::GetEnvironmentVariableW(L"WSLENV", existing, static_cast<DWORD>(std::size(existing)));
+    if (n > 0 && n < std::size(existing)) {
+      wslenv.assign(existing, n);
+      if (wslenv.find(L"WSLDRIVE_TOKEN") == std::wstring::npos) wslenv += L":WSLDRIVE_TOKEN/u";
+    } else {
+      wslenv = L"WSLDRIVE_TOKEN/u";
+    }
+    ::SetEnvironmentVariableW(L"WSLENV", wslenv.c_str());
+  }
   std::wstring cmd = win::to_wide(build_wsl_command(spec));
   cmd.push_back(L'\0');  // CreateProcessW may modify the buffer
 

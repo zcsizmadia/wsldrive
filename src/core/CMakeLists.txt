@@ -1,6 +1,6 @@
 add_library(wsldrive_core STATIC
+  auth_token.cpp
   coalescer.cpp
-  content_cache.cpp
   hash.cpp
   ignore.cpp
   metadata_tree.cpp
@@ -17,3 +17,6 @@ target_include_directories(wsldrive_core
 target_link_libraries(wsldrive_core
   PUBLIC wsldrive::options
   PRIVATE blake3)
+if(WIN32)
+  target_link_libraries(wsldrive_core PRIVATE bcrypt)  # BCryptGenRandom for the auth token
+endif()

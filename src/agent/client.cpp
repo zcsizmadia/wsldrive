@@ -45,9 +45,12 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
   if (!prefetch_.joinable()) prefetch_ = std::thread([this] { prefetch_loop(); });
   std::vector<std::byte> payload;
   proto::Writer w(payload);
-  proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion, .capabilities = 0, .agent = "wsldrive/0.1"});
+  proto::write_hello(
+      w, proto::Hello{
+             .protocol_version = proto::kVersion, .capabilities = 0, .agent = "wsldrive/0.1", .token = token_});
   auto p = request(proto::MsgType::Hello, payload, timeout);
   if (!p) return fail(p.error());
+  // An Error reply (e.g. a rejected token) is already decoded by request().
   if ((*p)->type != proto::MsgType::HelloAck) return fail(Errc::ProtocolError);
   proto::Reader r((*p)->payload);
   auto ack = proto::read_hello(r);
@@ -535,7 +538,7 @@ Result<std::shared_ptr<RemoteRoot::Pending>> RemoteRoot::request(proto::MsgType 
   if (pending->type == proto::MsgType::Error) {
     proto::Reader r(pending->payload);
     auto e = proto::read_error(r);
-    if (e && e->code != 0 && e->code <= static_cast<std::uint32_t>(Errc::ProtocolError))
+    if (e && e->code != 0 && e->code <= static_cast<std::uint32_t>(kLastErrc))
       return fail(static_cast<Errc>(e->code));
     return fail(Errc::ProtocolError);
   }

@@ -3,6 +3,8 @@
 //   wsldrived --root <dir> --listen tcp://127.0.0.1:7788
 //   wsldrived --root <dir> --connect vsock://host:7788      (WSL2 guest dialling the Windows host)
 #include "agent/server.hpp"
+
+#include "core/auth_token.hpp"
 #include "net/frame_channel.hpp"
 #include "net/socket.hpp"
 
@@ -35,6 +37,7 @@ int main(int argc, char** argv) {
   bool watch = true;
   bool exit_when_idle = false;
   bool one_file_system = true;
+  bool insecure_no_auth = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
     auto next = [&](std::string& out) {
@@ -58,6 +61,8 @@ int main(int argc, char** argv) {
       exit_when_idle = true;
     } else if (a == "--cross-filesystems") {
       one_file_system = false;
+    } else if (a == "--insecure-no-auth") {
+      insecure_no_auth = true;
     } else {
       usage();
       return 2;
@@ -68,7 +73,20 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  wsld::agent::RootServer server({.root = root, .watch = watch, .one_file_system = one_file_system});
+  // The agent serves reads and mutations, so it refuses to run unauthenticated
+  // unless the operator says so explicitly. The launcher passes the token in the
+  // environment (not argv, which is world-readable).
+  const std::string token = wsld::auth_token_from_env();
+  if (token.empty() && !insecure_no_auth) {
+    std::fprintf(stderr,
+                 "wsldrived: refusing to serve without authentication.\n"
+                 "  Set %s in the environment (the wsldrive launcher does this for you),\n"
+                 "  or pass --insecure-no-auth to accept any local peer.\n",
+                 wsld::kAuthTokenEnv);
+    return 2;
+  }
+  wsld::agent::RootServer server(
+      {.root = root, .watch = watch, .one_file_system = one_file_system, .token = token});
   if (auto r = server.start(); !r) {
     std::fprintf(stderr, "wsldrived: cannot start: %s\n", wsld::to_string(r.error()));
     return 1;
@@ -117,18 +135,50 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  std::vector<std::thread> sessions;
+  // Sessions are capped and reaped: an unbounded accept loop that never joins
+  // finished threads lets a peer exhaust threads, handles and memory (each
+  // session can hold a 64 MiB receive buffer).
+  constexpr std::size_t kMaxSessions = 32;
+  struct Session {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
+  };
+  std::vector<Session> sessions;
+  auto reap = [&sessions] {
+    for (std::size_t i = 0; i < sessions.size();) {
+      if (sessions[i].done->load()) {
+        if (sessions[i].thread.joinable()) sessions[i].thread.join();
+        sessions.erase(sessions.begin() + static_cast<std::ptrdiff_t>(i));
+      } else {
+        ++i;
+      }
+    }
+  };
+
   for (;;) {
     auto sock = listener->accept();
     if (!sock) {
-      if (sock.error() == wsld::Errc::Timeout) continue;
+      if (sock.error() == wsld::Errc::Timeout) {
+        reap();
+        continue;
+      }
       break;
     }
-    sessions.emplace_back([&server, s = std::move(*sock)]() mutable {
-      wsld::net::FrameChannel ch(std::move(s));
+    reap();
+    if (sessions.size() >= kMaxSessions) {
+      std::fprintf(stderr, "wsldrived: refusing connection, %zu sessions already active\n", sessions.size());
+      continue;  // dropping the socket closes it
+    }
+    Session s;
+    auto done = s.done;
+    s.thread = std::thread([&server, done, sk = std::move(*sock)]() mutable {
+      wsld::net::FrameChannel ch(std::move(sk));
       server.serve(ch);
+      done->store(true);
     });
+    sessions.push_back(std::move(s));
   }
-  for (auto& t : sessions) t.join();
+  for (auto& s : sessions)
+    if (s.thread.joinable()) s.thread.join();
   return 0;
 }

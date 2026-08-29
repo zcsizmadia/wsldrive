@@ -4,6 +4,7 @@
 //   wsldrive fetch --connect tcp://127.0.0.1:7788 [--watch] [--read <path>] [--lookups N]
 //   wsldrive fetch --listen hv://7788          (wait for the WSL2 agent to dial in)
 #include "agent/client.hpp"
+#include "core/auth_token.hpp"
 #include "net/frame_channel.hpp"
 #include "net/socket.hpp"
 
@@ -160,6 +161,7 @@ int main(int argc, char** argv) {
     }
     const std::string mountpoint = argv[2];
     std::string connect, listen, distro, wsl_root, agent_path, win_root, win_agent;
+    std::string auth_token = wsld::auth_token_from_env();  // inherited for --connect; generated for auto-launch
     std::uint32_t port = 51789;
     bool have_distro = false;
     bool writeback = false;
@@ -223,7 +225,16 @@ int main(int argc, char** argv) {
       // client connects to the guest VM over AF_HYPERV. Needs a registered vsock
       // port (scripts/register-hvsocket.ps1) and the VM's GUID.
       if (hvsocket && port == 51789) port = 5700;  // a registered vsock port by default
-      wsld::platform::WslAgentSpec spec{.distro = distro, .agent_path = agent_path, .wsl_root = wsl_root, .port = port};
+      // Per-mount shared secret: generated here, handed to the agent through the
+      // environment (WSLENV forwards it into the distro, so it never appears on a
+      // command line) and presented by this client in the Hello handshake.
+      auth_token = wsld::generate_auth_token();
+      if (auth_token.empty()) {
+        std::fprintf(stderr, "wsldrive: could not generate an authentication token\n");
+        return 1;
+      }
+      wsld::platform::WslAgentSpec spec{
+          .distro = distro, .agent_path = agent_path, .wsl_root = wsl_root, .port = port, .token = auth_token};
       if (hvsocket) {
         std::string guid = vm_guid.empty() ? wsld::platform::discover_wsl_vm_guid() : vm_guid;
         if (guid.empty()) {
@@ -282,6 +293,12 @@ int main(int argc, char** argv) {
         return 2;
       }
       if (hvsocket && port == 51789) port = 5700;
+      // Per-mount shared secret for the agent we are about to launch.
+      auth_token = wsld::generate_auth_token();
+      if (auth_token.empty()) {
+        std::fprintf(stderr, "wsldrive: could not generate an authentication token\n");
+        return 1;
+      }
       if (hvsocket) {
         std::string guid = vm_guid.empty() ? wsld::platform::discover_wsl_vm_guid() : vm_guid;
         if (guid.empty()) {
@@ -320,7 +337,9 @@ int main(int argc, char** argv) {
       // The listener is up, so launch the Windows agent to dial back in now (an
       // AF_HYPERV connect would block if it were started before we were listening).
       if (!win_agent_connect.empty()) {
-        if (auto r = win_proc.start({.exe = win_agent, .win_root = win_root, .connect = win_agent_connect}); !r) {
+        if (auto r = win_proc.start(
+                {.exe = win_agent, .win_root = win_root, .connect = win_agent_connect, .token = auth_token});
+            !r) {
           std::fprintf(stderr, "wsldrive: failed to launch Windows agent '%s'\n", win_agent.c_str());
           return 1;
         }
@@ -358,6 +377,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     wsld::agent::RemoteRoot root(std::make_unique<wsld::net::FrameChannel>(std::move(*sock)));
+    root.set_auth_token(auth_token);
     if (auto h = root.connect(); !h) {
       std::fprintf(stderr, "wsldrive: handshake failed: %s\n", wsld::to_string(h.error()));
       return 1;
@@ -464,6 +484,7 @@ int main(int argc, char** argv) {
   }
 
   wsld::agent::RemoteRoot root(std::make_unique<wsld::net::FrameChannel>(std::move(sock)));
+  root.set_auth_token(wsld::auth_token_from_env());
   auto hello = root.connect();
   if (!hello) {
     std::fprintf(stderr, "wsldrive: handshake failed: %s\n", wsld::to_string(hello.error()));
