@@ -291,7 +291,7 @@ int main(int argc, char** argv) {
         listen = "vsock://any:" + std::to_string(port);
         win_agent_connect = "hv://{" + guid + "}:" + std::to_string(port);
       } else {
-        listen = "tcp://0.0.0.0:" + std::to_string(port);
+        listen = "tcp://127.0.0.1:" + std::to_string(port);  // loopback only: the Windows agent dials in locally
         win_agent_connect = "tcp://127.0.0.1:" + std::to_string(port);
       }
     }

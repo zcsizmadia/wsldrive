@@ -292,6 +292,29 @@ content cache, ignore rules, name escaping, path utils), all unit-tested. `src/n
 `src/agent` — the scanner, `RootServer`, and the `RemoteRoot` client. `src/mount` — the FUSE3 mount.
 `src/tools` — the `wsldrive` and `wsldrived` binaries. `tests`, `bench`, `scripts` as named.
 
+## Security
+
+**The agent does not authenticate its peer.** `wsldrived` serves reads *and* write-through mutations
+(write, create, mkdir, unlink, rmdir, rename, truncate) to whoever connects — there is no token and no
+peer check. Anything that can reach the socket can read and modify the served tree with your
+permissions:
+
+- **Direction A** — the agent listens on loopback *inside the distro*, so any process in that distro can
+  reach it while the mount is up.
+- **Direction B** — the client listens on loopback on the WSL side, so any local process can reach it.
+
+Auto-launch (`--distro` / `--win-agent`) narrows the window considerably: the agent runs with
+`--exit-when-idle`, serving exactly one session and exiting when the mount ends. A long-lived
+`wsldrived --listen` is the exposed case.
+
+Practical guidance: **serve a tree you are willing to expose to every process on that machine**, and
+don't run a long-lived agent on a shared or untrusted host. Peer authentication (a per-mount shared
+secret passed by the launcher) is planned; until then this is the trust boundary.
+
+Paths from a peer are confined to the served root — `..`, absolute and drive-letter paths are rejected
+and the resolved path is re-checked against the root — but note that a **symlink inside the tree is
+followed**, so a link pointing outside the root resolves to its target.
+
 ## License
 
 [MIT](LICENSE). WinFsp (a runtime dependency for Direction A) is licensed separately under GPLv3 or a

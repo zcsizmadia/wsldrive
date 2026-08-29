@@ -1,10 +1,24 @@
 #include "core/protocol.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace wsld::proto {
 
 namespace {
+
+// An element count read off the wire is attacker-controlled. It is already
+// bounded by the bytes remaining in the frame, but a 64 MiB frame can still
+// claim ~64M elements, and reserving that many multi-byte structs would commit
+// gigabytes before a single element is validated. Reserve only a modest amount
+// up front and let the container grow as elements actually decode — a truncated
+// or lying count then fails on the first short read instead of on allocation.
+constexpr std::uint64_t kMaxPreReserve = 4096;
+
+template <class V>
+void reserve_bounded(V& v, std::uint64_t claimed) {
+  v.reserve(static_cast<std::size_t>(std::min(claimed, kMaxPreReserve)));
+}
 
 inline void put_le(std::byte* p, std::uint64_t v, std::size_t n) noexcept {
   for (std::size_t i = 0; i < n; ++i) p[i] = static_cast<std::byte>((v >> (8 * i)) & 0xFF);
@@ -253,7 +267,7 @@ Result<InvalidationBatch> read_invalidation(Reader& r) noexcept {
   auto count = r.varint();
   if (!count) return fail(count.error());
   if (*count > r.remaining()) return fail(Errc::Corrupt);  // every op is >= 2 bytes
-  b.ops.reserve(static_cast<std::size_t>(*count));
+  reserve_bounded(b.ops, *count);
   for (std::uint64_t i = 0; i < *count; ++i) {
     InvalidationOp op;
     auto kind = r.u8();
@@ -437,7 +451,7 @@ Result<ReadManyRequest> read_read_many_request(Reader& r) {
   if (!count) return fail(count.error());
   if (*count > r.remaining()) return fail(Errc::Corrupt);  // each path is >= 1 byte
   ReadManyRequest q;
-  q.paths.reserve(static_cast<std::size_t>(*count));
+  reserve_bounded(q.paths, *count);
   for (std::uint64_t i = 0; i < *count; ++i) {
     auto p = r.string();
     if (!p) return fail(p.error());
@@ -459,7 +473,7 @@ Result<ReadManyResponse> read_read_many_response(Reader& r) {
   if (!count) return fail(count.error());
   if (*count > r.remaining()) return fail(Errc::Corrupt);
   ReadManyResponse p;
-  p.items.reserve(static_cast<std::size_t>(*count));
+  reserve_bounded(p.items, *count);
   for (std::uint64_t i = 0; i < *count; ++i) {
     auto ok = r.u8();
     if (!ok) return fail(ok.error());

@@ -177,10 +177,52 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch) {
   }
 }
 
+namespace {
+
+// True when `p` is lexically inside `root`. Compared component-wise on already
+// normalised paths, so it never touches the filesystem (no TOCTOU, no cost).
+bool path_is_under(const std::filesystem::path& root, const std::filesystem::path& p) {
+  const auto r = root.lexically_normal();
+  const auto q = p.lexically_normal();
+  auto ri = r.begin();
+  auto qi = q.begin();
+  for (; ri != r.end(); ++ri, ++qi) {
+    if (ri->empty()) continue;  // trailing separator yields an empty component
+    if (qi == q.end() || *qi != *ri) return false;
+  }
+  return true;
+}
+
+// A peer-supplied path must stay inside the served root. Rejecting the ".."
+// component (not the substring, so `foo..bar` stays legal) is not enough on
+// Windows: `C:/Windows/...` has no ".." at all, yet fs::path::operator/ REPLACES
+// the left side when the right has a root name, so the join would escape the
+// root entirely. Reject anything that is not a pure relative path.
+bool is_contained_relative(std::string_view norm) {
+  if (norm.empty()) return true;  // the root itself
+  std::size_t i = 0;
+  while (i <= norm.size()) {
+    const std::size_t j = norm.find('/', i);
+    const std::string_view comp = norm.substr(i, (j == std::string_view::npos ? norm.size() : j) - i);
+    if (comp == "..") return false;
+    // A component carrying a root name (drive letter, and on Windows also an
+    // alternate data stream) would re-anchor the join.
+    if (comp.find(':') != std::string_view::npos) return false;
+    if (j == std::string_view::npos) break;
+    i = j + 1;
+  }
+  return true;
+}
+
+}  // namespace
+
 Result<std::filesystem::path> RootServer::resolve(std::string_view rel) const {
   const std::string norm = normalize_path(rel);
-  if (norm.find("..") != std::string::npos) return fail(Errc::InvalidPath);
-  return join_relative(opts_.root, norm);
+  if (!is_contained_relative(norm)) return fail(Errc::InvalidPath);
+  std::filesystem::path full = join_relative(opts_.root, norm);
+  // Defence in depth: whatever the join produced must still be under the root.
+  if (!path_is_under(opts_.root, full)) return fail(Errc::InvalidPath);
+  return full;
 }
 
 namespace {
@@ -352,8 +394,9 @@ Result<void> RootServer::send_read(const net::Frame& f, net::FrameChannel& ch) {
   auto q = proto::read_read_request(r);
   if (!q) return fail(q.error());
   const std::string rel = normalize_path(q->path);
-  if (rel.find("..") != std::string::npos) return send_error(f.header.request_id, Errc::InvalidPath, "'..' not allowed", ch);
-  const fs::path full = join_relative(opts_.root, rel);
+  auto resolved = resolve(rel);  // single gate: rejects .., absolute and escaping paths
+  if (!resolved) return send_error(f.header.request_id, Errc::InvalidPath, "path outside the served root", ch);
+  const fs::path full = *resolved;
 
   std::error_code ec;
   const auto size = fs::file_size(full, ec);
@@ -398,8 +441,9 @@ Result<void> RootServer::send_read_many(const net::Frame& f, net::FrameChannel& 
 
   for (std::size_t i = 0; i < n; ++i) {
     const std::string rel = normalize_path(q->paths[i]);
-    if (rel.find("..") != std::string::npos) continue;
-    const fs::path full = join_relative(opts_.root, rel);
+    auto resolved = resolve(rel);  // same gate as the single read
+    if (!resolved) continue;
+    const fs::path full = *resolved;
     std::error_code ec;
     const auto sz = fs::file_size(full, ec);
     if (ec || sz > (16u << 20) || total + sz > cap) continue;  // skip; client fetches individually
