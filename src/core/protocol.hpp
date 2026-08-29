@@ -104,7 +104,12 @@ class Reader {
   [[nodiscard]] Result<std::uint32_t> u32() noexcept;
   [[nodiscard]] Result<std::uint64_t> u64() noexcept;
   [[nodiscard]] Result<std::int64_t> i64() noexcept {
-    return u64().transform([](std::uint64_t v) { return static_cast<std::int64_t>(v); });
+    // Spelled out rather than .transform(): the monadic std::expected API is a
+    // GCC 13 addition, and the release binaries are built with GCC 12 so they
+    // load on Ubuntu 22.04.
+    auto v = u64();
+    if (!v) return fail(v.error());
+    return static_cast<std::int64_t>(*v);
   }
   [[nodiscard]] Result<std::uint64_t> varint() noexcept;
   [[nodiscard]] Result<std::span<const std::byte>> raw(std::size_t n) noexcept;
