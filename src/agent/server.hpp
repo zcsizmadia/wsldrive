@@ -71,6 +71,9 @@ class RootServer {
 
   void on_event(const FsEvent& ev);
   void flush_loop();
+  // Adds a session to the invalidation broadcast set. Returns false when the
+  // server is stopping, in which case the caller must not serve the session.
+  bool add_peer(net::FrameChannel& ch);
   void broadcast(const std::vector<std::byte>& frame);
 
   Options opts_;
