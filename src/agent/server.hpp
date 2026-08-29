@@ -7,6 +7,7 @@
 #include "platform/watcher.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <memory>
@@ -35,6 +36,11 @@ class RootServer {
     // Shared secret a peer must present in its Hello. Empty disables the check
     // (only when the operator passes --insecure-no-auth).
     std::string token;
+    // How long a connected peer may stay silent before authenticating. The
+    // gate in handle() only fires on an incoming frame, so without this a peer
+    // that connects and sends nothing would hold a session slot forever — 32 of
+    // them lock every legitimate client out of a --listen agent.
+    std::chrono::milliseconds handshake_timeout = std::chrono::seconds(10);
   };
 
   explicit RootServer(Options opts);
