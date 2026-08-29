@@ -117,12 +117,14 @@ TEST_F(AgentTest, ReadAttributes) {
 /// Runs a RootServer on a loopback TCP listener with one accept thread.
 class LoopbackServer {
  public:
-  explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20), std::string token = {})
+  explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20), std::string token = {},
+                          std::chrono::milliseconds handshake_timeout = 10s)
       : server_({.root = std::move(root),
                  .watch = watch,
                  .coalescer = {},
                  .snapshot_chunk_bytes = chunk_bytes,
-                 .token = std::move(token)}) {
+                 .token = std::move(token),
+                 .handshake_timeout = handshake_timeout}) {
     auto l = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
     if (!l) throw std::runtime_error("bind failed");
     listener_ = std::move(*l);
@@ -385,6 +387,37 @@ TEST_F(AgentTest, UnauthenticatedPeerReceivesNoInvalidations) {
   } else {
     EXPECT_EQ(f.error(), Errc::Timeout) << "expected silence, got " << to_string(f.error());
   }
+}
+
+TEST_F(AgentTest, SilentPeerIsDroppedAfterTheHandshakeTimeout) {
+  // The authentication gate only fires on an incoming frame, so a peer that
+  // connects and never sends anything would otherwise hold one of the agent's
+  // session slots forever; 32 of those lock every real client out.
+  LoopbackServer srv(root_, /*watch=*/false, 4u << 20, "s3cret-token", /*handshake_timeout=*/400ms);
+
+  auto sock = net::connect(srv.endpoint());
+  ASSERT_TRUE(sock.has_value());
+  net::FrameChannel silent(std::move(*sock));
+
+  // The server says why, then hangs up.
+  auto notice = silent.receive(5s);
+  ASSERT_TRUE(notice.has_value()) << "expected the server to end the session, not keep waiting";
+  EXPECT_EQ(notice->header.type, proto::MsgType::Error);
+  proto::Reader r(notice->payload);
+  auto err = proto::read_error(r);
+  ASSERT_TRUE(err.has_value());
+  EXPECT_EQ(static_cast<Errc>(err->code), Errc::Timeout);
+  auto after = silent.receive(5s);
+  EXPECT_FALSE(after.has_value()) << "the session must be closed after the notice";
+  if (!after.has_value()) EXPECT_NE(after.error(), Errc::Timeout) << "closed, not merely quiet";
+
+  // A peer that does authenticate in time is unaffected by the deadline.
+  auto good = connect_client(srv.endpoint());
+  ASSERT_NE(good, nullptr);
+  good->set_auth_token("s3cret-token");
+  ASSERT_TRUE(good->connect().has_value());
+  std::this_thread::sleep_for(600ms);  // well past the handshake window
+  EXPECT_TRUE(good->ping().has_value()) << "an authenticated session must not be timed out";
 }
 
 TEST(AuthToken, GeneratesDistinctHexSecrets) {

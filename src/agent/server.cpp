@@ -171,11 +171,19 @@ void RootServer::serve(net::FrameChannel& ch) {
   }
   if (authed && !(registered = add_peer(ch))) return;
 
+  // A silent peer never trips the gate in handle(), so it is dropped on a clock
+  // instead: it must have authenticated by this deadline or the session ends.
+  const auto handshake_deadline = std::chrono::steady_clock::now() + opts_.handshake_timeout;
+
   for (;;) {
     auto f = ch.receive(std::chrono::milliseconds(200));
     if (!f) {
       if (f.error() == Errc::Timeout) {
         if (stopping_) break;
+        if (!authed && std::chrono::steady_clock::now() >= handshake_deadline) {
+          (void)send_error(0, Errc::Timeout, "handshake timeout", ch);
+          break;
+        }
         continue;
       }
       break;  // peer disconnected or I/O error
