@@ -29,11 +29,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # 22.04's default GCC 11 has no <expected>; g++-12 is in its own repos and,
+      # with libstdc++ linked statically, the binary still only needs 22.04's glibc.
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev g++-12
       - name: Build
         run: |
-          cmake --preset linux-release -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --preset linux-release -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 \
+                -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
           # wsldrive = client (Direction B); wsldrived = agent (Direction A auto-launch)
           cmake --build --preset linux-release --target wsldrive wsldrived --parallel
       - name: Check the glibc ceiling (must run on Ubuntu 22.04 / Debian 12)
