@@ -37,7 +37,8 @@ foreach ($pair in @(@('wsldrive', 'wsldrive-linux-x64'), @('wsldrived', 'wsldriv
 Copy-Item (Join-Path $root 'scripts\install.ps1'), (Join-Path $root 'scripts\register-hvsocket.ps1') "$stage\scripts\"
 Copy-Item (Join-Path $root 'wsldrive.example.json'), (Join-Path $root 'README.md'), (Join-Path $root 'CHANGELOG.md'), (Join-Path $root 'LICENSE') $stage\
 
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent (Resolve-Path -LiteralPath (Split-Path -Parent $Out) -ErrorAction SilentlyContinue) ) -ErrorAction SilentlyContinue | Out-Null
+$outDir = Split-Path -Parent $Out
+if ($outDir) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }   # a bare file name means the cwd
 if (Test-Path $Out) { Remove-Item -Force $Out }
 # Zip the CONTENTS of the staging dir (a directory entry keeps its subfolders).
 Compress-Archive -Path "$stage\*" -DestinationPath $Out
