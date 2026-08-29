@@ -409,7 +409,9 @@ TEST_F(AgentTest, SilentPeerIsDroppedAfterTheHandshakeTimeout) {
   EXPECT_EQ(static_cast<Errc>(err->code), Errc::Timeout);
   auto after = silent.receive(5s);
   EXPECT_FALSE(after.has_value()) << "the session must be closed after the notice";
-  if (!after.has_value()) EXPECT_NE(after.error(), Errc::Timeout) << "closed, not merely quiet";
+  if (!after.has_value()) {
+    EXPECT_NE(after.error(), Errc::Timeout) << "closed, not merely quiet";
+  }
 
   // A peer that does authenticate in time is unaffected by the deadline.
   auto good = connect_client(srv.endpoint());
