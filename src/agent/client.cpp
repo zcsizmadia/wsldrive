@@ -121,11 +121,20 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
   if (!is_file || size > kMaxCacheableFile) return read_remote(path, offset, length, timeout);
 
   {
-    std::lock_guard lock(rcache_mu_);
-    if (const auto it = rcache_.find(path); it != rcache_.end() && it->second.mtime_ns == mtime &&
-                                            it->second.size == size) {
-      it->second.last_use = ++rcache_tick_;
-      auto out = slice(it->second.data, offset, length);
+    // Take a reference to the buffer under the lock, then copy the requested
+    // range after releasing it: the copy is the long part, and holding the cache
+    // mutex across it serialised every concurrent reader of cached files.
+    std::shared_ptr<const std::vector<std::byte>> hit;
+    {
+      std::lock_guard lock(rcache_mu_);
+      if (const auto it = rcache_.find(path);
+          it != rcache_.end() && it->second.mtime_ns == mtime && it->second.size == size) {
+        lru_.splice(lru_.begin(), lru_, it->second.lru);  // most-recently-used
+        hit = it->second.data;
+      }
+    }
+    if (hit) {
+      auto out = slice(*hit, offset, length);
       std::lock_guard s(stats_mu_);
       ++stats_.read_cache_hits;
       return out;
@@ -188,18 +197,42 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
   return slice(target_bytes, offset, length);
 }
 
-void RemoteRoot::cache_put(std::string path, std::int64_t mtime_ns, std::uint64_t size, std::vector<std::byte> data) {
-  std::lock_guard lock(rcache_mu_);
-  if (const auto it = rcache_.find(path); it != rcache_.end()) rcache_bytes_ -= it->second.data.size();
-  rcache_bytes_ += data.size();
-  rcache_[path] = CacheEntry{mtime_ns, size, ++rcache_tick_, std::move(data)};
+void RemoteRoot::evict_locked() {
+  // Evict least-recently-used first. The LRU list makes each victim O(1); a scan
+  // for the minimum would make a full cache O(n) per insert (O(n^2) while
+  // thrashing the cap).
   while (rcache_bytes_ > rcache_cap_ && rcache_.size() > 1) {
-    auto victim = rcache_.begin();
-    for (auto i = std::next(rcache_.begin()); i != rcache_.end(); ++i)
-      if (i->second.last_use < victim->second.last_use) victim = i;
-    rcache_bytes_ -= victim->second.data.size();
-    rcache_.erase(victim);
+    const auto victim = rcache_.find(lru_.back());
+    if (victim == rcache_.end()) {  // should not happen; keep the list consistent
+      lru_.pop_back();
+      continue;
+    }
+    cache_erase(victim);
   }
+}
+
+void RemoteRoot::set_read_cache_limit(std::uint64_t bytes) {
+  std::lock_guard lock(rcache_mu_);
+  rcache_cap_ = bytes;
+  evict_locked();
+  std::lock_guard s(stats_mu_);
+  stats_.read_cache_bytes = rcache_bytes_;
+}
+
+void RemoteRoot::cache_erase(std::unordered_map<std::string, CacheEntry, StringHash, std::equal_to<>>::iterator it) {
+  rcache_bytes_ -= it->second.data ? it->second.data->size() : 0;
+  lru_.erase(it->second.lru);
+  rcache_.erase(it);
+}
+
+void RemoteRoot::cache_put(std::string path, std::int64_t mtime_ns, std::uint64_t size, std::vector<std::byte> data) {
+  auto buf = std::make_shared<const std::vector<std::byte>>(std::move(data));
+  std::lock_guard lock(rcache_mu_);
+  if (const auto it = rcache_.find(path); it != rcache_.end()) cache_erase(it);
+  rcache_bytes_ += buf->size();
+  lru_.push_front(path);
+  rcache_.insert_or_assign(std::move(path), CacheEntry{mtime_ns, size, lru_.begin(), std::move(buf)});
+  evict_locked();
   std::lock_guard s(stats_mu_);
   stats_.read_cache_bytes = rcache_bytes_;
 }
@@ -362,10 +395,7 @@ Result<std::chrono::nanoseconds> RemoteRoot::ping(std::chrono::milliseconds time
 
 void RemoteRoot::drop_cached(std::string_view path) {
   std::lock_guard lock(rcache_mu_);
-  if (const auto it = rcache_.find(path); it != rcache_.end()) {
-    rcache_bytes_ -= it->second.data.size();
-    rcache_.erase(it);
-  }
+  if (const auto it = rcache_.find(path); it != rcache_.end()) cache_erase(it);
 }
 
 Result<void> RemoteRoot::create_file(std::string_view path, std::uint32_t mode, std::chrono::milliseconds timeout) {
@@ -615,10 +645,7 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
   {
     std::lock_guard lock(rcache_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
-      if (const auto it = rcache_.find(op.path); it != rcache_.end()) {
-        rcache_bytes_ -= it->second.data.size();
-        rcache_.erase(it);
-      }
+      if (const auto it = rcache_.find(op.path); it != rcache_.end()) cache_erase(it);
     }
   }
   // Let a changed directory be re-prefetched on the next read there.

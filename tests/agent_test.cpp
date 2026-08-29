@@ -291,6 +291,43 @@ TEST_F(AgentTest, ChunkedSnapshotReassembles) {
   EXPECT_GT(c->stats().snapshot_bytes, 256u);
 }
 
+TEST_F(AgentTest, ReadCacheEvictsLeastRecentlyUsed) {
+  // Eviction must drop the least-recently-*used* entry, not the oldest-inserted:
+  // re-reading a file has to refresh its recency.
+  // One file per directory on purpose: a read miss bulk-fetches the target's
+  // siblings, which would otherwise re-cache everything and mask the ordering.
+  const std::string body(1000, 'x');
+  for (const char* d : {"d1", "d2", "d3"}) {
+    fs::create_directories(root_ / "lru" / d);
+    write_file(root_ / "lru" / d / "f", body);
+  }
+
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  c->set_read_cache_limit(2500);  // room for two of these files, not three
+
+  ASSERT_TRUE(c->read("lru/d1/f", 0, 16).has_value());
+  ASSERT_TRUE(c->read("lru/d2/f", 0, 16).has_value());
+  ASSERT_TRUE(c->read("lru/d1/f", 0, 16).has_value());  // refreshes d1; d2 is now LRU
+  ASSERT_TRUE(c->read("lru/d3/f", 0, 16).has_value());  // pushes past the budget
+
+  const auto hits_before = c->stats().read_cache_hits;
+  ASSERT_TRUE(c->read("lru/d1/f", 0, 16).has_value());
+  EXPECT_GT(c->stats().read_cache_hits, hits_before) << "recently used entry should have survived";
+
+  const auto misses_before = c->stats().read_cache_misses;
+  ASSERT_TRUE(c->read("lru/d2/f", 0, 16).has_value());
+  EXPECT_GT(c->stats().read_cache_misses, misses_before) << "least-recently-used entry should have been evicted";
+  EXPECT_LE(c->stats().read_cache_bytes, 2500u) << "cache must stay within its budget";
+
+  // Lowering the budget to nothing must clear it down (one entry may remain).
+  c->set_read_cache_limit(0);
+  EXPECT_LE(c->stats().read_cache_bytes, body.size());
+}
+
 TEST_F(AgentTest, RejectsPathsOutsideTheServedRoot) {
   // A peer must not be able to name anything outside the root. `..` was already
   // refused, but an absolute/drive-letter path contains no `..` at all and
