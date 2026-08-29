@@ -116,13 +116,19 @@ jobs:
             if ($errors) { $bad++; Write-Host "::error file=$($f.FullName)::$($errors[0].Message)" } else { Write-Host "ok  $($f.Name)" }
           }
           if ($bad) { throw "$bad script(s) do not parse" }
-      - name: Stage a release-zip layout (placeholder binaries)
+      - name: Build the release zip exactly as release.yml does, then unpack it
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path rel\scripts | Out-Null
-          foreach ($f in 'wsldrive.exe','wsldrived.exe','wsldrivew.exe','wsldrive-linux-x64','wsldrived-linux-x64') { Set-Content -Path "rel\$f" -Value 'placeholder' }
-          Copy-Item scripts\install.ps1, scripts\register-hvsocket.ps1 rel\scripts\
-          Copy-Item wsldrive.example.json, README.md, LICENSE, CHANGELOG.md rel\
+          # Placeholder binaries: the zip layout is what is under test here, and a
+          # dry run only checks that the files exist.
+          New-Item -ItemType Directory -Force -Path bin\win, bin\linux | Out-Null
+          foreach ($f in 'wsldrive.exe','wsldrived.exe','wsldrivew.exe') { Set-Content -Path "bin\win\$f" -Value 'placeholder' }
+          foreach ($f in 'wsldrive','wsldrived') { Set-Content -Path "bin\linux\$f" -Value 'placeholder' }
+          .\scripts\package-zip.ps1 -WinBin bin\win -LinuxBin bin\linux -Out wsldrive-windows-x64.zip
+          Expand-Archive wsldrive-windows-x64.zip -DestinationPath rel
+          # The README's route 2 command must resolve inside the unpacked zip.
+          if (-not (Test-Path rel\scripts\install.ps1)) { throw 'zip lacks scripts\install.ps1 - README route 2 would fail' }
+          Get-ChildItem rel -Recurse -Name
       - name: Dry run - Direction A (easy mode)
         shell: pwsh
         run: |
@@ -131,6 +137,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
           if ($out -notmatch "would register logon task 'wsldrive-mount-W'") { throw 'the plan does not register the W: task' }
           if ($out -notmatch 'would start wsldrive-mount-W') { throw 'the plan does not start the mount' }
+          if ($out -match 'needs the Linux build') { throw 'the Linux agent in the zip was not found from the unpacked layout' }
       - name: Dry run - several mounts from the example config
         shell: pwsh
         run: |
