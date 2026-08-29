@@ -15,6 +15,7 @@ using StatT = struct fuse_stat;
 using StatvfsT = struct fuse_statvfs;
 using OffT = fuse_off_t;
 using ModeT = fuse_mode_t;
+using TimespecT = struct fuse_timespec;
 #ifndef S_IFLNK
 #define S_IFLNK 0120000
 #endif
@@ -22,11 +23,13 @@ using ModeT = fuse_mode_t;
 #define FUSE_USE_VERSION 31
 #include <fuse3/fuse.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/statvfs.h>
 using StatT = struct stat;
 using StatvfsT = struct statvfs;
 using OffT = off_t;
 using ModeT = mode_t;
+using TimespecT = struct timespec;
 #endif
 
 #include <algorithm>
@@ -110,6 +113,14 @@ std::string to_rel(const char* path) {
 
 void fill_stat(const MetadataTree::Node& n, StatT* st) {
   std::memset(st, 0, sizeof(*st));
+#ifndef _WIN32
+  // Report the mounting user as the owner. Left at 0 the whole tree looks
+  // root-owned, and tools that check ownership refuse to touch it — git aborts
+  // with "detected dubious ownership" on any repo living on the mount. The
+  // backing store (NTFS via the Windows agent) has no POSIX owner to preserve.
+  st->st_uid = ::getuid();
+  st->st_gid = ::getgid();
+#endif
   if (n.attr.kind == NodeKind::Directory) {
     st->st_mode = static_cast<ModeT>(S_IFDIR | 0755);
     st->st_nlink = 2;
@@ -292,6 +303,26 @@ int op_statfs(const char*, StatvfsT* st) {
 
 int op_fsync(const char*, int, struct fuse_file_info* fi) { return flush_handle(handle_of(fi)); }
 
+// Accepted but not carried across the boundary: the served tree may live on a
+// filesystem with no POSIX mode or ns timestamps (NTFS, via the Windows agent),
+// and the protocol has no message for either. Returning ENOSYS instead is worse
+// than accepting: git probes `core.filemode` by chmod-ing .git/config.lock and
+// aborts the whole clone if that fails, so a repo could not live on the mount at
+// all. The mirror keeps reporting the attributes the agent reports.
+int op_chmod(const char* path, ModeT, struct fuse_file_info*) {
+  const std::string rel = to_rel(path);
+  return ctx()->root->with_tree([&](const MetadataTree& t) {
+    return t.lookup(rel, LookupMode::CaseInsensitive) ? 0 : -ENOENT;
+  });
+}
+
+int op_utimens(const char* path, const TimespecT[2], struct fuse_file_info*) {
+  const std::string rel = to_rel(path);
+  return ctx()->root->with_tree([&](const MetadataTree& t) {
+    return t.lookup(rel, LookupMode::CaseInsensitive) ? 0 : -ENOENT;
+  });
+}
+
 void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
   cfg->kernel_cache = 0;
   cfg->entry_timeout = 1.0;
@@ -316,6 +347,8 @@ fuse_operations make_ops() {
   ops.rename = op_rename;
   ops.statfs = op_statfs;
   ops.fsync = op_fsync;
+  ops.chmod = op_chmod;      // accepted (not persisted) - git aborts a clone without it
+  ops.utimens = op_utimens;  // likewise, so `touch` and build tools work
   ops.flush = op_flush;
   ops.release = op_release;
   return ops;
