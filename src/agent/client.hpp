@@ -70,6 +70,13 @@ class RemoteRoot {
   [[nodiscard]] Result<std::vector<std::byte>> read(std::string_view path, std::uint64_t offset, std::uint32_t length,
                                                     std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
+  /// Reads into a caller-supplied buffer and returns the byte count. On a cache
+  /// hit this copies straight from the cached file into `out`, so the hot path
+  /// (a mount reading a cached file in chunks) does no intermediate allocation.
+  /// Misses take the same path as read().
+  [[nodiscard]] Result<std::size_t> read_into(std::string_view path, std::uint64_t offset, std::span<std::byte> out,
+                                              std::chrono::milliseconds timeout = std::chrono::seconds(30));
+
   /// Largest file the read cache will hold whole; larger reads stream uncached.
   static constexpr std::uint64_t kMaxCacheableFile = 8u << 20;
 

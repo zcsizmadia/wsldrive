@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -328,6 +329,38 @@ TEST(AuthToken, GeneratesDistinctHexSecrets) {
   EXPECT_EQ(a.size(), 32u);  // 128 bits as hex
   EXPECT_NE(a, b);
   EXPECT_EQ(a.find_first_not_of("0123456789abcdef"), std::string::npos);
+}
+
+TEST_F(AgentTest, ReadIntoMatchesReadAndServesFromCache) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  std::array<std::byte, 64> buf{};
+  auto n = c->read_into("README.md", 0, buf);  // miss: goes to the agent
+  ASSERT_TRUE(n.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(buf.data()), *n), "# readme\n");
+
+  const auto hits_before = c->stats().read_cache_hits;
+  auto again = c->read_into("README.md", 2, buf);  // hit: copied straight into buf
+  ASSERT_TRUE(again.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(buf.data()), *again), "readme\n");
+  EXPECT_GT(c->stats().read_cache_hits, hits_before);
+
+  // Past EOF yields nothing, and a missing file reports the same error as read().
+  auto past = c->read_into("README.md", 1000, buf);
+  ASSERT_TRUE(past.has_value());
+  EXPECT_EQ(*past, 0u);
+  EXPECT_EQ(c->read_into("nope.txt", 0, buf).error(), Errc::NotFound);
+
+  // A short buffer must be honoured, never overrun.
+  std::array<std::byte, 4> small{};
+  auto few = c->read_into("README.md", 0, small);
+  ASSERT_TRUE(few.has_value());
+  EXPECT_EQ(*few, 4u);
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(small.data()), 4), "# re");
 }
 
 TEST_F(AgentTest, ReadCacheEvictsLeastRecentlyUsed) {
