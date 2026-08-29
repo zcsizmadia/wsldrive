@@ -120,10 +120,15 @@ jobs:
           # Zip of raw binaries + the script installer, for the no-build script path.
           $z = 'staging\wsldrive-windows-x64.zip'
           Copy-Item build\msvc-release\src\tools\wsldrive.exe,build\msvc-release\src\tools\wsldrived.exe,build\msvc-release\src\tools\wsldrivew.exe .
+          # The Linux client and agent must be in the zip too: install.ps1 stages
+          # them into the distro, and without them the script route cannot set up
+          # either direction.
+          Copy-Item build\linux-release\src\tools\wsldrive  wsldrive-linux-x64
+          Copy-Item build\linux-release\src\tools\wsldrived wsldrived-linux-x64
           Compress-Archive -Force -DestinationPath $z -Path `
-            wsldrive.exe,wsldrived.exe,wsldrivew.exe,scripts\install.ps1,scripts\register-hvsocket.ps1,README.md,LICENSE
-          Copy-Item build\linux-release\src\tools\wsldrive  staging\wsldrive-linux-x64
-          Copy-Item build\linux-release\src\tools\wsldrived staging\wsldrived-linux-x64
+            wsldrive.exe,wsldrived.exe,wsldrivew.exe,wsldrive-linux-x64,wsldrived-linux-x64,`
+            scripts\install.ps1,scripts\register-hvsocket.ps1,wsldrive.example.json,README.md,LICENSE
+          Copy-Item wsldrive-linux-x64,wsldrived-linux-x64 staging\
           # Publish checksums so a download can be verified (the binaries are unsigned).
           Get-ChildItem staging -File | Get-FileHash -Algorithm SHA256 |
             ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |

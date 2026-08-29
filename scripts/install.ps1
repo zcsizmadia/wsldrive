@@ -175,20 +175,39 @@ if ($Uninstall) {
 }
 
 # ---- locate the built binaries --------------------------------------------
+# Binaries are found in a source tree (build/... after scripts\build.ps1) or in a
+# release download, where they sit next to the scripts folder. Returns the first
+# path that exists.
+function First-Existing([string[]]$candidates) {
+  foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+  return ''
+}
 if (-not $BinDir) {
   foreach ($c in 'msvc-release','msvc-relwithdebinfo','msvc-debug') {
     $p = Join-Path $root "build\$c\src\tools"
     if (Test-Path (Join-Path $p 'wsldrive.exe')) { $BinDir = $p; break }
   }
+  # Release layout: wsldrive.exe beside scripts\install.ps1 (or next to it).
+  if (-not $BinDir) { $BinDir = First-Existing @($root, $PSScriptRoot | Where-Object { Test-Path (Join-Path $_ 'wsldrive.exe') }) }
 }
 $srcCli      = if ($BinDir) { Join-Path $BinDir 'wsldrive.exe' }  else { '' }
 $srcAgent    = if ($BinDir) { Join-Path $BinDir 'wsldrived.exe' } else { '' }
 $srcLauncher = if ($BinDir) { Join-Path $BinDir 'wsldrivew.exe' } else { '' }  # windowless launcher (optional)
-if (-not (Test-Path $srcCli) -or -not (Test-Path $srcAgent)) {
-  throw "Could not find wsldrive.exe / wsldrived.exe. Build first (.\scripts\build.ps1) or pass -BinDir."
+if (-not $srcCli -or -not (Test-Path $srcCli) -or -not (Test-Path $srcAgent)) {
+  throw "Could not find wsldrive.exe / wsldrived.exe. Build first (.\scripts\build.ps1), unpack the release zip, or pass -BinDir."
 }
-$linuxCli   = if ($LinuxBin)   { $LinuxBin }   else { Join-Path $root 'build\linux-release\src\tools\wsldrive' }   # Direction B client
-$linuxAgent = if ($LinuxAgent) { $LinuxAgent } else { Join-Path $root 'build\linux-release\src\tools\wsldrived' }  # Direction A agent
+# Linux binaries: a source build, or the names used by the release zip and by the
+# GUI installer's install directory.
+$linuxCli = if ($LinuxBin) { $LinuxBin } else {
+  First-Existing @((Join-Path $root 'build\linux-release\src\tools\wsldrive'),
+                   (Join-Path $root 'wsldrive-linux-x64'),
+                   (Join-Path $root 'wsldrive-linux'))
+}
+$linuxAgent = if ($LinuxAgent) { $LinuxAgent } else {
+  First-Existing @((Join-Path $root 'build\linux-release\src\tools\wsldrived'),
+                   (Join-Path $root 'wsldrived-linux-x64'),
+                   (Join-Path $root 'wsldrived-linux'))
+}
 
 # Absolute $HOME inside a distro (cached — each distro is asked at most once).
 $script:WslHomeCache = @{}
@@ -365,12 +384,12 @@ foreach ($m in @($mounts | Where-Object { $_.Direction -eq 'A' })) {
 $doA = @($mounts | Where-Object { $_.Direction -eq 'A' }).Count -gt 0
 $doB = @($mounts | Where-Object { $_.Direction -eq 'B' }).Count -gt 0
 
-if ($doA -and -not (Test-Path $linuxAgent)) {
+if ($doA -and -not ($linuxAgent -and (Test-Path $linuxAgent))) {
   Warn "Direction A needs the Linux build of the agent (wsldrived) at:`n         $linuxAgent"
   Warn "Build it in WSL:  cmake --preset linux-release && cmake --build --preset linux-release"
   if (-not (AskYN 'Continue anyway (the task will fail until it exists)?' $false)) { exit 1 }
 }
-if ($doB -and -not (Test-Path $linuxCli)) {
+if ($doB -and -not ($linuxCli -and (Test-Path $linuxCli))) {
   Warn "Direction B needs the Linux build of wsldrive at:`n         $linuxCli"
   Warn "Build it in WSL:  cmake --preset linux-release && cmake --build --preset linux-release"
   if (-not (AskYN 'Continue anyway (the task will fail until it exists)?' $false)) { exit 1 }
@@ -472,11 +491,11 @@ if ($sameDir) {
 $agentInWsl = @{}   # distro -> absolute path of its staged agent (for the A task)
 foreach ($d in @($mounts | Where-Object { $_.Direction -eq 'A' } | ForEach-Object { $_.Distro } | Select-Object -Unique)) {
   Plan "stage Linux wsldrived into ${d}:$(Get-WslHome $d)/.local/bin/wsldrived"
-  if (-not $DryRun -and (Test-Path $linuxAgent)) { $agentInWsl[$d] = Stage-Into-Wsl $linuxAgent 'wsldrived' $d }
+  if (-not $DryRun -and $linuxAgent -and (Test-Path $linuxAgent)) { $agentInWsl[$d] = Stage-Into-Wsl $linuxAgent 'wsldrived' $d }
 }
 foreach ($d in @($mounts | Where-Object { $_.Direction -eq 'B' } | ForEach-Object { $_.Distro } | Select-Object -Unique)) {
   Plan "stage Linux wsldrive into ${d}:$(Get-WslHome $d)/.local/bin/wsldrive"
-  if (-not $DryRun -and (Test-Path $linuxCli)) { [void](Stage-Into-Wsl $linuxCli 'wsldrive' $d) }
+  if (-not $DryRun -and $linuxCli -and (Test-Path $linuxCli)) { [void](Stage-Into-Wsl $linuxCli 'wsldrive' $d) }
 }
 Ok 'Binaries installed.'
 
