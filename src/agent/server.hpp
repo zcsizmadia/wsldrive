@@ -41,6 +41,11 @@ class RootServer {
     // that connects and sends nothing would hold a session slot forever — 32 of
     // them lock every legitimate client out of a --listen agent.
     std::chrono::milliseconds handshake_timeout = std::chrono::seconds(10);
+    // A directory that appears by rename is enumerated into the invalidation
+    // batch so peers see its contents. Past this many entries the enumeration
+    // stops and the peers are told to Rescan instead: bounded work on the
+    // flusher thread, and a bounded batch.
+    std::size_t max_expanded_entries = 100000;
   };
 
   explicit RootServer(Options opts);
@@ -83,9 +88,16 @@ class RootServer {
 
   void on_event(const FsEvent& ev);
   void flush_loop();
-  // Appends an Upsert for every entry below the directory `rel` (which has just
-  // appeared, typically by rename) so the peers' mirrors do not show it empty.
-  void append_subtree(const std::string& rel, std::vector<proto::InvalidationOp>& ops);
+  // Appends an Upsert for every entry below each directory in `dirs` (which have
+  // just appeared, typically by rename) so the peers' mirrors do not show them
+  // empty. Paths already in `ops` are not repeated; nested dirs are enumerated
+  // once via their topmost ancestor; past Options::max_expanded_entries the
+  // expansion is replaced by a single Rescan.
+  void append_subtrees(std::vector<std::string> dirs, std::vector<proto::InvalidationOp>& ops);
+  // Encodes and broadcasts a batch, split into frames of about
+  // snapshot_chunk_bytes each (same generation) so no batch can exceed the
+  // frame limit and kill every peer's connection.
+  void broadcast_batch(const proto::InvalidationBatch& batch);
   // Adds a session to the invalidation broadcast set. Returns false when the
   // server is stopping, in which case the caller must not serve the session.
   bool add_peer(net::FrameChannel& ch);

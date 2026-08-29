@@ -55,6 +55,16 @@ installer that leaves you with a drive that comes back after every reboot.
   truncate and open on transient share errors for about a second, as Git for
   Windows itself does.
 
+- **From the final pre-release review:** a renamed directory's expansion is now
+  split into frames and capped (past 100 000 entries the peers are told to
+  rescan) — one huge `mv` could previously produce a frame above the protocol
+  limit and drop every mount; the share-violation retry no longer waits on a
+  read-only file or directory (a permanent refusal fails fast, ~255 ms budget
+  otherwise); snapshot fetches are serialised so a rescan during the initial
+  fetch cannot lose invalidations; an unauthenticated peer's frames are capped
+  at 4 KiB and must complete within the handshake window, so a half-sent frame
+  can no longer pin a session thread and 64 MiB of buffer.
+
 ### Security
 
 - **Peers authenticate** with a per-mount 128-bit shared secret from the platform

@@ -200,6 +200,9 @@ class RemoteRoot {
   // by tree_mu_ (write side).
   bool snapshot_in_flight_ = false;
   std::vector<proto::InvalidationBatch> snapshot_replay_;
+  // One snapshot fetch at a time: the mount-time fetch and a Rescan-triggered
+  // one overlapping would each end the other's replay recording.
+  std::mutex snapshot_mu_;
 
   std::thread rescan_;
   std::mutex rs_mu_;

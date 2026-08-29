@@ -25,6 +25,10 @@ Result<void> FrameChannel::send(proto::MsgType type, std::uint64_t request_id, s
 }
 
 Result<void> FrameChannel::send_raw(std::span<const std::byte> frames) {
+  // The header's length field is 32 bits and the receiver rejects anything
+  // above kMaxPayload; a caller that laid out an oversized frame would only
+  // learn about it when the peer dropped the connection.
+  if (frames.size() > proto::kHeaderSize + proto::kMaxPayload) return fail(Errc::TooLarge);
   std::lock_guard lock(send_mu_);
   auto r = sock_.send_all(frames);
   if (r) {
@@ -42,13 +46,17 @@ Result<Frame> FrameChannel::receive(std::chrono::milliseconds timeout) {
 }
 
 Result<Frame> FrameChannel::receive() {
+  const bool bounded = frame_timeout_.count() > 0;
+  const auto deadline = std::chrono::steady_clock::now() + frame_timeout_;
+  auto recv = [&](std::span<std::byte> buf) { return bounded ? sock_.recv_exact(buf, deadline) : sock_.recv_exact(buf); };
   std::array<std::byte, proto::kHeaderSize> hdr{};
-  if (auto r = sock_.recv_exact(hdr); !r) return fail(r.error());
+  if (auto r = recv(hdr); !r) return fail(r.error());
   auto h = proto::decode_header(hdr);
   if (!h) return fail(h.error());
+  if (h->payload_len > max_payload_) return fail(Errc::TooLarge);  // checked before any allocation
   recv_buf_.resize(h->payload_len);
   if (h->payload_len != 0) {
-    if (auto r = sock_.recv_exact(recv_buf_); !r) return fail(r.error());
+    if (auto r = recv(recv_buf_); !r) return fail(r.error());
   }
   ++stats_.frames_received;
   stats_.bytes_received += proto::kHeaderSize + h->payload_len;
