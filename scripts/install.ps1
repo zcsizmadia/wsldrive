@@ -102,6 +102,13 @@ function AskYN([string]$prompt, [bool]$default) {
   }
 }
 
+# Every wsldrive logon task currently registered (any mount, any older naming).
+# Defined up here on purpose: PowerShell resolves functions as the script runs,
+# and the uninstall path below calls this long before the rest of the helpers.
+function Get-WsldriveTasks {
+  @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "$TaskPrefix*" })
+}
+
 # ---- environment probes ----------------------------------------------------
 function Test-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -243,11 +250,6 @@ function Stage-Into-Wsl([string]$srcWin, [string]$name, [string]$d) {
   $dest = "$hm/.local/bin/$name"
   & wsl.exe -d $d -- bash -lc "mkdir -p '$hm/.local/bin' && cp '$srcWsl' '$dest' && chmod +x '$dest'" 2>$null
   return $dest
-}
-
-# Every wsldrive logon task currently registered (any mount, any older naming).
-function Get-WsldriveTasks {
-  @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "$TaskPrefix*" })
 }
 
 # A stable, filename-safe task name per mount, so several mounts coexist.
