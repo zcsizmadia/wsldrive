@@ -56,7 +56,10 @@ class RootServer {
   [[nodiscard]] const std::filesystem::path& root() const noexcept { return opts_.root; }
 
  private:
-  Result<void> handle(const net::Frame& f, net::FrameChannel& ch);
+  // `authed` is this session's authentication state, owned by serve(). Every
+  // request type other than Hello is refused until it is true, so presenting the
+  // token cannot be skipped by simply not sending a Hello.
+  Result<void> handle(const net::Frame& f, net::FrameChannel& ch, bool& authed);
   Result<void> send_snapshot(std::uint64_t request_id, net::FrameChannel& ch);
   Result<void> send_read(const net::Frame& f, net::FrameChannel& ch);
   Result<void> send_read_many(const net::Frame& f, net::FrameChannel& ch);
