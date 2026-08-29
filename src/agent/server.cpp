@@ -527,6 +527,11 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
   const std::uint64_t id = f.header.request_id;
   proto::Reader r(f.payload);
   auto reject = [&](Errc e, std::string_view d) { return send_error(id, e, d, ch); };
+  // Every acknowledgement carries the generation as of now - i.e. after the
+  // filesystem change - so the client can discard an invalidation resolved
+  // before its mutation (see proto::MutationAck).
+  auto ack = [&](proto::Writer& w) { proto::write_mutation_ack(w, proto::MutationAck{generation_.load()}); };
+  auto send_ok = [&] { return ch.send_with(proto::MsgType::Ok, id, ack); };
 
   switch (f.header.type) {
     case proto::MsgType::CreateRequest: {
@@ -541,7 +546,10 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       }
       auto attr = read_attributes(*full);
       if (!attr) return reject(attr.error(), q->path);
-      return ch.send_with(proto::MsgType::CreateResponse, id, [&](proto::Writer& w) { proto::write_attributes(w, *attr); });
+      return ch.send_with(proto::MsgType::CreateResponse, id, [&](proto::Writer& w) {
+        proto::write_attributes(w, *attr);
+        ack(w);
+      });
     }
     case proto::MsgType::WriteRequest: {
       auto q = proto::read_write_request(r);
@@ -559,8 +567,9 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       const std::size_t n = q->data.empty() ? 0 : std::fwrite(q->data.data(), 1, q->data.size(), fp);
       std::fclose(fp);
       if (n != q->data.size()) return reject(Errc::IoError, q->path);
-      return ch.send_with(proto::MsgType::WriteResponse, id,
-                          [&](proto::Writer& w) { proto::write_write_response(w, proto::WriteResponse{n}); });
+      return ch.send_with(proto::MsgType::WriteResponse, id, [&](proto::Writer& w) {
+        proto::write_write_response(w, proto::WriteResponse{n, generation_.load()});
+      });
     }
     case proto::MsgType::TruncateRequest: {
       auto q = proto::read_truncate_request(r);
@@ -576,7 +585,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
         log_io_failure("truncate", q->path, ec);
         return reject(map_fs_error(ec), q->path);
       }
-      return ch.send(proto::MsgType::Ok, id, {});
+      return send_ok();
     }
     case proto::MsgType::MkdirRequest: {
       auto q = proto::read_mkdir_request(r);
@@ -585,7 +594,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!full) return reject(full.error(), q->path);
       std::error_code ec;
       if (!fs::create_directory(*full, ec) || ec) return reject(ec ? map_fs_error(ec) : Errc::AlreadyExists, q->path);
-      return ch.send(proto::MsgType::Ok, id, {});
+      return send_ok();
     }
     case proto::MsgType::UnlinkRequest: {
       auto q = proto::read_path_request(r);
@@ -605,7 +614,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
         return reject(map_fs_error(ec), q->path);
       }
       if (!removed) return reject(Errc::NotFound, q->path);
-      return ch.send(proto::MsgType::Ok, id, {});
+      return send_ok();
     }
     case proto::MsgType::RmdirRequest: {
       auto q = proto::read_path_request(r);
@@ -615,7 +624,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       std::error_code ec;
       if (!fs::is_directory(*full, ec)) return reject(Errc::NotADirectory, q->path);
       if (!fs::remove(*full, ec) || ec) return reject(ec ? map_fs_error(ec) : Errc::NotFound, q->path);
-      return ch.send(proto::MsgType::Ok, id, {});
+      return send_ok();
     }
     case proto::MsgType::RenameRequest: {
       auto q = proto::read_rename_request(r);
@@ -633,7 +642,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
         log_io_failure("rename", q->to, ec);
         return reject(map_fs_error(ec), q->to);
       }
-      return ch.send(proto::MsgType::Ok, id, {});
+      return send_ok();
     }
     default:
       return reject(Errc::ProtocolError, "not a mutation");

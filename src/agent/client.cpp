@@ -534,6 +534,19 @@ Result<std::string> RemoteRoot::readlink(std::string_view path, std::chrono::mil
   return target;
 }
 
+void RemoteRoot::note_mutation(std::string_view path, std::uint64_t generation) {
+  // Without a watcher nothing ever retires these; keep the table from growing
+  // without bound on a long-lived mount that only writes.
+  if (local_mutations_.size() > 65536) local_mutations_.clear();
+  local_mutations_.insert_or_assign(normalize_path(path), generation);
+}
+
+Result<std::uint64_t> RemoteRoot::take_ack(proto::Reader& r) noexcept {
+  auto a = proto::read_mutation_ack(r);
+  if (!a) return fail(a.error());
+  return a->generation;
+}
+
 Result<void> RemoteRoot::create_file(std::string_view path, std::uint32_t mode, std::chrono::milliseconds timeout) {
   std::vector<std::byte> pl;
   proto::Writer w(pl);
@@ -544,8 +557,11 @@ Result<void> RemoteRoot::create_file(std::string_view path, std::uint32_t mode, 
   proto::Reader r((*p)->payload);
   auto attr = proto::read_attributes(r);
   if (!attr) return fail(attr.error());
+  auto gen = take_ack(r);
+  if (!gen) return fail(gen.error());
   std::unique_lock lock(tree_mu_);
   (void)tree_.upsert_path(path, *attr);
+  note_mutation(path, *gen);
   return {};
 }
 
@@ -570,6 +586,7 @@ Result<std::uint64_t> RemoteRoot::write(std::string_view path, std::uint64_t off
   } else {
     (void)tree_.upsert_path(path, Attributes{.size = end, .mtime_ns = 0, .mode = 0644, .kind = NodeKind::File});
   }
+  note_mutation(path, resp->generation);
   return resp->written;
 }
 
@@ -580,6 +597,9 @@ Result<void> RemoteRoot::truncate(std::string_view path, std::uint64_t size, std
   auto p = request(proto::MsgType::TruncateRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto gen = take_ack(r);
+  if (!gen) return fail(gen.error());
   drop_cached(path);
   std::unique_lock lock(tree_mu_);
   if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
@@ -587,6 +607,7 @@ Result<void> RemoteRoot::truncate(std::string_view path, std::uint64_t size, std
     a.size = size;
     (void)tree_.set_attributes(*id, a);
   }
+  note_mutation(path, *gen);
   return {};
 }
 
@@ -597,8 +618,12 @@ Result<void> RemoteRoot::mkdir(std::string_view path, std::uint32_t mode, std::c
   auto p = request(proto::MsgType::MkdirRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto gen = take_ack(r);
+  if (!gen) return fail(gen.error());
   std::unique_lock lock(tree_mu_);
   (void)tree_.upsert_path(path, Attributes{.size = 0, .mtime_ns = 0, .mode = mode, .kind = NodeKind::Directory});
+  note_mutation(path, *gen);
   return {};
 }
 
@@ -609,8 +634,13 @@ Result<void> RemoteRoot::unlink(std::string_view path, std::chrono::milliseconds
   auto p = request(proto::MsgType::UnlinkRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto gen = take_ack(r);
+  if (!gen) return fail(gen.error());
+  drop_cached(path);
   std::unique_lock lock(tree_mu_);
   (void)tree_.remove_path(path);
+  note_mutation(path, *gen);
   return {};
 }
 
@@ -621,8 +651,12 @@ Result<void> RemoteRoot::rmdir(std::string_view path, std::chrono::milliseconds 
   auto p = request(proto::MsgType::RmdirRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto gen = take_ack(r);
+  if (!gen) return fail(gen.error());
   std::unique_lock lock(tree_mu_);
   (void)tree_.remove_path(path);
+  note_mutation(path, *gen);
   return {};
 }
 
@@ -633,12 +667,17 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
   auto p = request(proto::MsgType::RenameRequest, pl, timeout);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
+  proto::Reader r((*p)->payload);
+  auto gen = take_ack(r);
+  if (!gen) return fail(gen.error());
   drop_cached(from);
   drop_cached(to);
   const std::string nfrom = normalize_path(from);
   const std::string nto = normalize_path(to);
   if (nfrom == nto) return {};  // the OS treated it as a no-op; so does the mirror
   std::unique_lock lock(tree_mu_);
+  note_mutation(nfrom, *gen);
+  note_mutation(nto, *gen);
   (void)tree_.remove_path(nto);  // rename replaces whatever was at the destination
   const auto id = tree_.lookup(nfrom, LookupMode::Exact);
   if (!id) return {};  // not mirrored (yet); the watcher's invalidation will add it
@@ -775,6 +814,16 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
   {
     std::unique_lock lock(tree_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
+      // An op for a path this client mutated is applied only if the batch is
+      // newer than the mutation's acknowledgement; otherwise the agent resolved
+      // it before (or while) the mutation happened and it would undo the
+      // mirror's own, correct, update - e.g. resurrect a file just renamed away.
+      if (op.kind != InvalidationKind::Rescan) {
+        if (const auto it = local_mutations_.find(op.path); it != local_mutations_.end()) {
+          if (batch->generation <= it->second) continue;  // stale relative to our mutation
+          local_mutations_.erase(it);                      // caught up; back to normal
+        }
+      }
       switch (op.kind) {
         case InvalidationKind::Upsert: (void)tree_.upsert_path(op.path, op.attr); break;
         case InvalidationKind::Remove: (void)tree_.remove_path(op.path); break;

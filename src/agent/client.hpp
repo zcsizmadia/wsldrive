@@ -203,6 +203,14 @@ class RemoteRoot {
   // One snapshot fetch at a time: the mount-time fetch and a Rescan-triggered
   // one overlapping would each end the other's replay recording.
   std::mutex snapshot_mu_;
+  // Paths this client mutated, with the agent generation acknowledged for the
+  // mutation. An invalidation op for such a path whose batch generation is not
+  // newer was resolved before (or during) the mutation and is discarded; the
+  // mutation's own watcher events follow in a newer batch. Guarded by tree_mu_.
+  std::unordered_map<std::string, std::uint64_t, StringHash, std::equal_to<>> local_mutations_;
+  void note_mutation(std::string_view path, std::uint64_t generation);  // call under tree_mu_ (write)
+  // Reads the trailing ack of a mutation reply and records it for `paths`.
+  Result<std::uint64_t> take_ack(proto::Reader& r) noexcept;
 
   std::thread rescan_;
   std::mutex rs_mu_;

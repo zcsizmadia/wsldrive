@@ -297,6 +297,23 @@ TEST(Fuzz, DecodersAreBounded) {
   }
 }
 
+TEST(Messages, MutationAckRoundTrip) {
+  std::vector<std::byte> buf;
+  Writer w(buf);
+  write_write_response(w, WriteResponse{.written = 7, .generation = 42});
+  write_mutation_ack(w, MutationAck{43});
+  Reader r(buf);
+  auto wr = read_write_response(r);
+  ASSERT_TRUE(wr.has_value());
+  EXPECT_EQ(wr->written, 7u);
+  EXPECT_EQ(wr->generation, 42u);
+  auto a = read_mutation_ack(r);
+  ASSERT_TRUE(a.has_value());
+  EXPECT_EQ(a->generation, 43u);
+  EXPECT_TRUE(r.empty());
+  EXPECT_EQ(read_mutation_ack(r).error(), Errc::Truncated);
+}
+
 TEST(Messages, ReadlinkRoundTrip) {
   std::vector<std::byte> buf;
   Writer w(buf);
