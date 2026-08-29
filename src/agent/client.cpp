@@ -3,6 +3,7 @@
 #include "core/path.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace wsld::agent {
@@ -105,6 +106,51 @@ std::vector<std::byte> slice(const std::vector<std::byte>& data, std::uint64_t o
                                 data.begin() + static_cast<std::ptrdiff_t>(end));
 }
 }  // namespace
+
+Result<std::size_t> RemoteRoot::read_into(std::string_view path, std::uint64_t offset, std::span<std::byte> out,
+                                          std::chrono::milliseconds timeout) {
+  // Fast path: a cached file is copied straight into the caller's buffer. A
+  // mount reads a file in chunks, so avoiding the intermediate vector saves one
+  // allocation and one copy per chunk.
+  std::int64_t mtime = 0;
+  std::uint64_t size = 0;
+  bool is_file = false;
+  {
+    std::shared_lock lock(tree_mu_);
+    if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
+      const auto& n = tree_.node(*id);
+      is_file = n.attr.kind == NodeKind::File;
+      mtime = n.attr.mtime_ns;
+      size = n.attr.size;
+    }
+  }
+  if (is_file && size <= kMaxCacheableFile) {
+    std::shared_ptr<const std::vector<std::byte>> hit;
+    {
+      std::lock_guard lock(rcache_mu_);
+      if (const auto it = rcache_.find(path);
+          it != rcache_.end() && it->second.mtime_ns == mtime && it->second.size == size) {
+        lru_.splice(lru_.begin(), lru_, it->second.lru);
+        hit = it->second.data;
+      }
+    }
+    if (hit) {
+      const std::size_t n = offset >= hit->size()
+                                ? 0
+                                : std::min<std::size_t>(out.size(), hit->size() - static_cast<std::size_t>(offset));
+      if (n > 0) std::memcpy(out.data(), hit->data() + offset, n);
+      std::lock_guard s(stats_mu_);
+      ++stats_.read_cache_hits;
+      return n;
+    }
+  }
+  // Miss (or an uncacheable file): reuse the read path, then hand the bytes over.
+  auto data = read(path, offset, static_cast<std::uint32_t>(std::min<std::size_t>(out.size(), 0xFFFFFFFFu)), timeout);
+  if (!data) return fail(data.error());
+  const std::size_t n = std::min(out.size(), data->size());
+  if (n > 0) std::memcpy(out.data(), data->data(), n);
+  return n;
+}
 
 Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint64_t offset, std::uint32_t length,
                                                 std::chrono::milliseconds timeout) {

@@ -266,11 +266,13 @@ int op_read(const char* path, char* buf, size_t size, OffT offset, struct fuse_f
     if (int rc = flush_handle(handle_of(fi)); rc != 0) return rc;  // never read stale bytes
   }
   const std::string rel = to_rel(path);
-  const std::uint32_t want = static_cast<std::uint32_t>(std::min<size_t>(size, 16u << 20));
-  auto data = ctx()->root->read(rel, static_cast<std::uint64_t>(offset), want);
-  if (!data) return err_to_errno(data.error());
-  if (!data->empty()) std::memcpy(buf, data->data(), data->size());
-  return static_cast<int>(data->size());
+  const std::size_t want = std::min<size_t>(size, 16u << 20);
+  // Read straight into the FUSE buffer: on a cache hit this avoids allocating
+  // and copying an intermediate vector for every chunk the kernel asks for.
+  auto n = ctx()->root->read_into(rel, static_cast<std::uint64_t>(offset),
+                                  std::span<std::byte>(reinterpret_cast<std::byte*>(buf), want));
+  if (!n) return err_to_errno(n.error());
+  return static_cast<int>(*n);
 }
 
 int op_statfs(const char*, StatvfsT* st) {
