@@ -50,7 +50,8 @@ Source: "{#BinDir}\wsldrived.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\wsldrivew.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\scripts\install.ps1";          DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\register-hvsocket.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "..\README.md";    DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE";   DestDir: "{app}"; Flags: ignoreversion
 ; The Linux binaries are optional; include them if built. wsldrive-linux is the
 ; client (Direction B); wsldrived-linux is the agent that serves the WSL tree (Direction A).

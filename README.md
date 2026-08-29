@@ -54,9 +54,12 @@ tears it all down cleanly on uninstall. The only thing you supply is what to mou
 ### 1. Download the installer (easiest — no build)
 
 Grab **`wsldrive-setup.exe`** from the [latest release](https://github.com/zcsizmadia/wsldrive/releases/latest)
-and run it. The wizard sets up Direction A by default; tick **Advanced** to also add Direction B. Each
-release also ships `wsldrive-windows-x64.zip` (raw binaries + the install script) and `wsldrive-linux-x64`
-(the Direction B client).
+and run it. The wizard sets up Direction A by default; tick **Advanced** to also add Direction B.
+
+Each release also ships `wsldrive-windows-x64.zip` (everything the script route needs: the Windows and
+Linux binaries plus `install.ps1`), the standalone Linux binaries `wsldrive-linux-x64` /
+`wsldrived-linux-x64`, and `SHA256SUMS.txt` to verify the downloads (the binaries are unsigned, so
+SmartScreen will warn on first run).
 
 ### 2. Run the script (no packaging — for CI, locked-down machines, or preference)
 
@@ -121,8 +124,9 @@ which side runs the agent and which runs the mount.
 **Metadata in RAM.** The whole tree (names, sizes, mtimes, mode→attributes) loads on mount and stays
 coherent via pushed invalidations, so `stat`/`readdir`/`open`/negative lookups never cross the boundary.
 
-**Content cache + read-ahead.** Small files are cached whole in RAM (BLAKE3-addressed, LRU, invalidated
-on change); on a read miss the file's directory is bulk-fetched in one `ReadMany` round-trip, so a
+**Content cache + read-ahead.** Small files (≤ 8 MiB) are cached whole in RAM, keyed by path and
+validated against the mirror's (mtime, size); the cache is LRU-evicted to a byte budget (256 MiB by
+default) and dropped on invalidation. On a read miss the file's directory is bulk-fetched in one `ReadMany` round-trip, so a
 sequential reader pays one request per directory, not per file. On mount the client also **warms the
 cache in the background** — it queues every directory whose small files fit the cache budget, so the
 first reads a tool makes are already hot and cold-read latency is avoided (disable with `--no-prefetch`).
@@ -287,7 +291,7 @@ detected (Linux) — so CI and minimal builds are unaffected.
 ## Layout
 
 `src/core` — platform-independent library (metadata tree, string pool, framed protocol, coalescer,
-content cache, ignore rules, name escaping, path utils), all unit-tested. `src/net` — sockets
+auth token, ignore rules, name escaping, path utils), all unit-tested. `src/net` — sockets
 (TCP/vsock/hvsocket) and the framed channel. `src/platform` — watchers and process launchers per OS.
 `src/agent` — the scanner, `RootServer`, and the `RemoteRoot` client. `src/mount` — the FUSE3 mount.
 `src/tools` — the `wsldrive` and `wsldrived` binaries. `tests`, `bench`, `scripts` as named.
@@ -314,6 +318,10 @@ links you would not expose.
 
 Release binaries are **unsigned** (Windows SmartScreen will warn); each release publishes
 `SHA256SUMS.txt` so downloads can be verified.
+
+## Changelog
+
+Release notes and known limitations: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
