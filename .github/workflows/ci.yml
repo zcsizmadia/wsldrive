@@ -40,6 +40,26 @@ jobs:
       - name: Test
         run: ctest --preset linux-release
 
+  # Mounts a real filesystem and exercises the operations tools depend on. Unit
+  # tests cannot catch a missing FUSE callback — `chmod` was unimplemented, which
+  # made git abort every clone on a mount while the whole suite stayed green.
+  conformance:
+    name: Filesystem conformance (mounted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev fuse3
+      - name: Build
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release --target wsldrive wsldrived --parallel
+      - name: Run the conformance battery
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          bash scripts/fs-conformance.sh
+
   benchmarks:
     name: Benchmarks (smoke)
     runs-on: ubuntu-latest
