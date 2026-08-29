@@ -39,8 +39,10 @@ has neither problem and is unsupported by design.
 ## Install
 
 The installer confirms each choice with you first, then does *everything else itself* — installs the
-binaries, checks for / chain-installs WinFsp, creates an at-logon task that mounts on every boot, and
-tears it all down cleanly on uninstall. The only thing you supply is what to mount where.
+binaries, checks that [WinFsp](https://winfsp.dev) is present (it tells you where to get it if not;
+`install.ps1 -WinFspMsi <path>` chain-installs a downloaded MSI), creates an at-logon task that mounts on
+every boot, and removes all of it on uninstall (tasks, running mounts, binaries, the copies staged into
+your distro). The only thing you supply is what to mount where.
 
 **Two modes:**
 
@@ -153,7 +155,7 @@ stream socket. Two transports:
 |---|---|
 | case-sensitive names | case-preserving; case-colliding siblings flagged, the shadowed one hidden |
 | symlinks | readable (`readlink`, following); relative targets resolve on the mount, absolute ones name the serving side; creating links is not supported |
-| mode bits | synthesised attributes (`READONLY` when no write bit); no ACL emulation |
+| mode bits | fixed `0644` files / `0755` directories on the mount; the read-only flag is not propagated in either direction, and `chmod` is accepted but not persisted (so `git` and build tools work) — no ACL emulation |
 | ns mtime | truncated to 100 ns |
 | hard links | reported as independent files (`st_nlink` not preserved) — known limitation |
 | names illegal on Windows (`: ? * < > \| "`, control chars, trailing dot/space) | mapped to U+F0xx (WSL/Cygwin convention), round-tripping |
@@ -190,7 +192,8 @@ kernel drivers or signing beyond WinFsp's.
 
 ### Direction A — mount a WSL ext4 tree as a Windows drive
 
-Requires [WinFsp](https://winfsp.dev) (runtime **and** the Developer/SDK feature). From any PowerShell:
+Requires the [WinFsp](https://winfsp.dev) runtime (the Developer/SDK feature is only needed to *build*
+wsldrive). From any PowerShell:
 
 ```powershell
 wsldrive doctor                                            # check WinFsp + WSL
@@ -329,4 +332,5 @@ Release notes and known limitations: [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 [MIT](LICENSE). WinFsp (a runtime dependency for Direction A) is licensed separately under GPLv3 or a
-commercial license and is **not** bundled — the installer chain-installs it from winfsp.dev.
+commercial license and is **not** bundled — install it from winfsp.dev (the installer checks for it and
+points you there).

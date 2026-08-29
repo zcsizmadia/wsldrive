@@ -124,13 +124,20 @@ void RootServer::flush_loop() {
       proto::InvalidationOp out;
       out.kind = op.kind;
       out.path = std::move(op.path);
-      if (out.kind == InvalidationKind::Upsert) {
+      if (out.kind != InvalidationKind::Rescan) {
+        // Both kinds are resolved against the disk NOW, not against the event.
+        // A Remove that is not re-checked is a real hazard: git renames
+        // config.lock away and immediately creates a new config.lock; the
+        // watcher's Remove for the old one arrives late and would delete the
+        // NEW one from every mirror, and the chmod git issues next fails with
+        // ENOENT ("could not set core.filemode") - seen in CI.
         auto attr = read_attributes(join_relative(opts_.root, out.path));
         if (!attr) {
-          out.kind = InvalidationKind::Remove;  // vanished between the event and now
+          out.kind = InvalidationKind::Remove;  // gone (or vanished between the event and now)
         } else if (attr->kind == NodeKind::Other) {
           continue;
         } else {
+          out.kind = InvalidationKind::Upsert;  // present, whatever the event said
           out.attr = *attr;
         }
       }

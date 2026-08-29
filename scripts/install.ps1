@@ -141,6 +141,11 @@ function To-WslPath([string]$winPath) {
   return $full
 }
 
+# Keep a log: the GUI installer runs this in a console that closes on exit, so
+# without one an error message is gone before anyone can read it.
+$LogPath = Join-Path $env:TEMP 'wsldrive-install.log'
+try { Start-Transcript -Path $LogPath -Append -ErrorAction Stop | Out-Null } catch {}
+
 # ===========================================================================
 Step 'wsldrive installer'
 
@@ -163,6 +168,15 @@ if ($Uninstall) {
   Step 'Uninstalling'
   $existing = Get-WsldriveTasks
   if ($existing.Count -eq 0) { Say '       (no wsldrive mount tasks registered)' }
+  # The distros we staged binaries into are recorded in the tasks themselves
+  # (`--distro X` for Direction A, `-d X` for Direction B); read them before the
+  # tasks go away so the staged files can be removed too.
+  $distros = @()
+  foreach ($t in $existing) {
+    $args = ($t.Actions | ForEach-Object { $_.Arguments }) -join ' '
+    if ($args -match '(?:--distro|-d)\s+"?([^\s"]+)') { $distros += $Matches[1] }
+  }
+  $distros = @($distros | Select-Object -Unique)
   foreach ($t in $existing) {
     Plan "stop + remove scheduled task $($t.TaskName)"
     if (-not $DryRun) {
@@ -170,14 +184,38 @@ if ($Uninstall) {
       Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false
     }
   }
+  # A live mount holds its own .exe open; end it or the install dir cannot be
+  # removed (and the drive would stay mounted).
+  if (Get-Process wsldrive,wsldrivew -ErrorAction SilentlyContinue) {
+    Plan 'end running wsldrive / wsldrivew processes (unmounts their drives)'
+    if (-not $DryRun) {
+      Get-Process wsldrive,wsldrivew -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Milliseconds 800
+    }
+  }
   Plan "unregister hvsocket service GUIDs (ports $FirstPort..$($FirstPort+$PortCount-1))"
   if (-not $DryRun) { & "$PSScriptRoot\register-hvsocket.ps1" -FirstPort $FirstPort -Count $PortCount -Unregister | Out-Null }
+  foreach ($d in $distros) {
+    # The agent exits on its own when its client goes away, but not instantly;
+    # a fresh install right after this would race it for the port.
+    Plan "end the wsldrive agent/client in distro $d and remove staged ~/.local/bin/wsldrive and wsldrived"
+    if (-not $DryRun) { & wsl.exe -d $d -- sh -c 'pkill -x wsldrived; pkill -x wsldrive; rm -f ~/.local/bin/wsldrive ~/.local/bin/wsldrived' 2>$null | Out-Null }
+  }
+  if (Test-Path "$env:LOCALAPPDATA\wsldrive") {
+    Plan "delete $env:LOCALAPPDATA\wsldrive (staging copies)"
+    if (-not $DryRun) { Remove-Item -Recurse -Force "$env:LOCALAPPDATA\wsldrive" -ErrorAction SilentlyContinue }
+  }
   if (Test-Path $InstallDir) {
     Plan "delete $InstallDir"
-    if (-not $DryRun) { Remove-Item -Recurse -Force $InstallDir }
+    if (-not $DryRun) {
+      # Something may still hold a file for a moment after the processes ended.
+      for ($try = 1; ; $try++) {
+        try { Remove-Item -Recurse -Force $InstallDir -ErrorAction Stop; break }
+        catch { if ($try -ge 5) { Warn "Could not remove $InstallDir completely: $($_.Exception.Message)"; break }; Start-Sleep -Milliseconds 700 }
+      }
+    }
   }
   Ok 'Uninstalled. (WinFsp was left installed; remove it from Apps if you no longer need it.)'
-  Warn 'Any mount running right now stays up until you end its process (Ctrl+C in its window) or reboot.'
   exit 0
 }
 
@@ -205,15 +243,17 @@ if (-not $srcCli -or -not (Test-Path $srcCli) -or -not (Test-Path $srcAgent)) {
 }
 # Linux binaries: a source build, or the names used by the release zip and by the
 # GUI installer's install directory.
+# Looked for beside the scripts folder ($root, the release zip and the GUI's
+# install dir) and beside this script itself, in case someone moved it.
 $linuxCli = if ($LinuxBin) { $LinuxBin } else {
   First-Existing @((Join-Path $root 'build\linux-release\src\tools\wsldrive'),
-                   (Join-Path $root 'wsldrive-linux-x64'),
-                   (Join-Path $root 'wsldrive-linux'))
+                   (Join-Path $root 'wsldrive-linux-x64'), (Join-Path $root 'wsldrive-linux'),
+                   (Join-Path $PSScriptRoot 'wsldrive-linux-x64'), (Join-Path $PSScriptRoot 'wsldrive-linux'))
 }
 $linuxAgent = if ($LinuxAgent) { $LinuxAgent } else {
   First-Existing @((Join-Path $root 'build\linux-release\src\tools\wsldrived'),
-                   (Join-Path $root 'wsldrived-linux-x64'),
-                   (Join-Path $root 'wsldrived-linux'))
+                   (Join-Path $root 'wsldrived-linux-x64'), (Join-Path $root 'wsldrived-linux'),
+                   (Join-Path $PSScriptRoot 'wsldrived-linux-x64'), (Join-Path $PSScriptRoot 'wsldrived-linux'))
 }
 
 # Absolute $HOME inside a distro (cached — each distro is asked at most once).
@@ -222,13 +262,19 @@ function Get-WslHome([string]$d) {
   if ([string]::IsNullOrWhiteSpace($d)) { return '' }
   if ($script:WslHomeCache.ContainsKey($d)) { return $script:WslHomeCache[$d] }
   $h = ''
-  try { $h = (& wsl.exe -d $d -- bash -lc 'echo $HOME' 2>$null | Select-Object -First 1) } catch { $h = '' }
+  # A plain sh, not a login shell: a login shell may print a motd/banner first,
+  # and not every distro has bash (Alpine).
+  try { $h = (& wsl.exe -d $d -- sh -c 'echo "$HOME"' 2>$null | Select-Object -First 1) } catch { $h = '' }
   if ($h) { $h = $h.Trim() }
   # wsl.exe reports "there is no distribution with the supplied name" on STDOUT,
   # so anything that is not an absolute Linux path is an error message, not a home.
   if ($h -notmatch '^/') { $h = '' }
   $script:WslHomeCache[$d] = $h
   return $h
+}
+# The distros wsl.exe knows about, for an error message.
+function Get-WslDistros {
+  try { @((& wsl.exe -l -q 2>$null) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } catch { @() }
 }
 
 # Expand a leading ~ against a distro's home. The path is single-quoted when
@@ -251,8 +297,20 @@ function Stage-Into-Wsl([string]$srcWin, [string]$name, [string]$d) {
   Copy-Item -Force $srcWin $staged
   $srcWsl = To-WslPath $staged
   $dest = "$hm/.local/bin/$name"
-  & wsl.exe -d $d -- bash -lc "mkdir -p '$hm/.local/bin' && cp '$srcWsl' '$dest' && chmod +x '$dest'" 2>$null
+  & wsl.exe -d $d -- sh -c "mkdir -p '$hm/.local/bin' && cp '$srcWsl' '$dest' && chmod +x '$dest'" 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    # Silently returning a path here would register a task pointing at a binary
+    # that is not there, and the mount would never come up.
+    throw "Could not copy $name into ${d}:$dest (is /mnt/c mounted in the distro? exit $LASTEXITCODE)."
+  }
   return $dest
+}
+
+# Direction B runs libfuse3 inside the distro; without the fuse3 package the
+# staged client cannot mount anything, and the failure would only show at logon.
+function Test-WslFuse3([string]$d) {
+  & wsl.exe -d $d -- sh -c 'command -v fusermount3 >/dev/null 2>&1 && [ -e /usr/lib/x86_64-linux-gnu/libfuse3.so.3 -o -e /usr/lib/libfuse3.so.3 -o -e /lib/x86_64-linux-gnu/libfuse3.so.3 ]' 2>$null
+  return ($LASTEXITCODE -eq 0)
 }
 
 # A stable, filename-safe task name per mount, so several mounts coexist.
@@ -364,6 +422,14 @@ $nextB = $FirstPort
 foreach ($m in $mounts) {
   if (-not $m.Distro) { throw 'A mount has no distro and no WSL default distro was found.' }
   $hm = Get-WslHome $m.Distro
+  if (-not $hm) {
+    # An unknown or stopped distro used to sail through and produce a task that
+    # can never mount (and a literal "~" as the served path). Stop here instead;
+    # a dry run only reports it, so the rest of the plan is still visible.
+    $known = Get-WslDistros
+    $msg = "WSL distro '$($m.Distro)' was not found or could not be started. Installed distros: $(if ($known) { $known -join ', ' } else { '(none found - is WSL installed?)' })"
+    if ($DryRun) { Warn $msg } else { throw $msg }
+  }
   if ($m.Direction -eq 'A') {
     $m.WslRoot = Expand-WslPath $m.WslRoot $hm
     if ($m.Port -le 0) { while ($usedA -contains $nextA) { $nextA++ }; $m.Port = $nextA; $usedA += $nextA; $nextA++ }
@@ -469,12 +535,17 @@ if ($running.Count -gt 0 -or (Get-Process wsldrive,wsldrivew -ErrorAction Silent
     Plan "stop task $($t.TaskName)"
     if (-not $DryRun) { Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue }
   }
-  Plan 'end any leftover wsldrive / wsldrivew processes'
+  Plan 'end any leftover wsldrive / wsldrivew processes (and the agents in the distros)'
   if (-not $DryRun) {
     Get-Process wsldrive,wsldrivew -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # A previous agent still winding down would hold the loopback port the new
+    # mount is about to use, and the first start would fail.
+    foreach ($d in @($mounts | ForEach-Object { $_.Distro } | Select-Object -Unique)) {
+      & wsl.exe -d $d -- sh -c 'pkill -x wsldrived; pkill -x wsldrive; true' 2>$null | Out-Null
+    }
     Start-Sleep -Milliseconds 800   # let the file handles drop
+    Warn 'Mounted drives were unmounted so the binaries could be replaced; they are re-started below.'
   }
-  Warn 'Mounted drives were unmounted so the binaries could be replaced; they are re-started below.'
 }
 
 # --- copy binaries (a no-op when a packaged installer already placed them here) ---
@@ -508,6 +579,10 @@ foreach ($d in @($mounts | Where-Object { $_.Direction -eq 'A' } | ForEach-Objec
 foreach ($d in @($mounts | Where-Object { $_.Direction -eq 'B' } | ForEach-Object { $_.Distro } | Select-Object -Unique)) {
   Plan "stage Linux wsldrive into ${d}:$(Get-WslHome $d)/.local/bin/wsldrive"
   if (-not $DryRun -and $linuxCli -and (Test-Path $linuxCli)) { [void](Stage-Into-Wsl $linuxCli 'wsldrive' $d) }
+  if (-not $DryRun -and -not (Test-WslFuse3 $d)) {
+    Warn "Distro '$d' has no fuse3 runtime; Direction B cannot mount there until you install it:"
+    Warn "    wsl -d $d -- sudo apt install fuse3        (Debian/Ubuntu; other distros: the package providing fusermount3)"
+  }
 }
 Ok 'Binaries installed.'
 

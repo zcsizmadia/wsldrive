@@ -20,18 +20,31 @@ permissions:
 jobs:
   # -- Linux client (Direction B), built on a Linux runner and handed to the
   #    Windows job so the installer can embed it. --------------------------
+  # Built on the OLDEST supported Ubuntu so the binaries load on every distro the
+  # README promises (22.04+ / Debian 12+): a build on 24.04 needs glibc 2.38,
+  # which 22.04 does not have. libstdc++/libgcc are linked statically for the
+  # same reason; glibc itself cannot be, so its ceiling is checked below.
   linux:
     name: Linux client
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev
       - name: Build
         run: |
-          cmake --preset linux-release
+          cmake --preset linux-release -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
           # wsldrive = client (Direction B); wsldrived = agent (Direction A auto-launch)
           cmake --build --preset linux-release --target wsldrive wsldrived --parallel
+      - name: Check the glibc ceiling (must run on Ubuntu 22.04 / Debian 12)
+        run: |
+          for b in wsldrive wsldrived; do
+            f=build/linux-release/src/tools/$b
+            max=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -t. -k2,2n -k3,3n | tail -1)
+            echo "$b: newest glibc symbol version $max"
+            case "$max" in GLIBC_2.3[6-9]*|GLIBC_2.[4-9][0-9]*) echo "::error::$b needs $max; Ubuntu 22.04 has glibc 2.35"; exit 1;; esac
+            if objdump -T "$f" | grep -q 'GLIBCXX_\|CXXABI_'; then echo "::error::$b links libstdc++ dynamically"; exit 1; fi
+          done
       - name: Upload Linux binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -117,18 +130,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path staging | Out-Null
           Copy-Item installer\dist\wsldrive-setup.exe staging\
-          # Zip of raw binaries + the script installer, for the no-build script path.
-          $z = 'staging\wsldrive-windows-x64.zip'
-          Copy-Item build\msvc-release\src\tools\wsldrive.exe,build\msvc-release\src\tools\wsldrived.exe,build\msvc-release\src\tools\wsldrivew.exe .
-          # The Linux client and agent must be in the zip too: install.ps1 stages
-          # them into the distro, and without them the script route cannot set up
-          # either direction.
-          Copy-Item build\linux-release\src\tools\wsldrive  wsldrive-linux-x64
-          Copy-Item build\linux-release\src\tools\wsldrived wsldrived-linux-x64
-          Compress-Archive -Force -DestinationPath $z -Path `
-            wsldrive.exe,wsldrived.exe,wsldrivew.exe,wsldrive-linux-x64,wsldrived-linux-x64,`
-            scripts\install.ps1,scripts\register-hvsocket.ps1,wsldrive.example.json,README.md,LICENSE
-          Copy-Item wsldrive-linux-x64,wsldrived-linux-x64 staging\
+          # Zip for the script route: binaries at the root, scripts under scripts\
+          # (the layout install.ps1 and the README expect). package-zip.ps1 is the
+          # single definition of that layout; CI's installer job tests the same zip.
+          .\scripts\package-zip.ps1 -WinBin build\msvc-release\src\tools -LinuxBin build\linux-release\src\tools -Out staging\wsldrive-windows-x64.zip
+          Copy-Item build\linux-release\src\tools\wsldrive  staging\wsldrive-linux-x64
+          Copy-Item build\linux-release\src\tools\wsldrived staging\wsldrived-linux-x64
           # Publish checksums so a download can be verified (the binaries are unsigned).
           Get-ChildItem staging -File | Get-FileHash -Algorithm SHA256 |
             ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |

@@ -15,7 +15,7 @@ installer that leaves you with a drive that comes back after every reboot.
   Hyper-V sockets: ~10× faster than `/mnt/c` on both 9P and virtiofs.
 - **Installer.** A GUI wizard (`wsldrive-setup.exe`) and a PowerShell installer
   that it drives, so both routes do the same thing. It installs the binaries,
-  checks for (or chain-installs) WinFsp, registers the Hyper-V socket services,
+  checks for WinFsp (and can chain-install a downloaded MSI), registers the Hyper-V socket services,
   and creates an at-logon task — the drive is back after a reboot with nothing
   to click. Uninstall removes all of it.
 - **Multiple mounts.** `install.ps1 -Config wsldrive.json` sets up several
@@ -63,7 +63,22 @@ installer that leaves you with a drive that comes back after every reboot.
   otherwise); snapshot fetches are serialised so a rescan during the initial
   fetch cannot lose invalidations; an unauthenticated peer's frames are capped
   at 4 KiB and must complete within the handshake window, so a half-sent frame
-  can no longer pin a session thread and 64 MiB of buffer.
+  can no longer pin a session thread and 64 MiB of buffer; a `Remove` event is
+  resolved against the disk at flush time like an `Upsert`, so the watcher's
+  late removal of a lock file git has already re-created no longer deletes the
+  new one from the mirror (git's next `chmod` failed with ENOENT in CI).
+
+- **Install routes, from the same review:** the release zip now keeps its
+  `scripts\` folder (it was flattened, so the documented `scripts\install.ps1`
+  did not exist and the Linux agent was not found); the Linux binaries are built
+  on Ubuntu 22.04 with static libstdc++ and checked against a glibc ceiling, so
+  they load on every distro the README lists; an unknown or stopped distro is
+  refused with the list of installed ones instead of producing a task that can
+  never mount; a staging copy that fails is an error, not a silent no-op; the
+  wizard checks for WinFsp before copying anything and names the log
+  (`%TEMP%\wsldrive-install.log`) when `install.ps1` fails; uninstall now ends
+  running mounts and removes the staged copies from the distro and
+  `%LOCALAPPDATA%\wsldrive`; Direction B warns when the distro lacks `fuse3`.
 
 ### Security
 

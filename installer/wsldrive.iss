@@ -101,6 +101,25 @@ begin
   end;
 end;
 
+{ Direction A needs the WinFsp runtime. install.ps1 checks too, but from this
+  wizard its console closes before the message can be read, so say it here,
+  before anything is copied. }
+function InitializeSetup(): Boolean;
+var
+  Dir: string;
+begin
+  Result := True;
+  if not RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\WinFsp', 'InstallDir', Dir) then
+  begin
+    if MsgBox('wsldrive needs WinFsp (https://winfsp.dev) to mount a WSL folder as a drive letter, '
+              + 'and it is not installed.' + #13#10#13#10
+              + 'Install WinFsp first (the free runtime is enough), then run this setup again.' + #13#10#13#10
+              + 'Continue anyway? Only the advanced Direction B (a Windows folder inside WSL) will work.',
+              mbConfirmation, MB_YESNO) = IDNO then
+      Result := False;
+  end;
+end;
+
 procedure InitializeWizard();
 var
   distro: string;
@@ -224,7 +243,8 @@ begin
     if not Exec('powershell.exe', BuildArgs(), '', SW_SHOW, ewWaitUntilTerminated, Res) then
       MsgBox('Setup could not run install.ps1.', mbError, MB_OK)
     else if Res <> 0 then
-      MsgBox('install.ps1 exited with code ' + IntToStr(Res) + '. See its output.', mbInformation, MB_OK);
+      MsgBox('install.ps1 exited with code ' + IntToStr(Res) + '. The drive was not set up.' + #13#10#13#10
+             + 'Details are in ' + ExpandConstant('{%TEMP}') + '\wsldrive-install.log', mbError, MB_OK);
 
     { A WSL restart is only needed for Direction B over hvsocket (Direction A uses
       loopback TCP). Offer it only then. }
@@ -242,5 +262,5 @@ Filename: "{app}\wsldrive.exe"; Parameters: "doctor"; Description: "Check the ws
 
 [UninstallRun]
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\install.ps1"" -Uninstall -Unattended"; \
+  Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\install.ps1"" -Uninstall -Unattended -InstallDir ""{app}"""; \
   Flags: runhidden; RunOnceId: "wsldriveuninstall"

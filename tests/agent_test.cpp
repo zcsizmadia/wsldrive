@@ -573,6 +573,37 @@ TEST_F(AgentTest, RenamedDirectoryExpansionIsChunkedAndCapped) {
   }
 }
 
+TEST_F(AgentTest, LateRemoveForARecreatedPathDoesNotDeleteIt) {
+  // git's lock-file dance: config.lock is renamed away and a NEW config.lock
+  // is created at once. The watcher's Remove for the old one arrives after the
+  // new one exists; applied blindly it deletes the new file from the mirror and
+  // git's next chmod fails with ENOENT. The agent must resolve a Remove against
+  // the disk at flush time, like it does an Upsert.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  ASSERT_TRUE(c->create_file("config.lock").has_value());  // the "new" lock, mirrored optimistically
+  ASSERT_TRUE(fs::exists(root_ / "config.lock"));
+  srv.server().notify(FsEvent{FsEventKind::Removed, "config.lock"});  // the stale event for the old one
+  // Give the batch time to arrive; whatever it says, the path exists on disk.
+  std::this_thread::sleep_for(300ms);
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) { return t.lookup("config.lock").has_value(); }))
+      << "a Remove for a path that exists again must not delete it from the mirror";
+
+  // And a Remove for something really gone still removes it.
+  fs::remove(root_ / "config.lock");
+  srv.server().notify(FsEvent{FsEventKind::Removed, "config.lock"});
+  bool gone = false;
+  for (int i = 0; i < 100 && !gone; ++i) {
+    std::this_thread::sleep_for(20ms);
+    gone = !c->with_tree([](const MetadataTree& t) { return t.lookup("config.lock").has_value(); });
+  }
+  EXPECT_TRUE(gone);
+}
+
 TEST(AuthToken, GeneratesDistinctHexSecrets) {
   const std::string a = generate_auth_token();
   const std::string b = generate_auth_token();
