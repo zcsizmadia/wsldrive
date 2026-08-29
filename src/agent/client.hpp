@@ -45,6 +45,8 @@ class RemoteRoot {
     std::uint64_t read_miss_fetch_ns = 0;
     std::uint64_t prefetch_files = 0;
     std::uint64_t prefetch_bytes = 0;
+    // Snapshots re-fetched because the agent's watcher overflowed (Rescan).
+    std::uint64_t rescans = 0;
   };
 
   using InvalidationHook = std::function<void(const proto::InvalidationBatch&)>;
@@ -61,7 +63,9 @@ class RemoteRoot {
   /// Starts the reader thread and performs the Hello handshake.
   [[nodiscard]] Result<proto::Hello> connect(std::chrono::milliseconds timeout = std::chrono::seconds(10));
 
-  /// Requests a full snapshot and replaces the tree with it.
+  /// Requests a full snapshot and replaces the tree with it. Invalidations that
+  /// arrive while the request is in flight and post-date the snapshot are
+  /// re-applied on top, so nothing observed during the fetch is lost.
   [[nodiscard]] Result<void> fetch_snapshot(std::chrono::milliseconds timeout = std::chrono::minutes(5));
 
   /// Reads `length` bytes at `offset` of `path`; returns fewer at EOF. Small
@@ -165,6 +169,10 @@ class RemoteRoot {
   // worker bulk-fetches its not-yet-cached siblings so later reads hit the cache.
   void enqueue_prefetch(std::string dir);
   void prefetch_loop();
+  // Re-fetches the snapshot when the agent signals a Rescan (its watcher lost
+  // events). Runs on its own thread: the request blocks, and the reader thread
+  // that receives the Rescan is the one that would have to answer it.
+  void rescan_loop();
 
   std::string token_;  // presented in Hello
   std::unique_ptr<net::FrameChannel> ch_;
@@ -178,6 +186,18 @@ class RemoteRoot {
 
   mutable std::shared_mutex tree_mu_;
   MetadataTree tree_;
+  // While a snapshot request is in flight, invalidations are applied to the old
+  // tree AND kept here; load_snapshot() would otherwise discard them, and the
+  // ones newer than the snapshot's generation are replayed on top. Both guarded
+  // by tree_mu_ (write side).
+  bool snapshot_in_flight_ = false;
+  std::vector<proto::InvalidationBatch> snapshot_replay_;
+
+  std::thread rescan_;
+  std::mutex rs_mu_;
+  std::condition_variable rs_cv_;
+  bool rs_requested_ = false;  // a Rescan arrived; coalesces any number of them
+  bool rs_stop_ = false;
 
   mutable std::mutex stats_mu_;
   Stats stats_;

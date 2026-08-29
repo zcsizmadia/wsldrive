@@ -23,11 +23,17 @@ void RemoteRoot::close() {
       pf_stop_.store(true);
     }
     pf_cv_.notify_all();
+    {
+      std::lock_guard lock(rs_mu_);
+      rs_stop_ = true;
+    }
+    rs_cv_.notify_all();
     ch_->shutdown();
     ch_->close();
     if (reader_.joinable()) reader_.join();
-    fail_all_pending();  // releases any in-flight prefetch read_many request
+    fail_all_pending();  // releases any in-flight prefetch read_many or rescan snapshot request
     if (prefetch_.joinable()) prefetch_.join();
+    if (rescan_.joinable()) rescan_.join();
   });
 }
 
@@ -44,6 +50,7 @@ RemoteRoot::Stats RemoteRoot::stats() const {
 Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
   if (!reader_.joinable()) reader_ = std::thread([this] { reader_loop(); });
   if (!prefetch_.joinable()) prefetch_ = std::thread([this] { prefetch_loop(); });
+  if (!rescan_.joinable()) rescan_ = std::thread([this] { rescan_loop(); });
   std::vector<std::byte> payload;
   proto::Writer w(payload);
   proto::write_hello(
@@ -63,6 +70,23 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
 
 Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
   const auto t0 = std::chrono::steady_clock::now();
+  {
+    // From here until the tree is replaced, apply_invalidation() also records
+    // every batch so the ones the snapshot does not include can be replayed.
+    std::unique_lock lock(tree_mu_);
+    snapshot_in_flight_ = true;
+    snapshot_replay_.clear();
+  }
+  // Whatever happens below, the recording stops when this call ends.
+  struct EndRecording {
+    RemoteRoot& self;
+    ~EndRecording() {
+      std::unique_lock lock(self.tree_mu_);
+      self.snapshot_in_flight_ = false;
+      self.snapshot_replay_.clear();
+    }
+  } end_recording{*this};
+
   auto p = request(proto::MsgType::SnapshotRequest, {}, timeout, /*streaming=*/true);
   if (!p) return fail(p.error());
   if ((*p)->type != proto::MsgType::Snapshot) return fail(Errc::ProtocolError);
@@ -73,9 +97,22 @@ Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
   auto& names = (*p)->snap_names;
   auto& entries = (*p)->snap_entries;
   for (std::size_t i = 0; i < entries.size(); ++i) entries[i].name = names[i];
+  const std::uint64_t snap_gen = (*p)->snap_generation;
   {
     std::unique_lock lock(tree_mu_);
     if (auto res = tree_.load_snapshot(entries); !res) return res;
+    // The agent stamped the snapshot with its generation before scanning, so a
+    // batch with a higher generation describes a change the scan may have
+    // missed; one at or below it is already in the snapshot.
+    for (const proto::InvalidationBatch& b : snapshot_replay_) {
+      if (b.generation <= snap_gen) continue;
+      for (const proto::InvalidationOp& op : b.ops) {
+        if (op.kind == InvalidationKind::Upsert) (void)tree_.upsert_path(op.path, op.attr);
+        else if (op.kind == InvalidationKind::Remove) (void)tree_.remove_path(op.path);
+      }
+    }
+    snapshot_replay_.clear();
+    snapshot_in_flight_ = false;
   }
   std::lock_guard lock(stats_mu_);
   stats_.generation = (*p)->snap_generation;
@@ -427,6 +464,30 @@ std::size_t RemoteRoot::warm_cache() {
   return dirs.size();
 }
 
+void RemoteRoot::rescan_loop() {
+  for (;;) {
+    {
+      std::unique_lock lock(rs_mu_);
+      rs_cv_.wait(lock, [&] { return rs_stop_ || rs_requested_; });
+      if (rs_stop_) return;
+      rs_requested_ = false;  // any Rescan arriving from here on schedules another pass
+    }
+    if (closed_) return;
+    // fetch_snapshot() replaces the mirror and replays whatever changed while
+    // the request was in flight, so the tree is current again — not merely as
+    // of the moment the agent started scanning.
+    if (!fetch_snapshot()) continue;  // connection gone or a bad reply; nothing more to do here
+    {
+      // Directories may have changed without per-path events, so let the
+      // read-ahead visit them again on the next miss.
+      std::lock_guard lock(pf_mu_);
+      pf_seen_.clear();
+    }
+    std::lock_guard s(stats_mu_);
+    ++stats_.rescans;
+  }
+}
+
 void RemoteRoot::wait_prefetch_idle(std::chrono::milliseconds timeout) {
   std::unique_lock lock(pf_mu_);
   pf_done_cv_.wait_for(lock, timeout, [&] {
@@ -680,15 +741,27 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
   proto::Reader r(payload);
   auto batch = proto::read_invalidation(r);
   if (!batch) return;
+  bool rescan = false;
   {
     std::unique_lock lock(tree_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
       switch (op.kind) {
         case InvalidationKind::Upsert: (void)tree_.upsert_path(op.path, op.attr); break;
         case InvalidationKind::Remove: (void)tree_.remove_path(op.path); break;
-        case InvalidationKind::Rescan: break;  // caller decides when to refetch; see stats()
+        case InvalidationKind::Rescan: rescan = true; break;  // handled below, off this thread
       }
     }
+    // A snapshot being fetched right now will replace this tree; keep the batch
+    // so fetch_snapshot() can replay it if the snapshot pre-dates it.
+    if (snapshot_in_flight_) snapshot_replay_.push_back(*batch);
+  }
+  if (rescan) {
+    // The agent's watcher overflowed: per-path events were lost, so the mirror
+    // can no longer be trusted. Re-fetch the snapshot on the rescan thread —
+    // this is the reader thread, and the request would wait on itself.
+    std::lock_guard lock(rs_mu_);
+    rs_requested_ = true;
+    rs_cv_.notify_one();
   }
   // Drop cached contents for any changed path so the next read refetches.
   {

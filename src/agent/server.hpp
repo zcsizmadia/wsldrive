@@ -57,6 +57,11 @@ class RootServer {
   /// per-connection thread. The channel must outlive the call.
   void serve(net::FrameChannel& ch);
 
+  /// Feeds one filesystem event into the coalescer as if the platform watcher
+  /// had reported it. Lets an external notifier (or a test) drive invalidations
+  /// — including an Overflow, which becomes a Rescan for every peer.
+  void notify(const FsEvent& ev) { on_event(ev); }
+
   [[nodiscard]] bool watching() const noexcept { return watcher_ != nullptr; }
   [[nodiscard]] std::uint64_t generation() const noexcept { return generation_.load(); }
   [[nodiscard]] const std::filesystem::path& root() const noexcept { return opts_.root; }
