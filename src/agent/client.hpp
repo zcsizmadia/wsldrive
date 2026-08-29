@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -86,6 +87,10 @@ class RemoteRoot {
   /// Blocks until the background prefetcher has drained its queue (or the
   /// connection closes / the timeout elapses). Mainly for tests and benchmarks.
   void wait_prefetch_idle(std::chrono::milliseconds timeout = std::chrono::minutes(5));
+
+  /// Byte budget for the in-RAM read cache (default 256 MiB). Lowering it evicts
+  /// least-recently-used entries immediately.
+  void set_read_cache_limit(std::uint64_t bytes);
 
   // --- write-through mutations (Phase 3) -------------------------------------
   // Each performs the operation on the far side, then optimistically updates the
@@ -171,14 +176,24 @@ class RemoteRoot {
   struct CacheEntry {
     std::int64_t mtime_ns = 0;
     std::uint64_t size = 0;
-    std::uint64_t last_use = 0;
-    std::vector<std::byte> data;
+    // Position of this entry's key in `lru_` (front = most recently used), so a
+    // hit reorders and an eviction picks a victim in O(1).
+    std::list<std::string>::iterator lru{};
+    // Shared so a reader can take a reference under the lock and copy its slice
+    // after releasing it — the cache never mutates a buffer once published.
+    std::shared_ptr<const std::vector<std::byte>> data;
   };
   mutable std::mutex rcache_mu_;
   std::unordered_map<std::string, CacheEntry, StringHash, std::equal_to<>> rcache_;
+  std::list<std::string> lru_;  // most-recently-used first
   std::uint64_t rcache_bytes_ = 0;
-  std::uint64_t rcache_tick_ = 0;
   std::uint64_t rcache_cap_ = 256u << 20;  // 256 MiB
+
+  // Erases one entry, keeping `lru_` and the byte count in step. Call under
+  // rcache_mu_.
+  void cache_erase(std::unordered_map<std::string, CacheEntry, StringHash, std::equal_to<>>::iterator it);
+  // Drops least-recently-used entries until the budget is met. Call under rcache_mu_.
+  void evict_locked();
 
   std::thread prefetch_;
   std::mutex pf_mu_;
