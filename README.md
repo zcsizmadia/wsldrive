@@ -105,7 +105,8 @@ replaces the binaries, removes tasks the new config no longer defines, and start
 
 `build-installer.ps1` needs [Inno Setup](https://jrsoftware.org/isdl.php) (pass `-InstallInno` to fetch
 it via winget). The GUI wizard is a thin front-end that drives `install.ps1`, so routes 1–3 all do
-exactly the same thing. Releases (and their `wsldrive-setup.exe`) are produced automatically by the
+exactly the same thing. CI dry-runs every `install.ps1` code path and compiles the wizard on each
+change; the elevated, real-WSL pass is a short [manual checklist](docs/release-checklist.md) per release. Releases (and their `wsldrive-setup.exe`) are produced automatically by the
 `Release` workflow on each `v*` tag. To run wsldrive manually without installing, see [Usage](#usage).
 
 ## How it works

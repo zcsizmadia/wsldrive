@@ -44,6 +44,10 @@ installer that leaves you with a drive that comes back after every reboot.
   arrived as a single bare `Upsert`. The client now moves the whole subtree, and
   the agent enumerates a directory that has just appeared so peers see what it
   brought along.
+- **`install.ps1 -Uninstall` removed nothing** (a helper was called before it was
+  defined, so the script failed at once); the GUI uninstaller shares that path.
+  Every `install.ps1` code path now runs in CI as a dry run, and the GUI installer
+  is compiled there, so a regression of this kind cannot ship silently again.
 - **`git init` on a Windows-served tree aborted about one run in three.** A
   just-written backing file is briefly held open by the search indexer or an
   antivirus scanner, so the rename right behind the write (git's lock-file
