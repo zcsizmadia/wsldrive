@@ -51,13 +51,14 @@ RootServer::RootServer(Options opts) : opts_(std::move(opts)), coalescer_(opts_.
 RootServer::~RootServer() { stop(); }
 
 Result<void> RootServer::start() {
-  if (!opts_.watch) return {};
-  auto w = platform::make_watcher(opts_.root, [this](const FsEvent& ev) { on_event(ev); });
-  if (!w) {
-    if (w.error() == Errc::Unsupported) return {};
-    return fail(w.error());
+  if (opts_.watch) {
+    auto w = platform::make_watcher(opts_.root, [this](const FsEvent& ev) { on_event(ev); });
+    if (!w && w.error() != Errc::Unsupported) return fail(w.error());
+    if (w) watcher_ = std::move(*w);
   }
-  watcher_ = std::move(*w);
+  // The flusher runs even without a platform watcher, so events fed through
+  // notify() still reach the peers; parked on a condition variable it costs
+  // nothing.
   flusher_ = std::thread([this] { flush_loop(); });
   return {};
 }

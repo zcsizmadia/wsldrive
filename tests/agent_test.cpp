@@ -782,6 +782,75 @@ TEST_F(AgentTest, LiveInvalidationsReachTheClient) {
   EXPECT_GT(client->stats().generation, 1u);
 }
 
+TEST_F(AgentTest, RescanRefetchesTheSnapshot) {
+  // When the agent's watcher overflows it sends a single Rescan instead of the
+  // events it lost. Ignoring it left the mirror stale until remount — exactly in
+  // the heavy-churn workloads (a checkout, a package install) wsldrive targets.
+  // No platform watcher here, so the Rescan is the ONLY way the client can learn
+  // about the change made below.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  auto has = [&](std::string_view p) {
+    return c->with_tree([&](const MetadataTree& t) { return t.lookup(p).has_value(); });
+  };
+
+  write_file(root_ / "late.txt", "late");
+  fs::remove(root_ / "README.md");
+  EXPECT_FALSE(has("late.txt")) << "nothing told the client yet";
+  EXPECT_TRUE(has("README.md"));
+
+  srv.server().notify(FsEvent{FsEventKind::Overflow, ""});
+
+  bool refreshed = false;
+  for (int i = 0; i < 200 && !refreshed; ++i) {
+    std::this_thread::sleep_for(50ms);
+    refreshed = has("late.txt") && !has("README.md");
+  }
+  EXPECT_TRUE(refreshed) << "the Rescan must trigger a re-fetch that picks up both the new and the removed file";
+  EXPECT_GE(c->stats().rescans, 1u);
+  // The connection is still fully usable afterwards.
+  auto r = c->read("late.txt", 0, 16);
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->data()), r->size()), "late");
+}
+
+TEST_F(AgentTest, SnapshotReplaysInvalidationsThatArriveDuringTheFetch) {
+  // A change reported while a snapshot is in flight, but after the agent
+  // stamped the snapshot's generation, must survive the tree replacement.
+  // The scan visits the root directory first, so a file created at the root
+  // once the fetch has started is (almost always) absent from the snapshot and
+  // reaches the client only through the replayed invalidation. A large tree in
+  // tiny frames keeps the fetch in flight long enough for that to happen; if the
+  // batch happens to land after the fetch, it is applied normally — the test can
+  // only pass for the right reason, never fail for the wrong one.
+  for (int d = 0; d < 20; ++d) {
+    fs::create_directories(root_ / "bulk" / std::to_string(d));
+    for (int i = 0; i < 100; ++i) write_file(root_ / "bulk" / std::to_string(d) / (std::to_string(i) + ".txt"), "x");
+  }
+  LoopbackServer srv(root_, /*watch=*/false, /*chunk_bytes=*/256);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  EXPECT_FALSE(c->with_tree([](const MetadataTree& t) { return t.lookup("during.txt").has_value(); }));
+
+  std::thread fetch([&] { EXPECT_TRUE(c->fetch_snapshot().has_value()); });
+  write_file(root_ / "during.txt", "d");
+  srv.server().notify(FsEvent{FsEventKind::Created, "during.txt"});
+  fetch.join();
+  // Whatever the interleaving, the batch has been delivered by the time both the
+  // fetch and (at most) one more round-trip complete.
+  bool present = false;
+  for (int i = 0; i < 100 && !present; ++i) {
+    present = c->with_tree([](const MetadataTree& t) { return t.lookup("during.txt").has_value(); });
+    if (!present) std::this_thread::sleep_for(20ms);
+  }
+  EXPECT_TRUE(present) << "an invalidation delivered during the fetch was lost to the tree replacement";
+}
+
 #ifdef _WIN32
 TEST(WslLaunch, BuildsCommand) {
   const std::string cmd = platform::build_wsl_command(

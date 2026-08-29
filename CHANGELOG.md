@@ -24,7 +24,10 @@ installer that leaves you with a drive that comes back after every reboot.
 ### Performance
 
 - Whole-tree metadata mirrored in RAM: `stat`/`readdir`/negative lookups never
-  cross the boundary.
+  cross the boundary. Kept current by pushed invalidations; when the agent's
+  watcher overflows under heavy churn, the client re-fetches the snapshot in the
+  background (replaying anything that changed meanwhile) instead of serving
+  stale metadata until remount.
 - Read cache with directory read-ahead and **prefetch-on-mount** (measured cold
   first-read 585 → 423 ms on the reference tree).
 - O(1) LRU eviction, the cached-read copy taken outside the cache lock, and FUSE
@@ -40,7 +43,8 @@ installer that leaves you with a drive that comes back after every reboot.
   paths are rejected and the resolved path is re-checked against the root.
 - Wire-count-driven allocations are bounded, so a malformed frame cannot make
   either side commit gigabytes.
-- Agent sessions are capped and reaped.
+- Agent sessions are capped and reaped, and a peer that does not authenticate
+  within 10 s is dropped, so idle connections cannot hold the session slots.
 - Release binaries are **unsigned** (SmartScreen will warn); every release
   publishes `SHA256SUMS.txt`.
 
@@ -51,10 +55,6 @@ installer that leaves you with a drive that comes back after every reboot.
 - **Symlinks are listed but cannot be followed through the mount.** They are
   reported as links, but there is no `readlink` support yet, so opening one from
   the other side fails. A tree full of symlinks will show them as broken.
-- **A watcher overflow leaves metadata stale until remount.** Under very heavy
-  churn the agent's coalescer emits a single "rescan" signal instead of
-  individual events; the client does not yet act on it, so the in-RAM mirror can
-  keep serving stale metadata for the affected paths until the mount restarts.
 - Hard links are reported as independent files (`st_nlink` is not preserved).
 - Names the tree cannot represent — a backslash, which systemd uses in unit
   filenames — are dropped from the mount and reported as `N entries dropped`.
