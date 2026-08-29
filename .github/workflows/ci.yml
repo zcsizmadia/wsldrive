@@ -149,6 +149,7 @@ jobs:
           Write-Host $out
           if ($LASTEXITCODE -eq 0) { throw 'two mounts on one drive letter must be rejected' }
           if ($out -notmatch 'same drive letter') { throw 'the rejection must say why' }
+          exit 0   # the rejection IS the pass; the step shell would otherwise re-raise the child's exit code
       - name: Dry run - uninstall
         shell: pwsh
         run: |
