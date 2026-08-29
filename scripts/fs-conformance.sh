@@ -53,7 +53,16 @@ mountpoint -q "$MNT" || { echo "MOUNT FAILED"; tail -5 /tmp/fsconf-mount.log; ex
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
-check(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+# On failure, show what the command said and what the mount and the backing
+# store hold - a bare FAIL is impossible to diagnose from a CI log.
+check(){
+  local out
+  if out=$(eval "$2" 2>&1); then ok "$1"; else
+    bad "$1"
+    printf '%s\n' "$out" | sed 's/^/        | /' | head -20
+    [ -d "$MNT/repo" ] && { echo "        mount .git : $(ls "$MNT/repo/.git" 2>&1 | tr '\n' ' ')"; echo "        backing .git: $(ls "$WORK/repo/.git" 2>&1 | tr '\n' ' ')"; }
+  fi
+}
 # An operation we knowingly do not support: report it, do not fail the run.
 known(){ if eval "$2" >/dev/null 2>&1; then printf '  note  %s (now works)\n' "$1"; else printf '  known %s (unsupported, documented)\n' "$1"; fi; }
 
@@ -116,4 +125,8 @@ known "hard link"              "ln '$MNT/d/b.txt' '$MNT/d/hard'"
 
 echo
 echo "passed: $PASS   failed: $FAIL"
+if [ "$FAIL" -ne 0 ]; then
+  echo "--- agent log (tail) ---"; tail -20 /tmp/fsconf-agent.log 2>/dev/null
+  echo "--- mount log (tail) ---"; tail -20 /tmp/fsconf-mount.log 2>/dev/null
+fi
 exit $FAIL
