@@ -163,8 +163,19 @@ struct WriteRequest {
   std::uint64_t offset = 0;
   std::span<const std::byte> data;
 };
+// Every mutation reply (Ok, WriteResponse, CreateResponse) ends with the agent's
+// invalidation generation at the moment the mutation completed. A client uses it
+// to tell a stale invalidation apart from a fresh one: an Upsert for a path it
+// renamed away, stat'ed by the agent just BEFORE the rename and delivered just
+// after, would otherwise resurrect the old name in the mirror until remount.
+// Ordering rule: a batch with generation G was resolved after G was assigned; a
+// mutation acknowledged at H happened before any batch with G > H began.
+struct MutationAck {
+  std::uint64_t generation = 0;
+};
 struct WriteResponse {
   std::uint64_t written = 0;
+  std::uint64_t generation = 0;
 };
 struct CreateRequest {
   std::string_view path;
@@ -250,6 +261,10 @@ void write_write_request(Writer& w, const WriteRequest& q);
 [[nodiscard]] Result<WriteRequest> read_write_request(Reader& r) noexcept;
 void write_write_response(Writer& w, const WriteResponse& p);
 [[nodiscard]] Result<WriteResponse> read_write_response(Reader& r) noexcept;
+
+// The Ok payload, and the tail of a CreateResponse after its attributes.
+void write_mutation_ack(Writer& w, const MutationAck& a);
+[[nodiscard]] Result<MutationAck> read_mutation_ack(Reader& r) noexcept;
 
 void write_create_request(Writer& w, const CreateRequest& q);
 [[nodiscard]] Result<CreateRequest> read_create_request(Reader& r) noexcept;

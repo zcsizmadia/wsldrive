@@ -363,12 +363,25 @@ Result<WriteRequest> read_write_request(Reader& r) noexcept {
   return q;
 }
 
-void write_write_response(Writer& w, const WriteResponse& p) { w.u64(p.written); }
+void write_write_response(Writer& w, const WriteResponse& p) {
+  w.u64(p.written);
+  w.u64(p.generation);
+}
 
 Result<WriteResponse> read_write_response(Reader& r) noexcept {
   auto n = r.u64();
   if (!n) return fail(n.error());
-  return WriteResponse{*n};
+  auto g = r.u64();
+  if (!g) return fail(g.error());
+  return WriteResponse{*n, *g};
+}
+
+void write_mutation_ack(Writer& w, const MutationAck& a) { w.u64(a.generation); }
+
+Result<MutationAck> read_mutation_ack(Reader& r) noexcept {
+  auto g = r.u64();
+  if (!g) return fail(g.error());
+  return MutationAck{*g};
 }
 
 void write_create_request(Writer& w, const CreateRequest& q) {
