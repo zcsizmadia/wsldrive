@@ -1,0 +1,26 @@
+# Keeps the GitHub Actions in .github/workflows current. The actions are pinned by
+# commit SHA (with a "# vN" comment); Dependabot preserves that style and bumps
+# the SHA + comment together, so the pins stay meaningful.
+#
+# Not covered here, because Dependabot has no ecosystem for them:
+#   - the CMake FetchContent dependencies in cmake/Dependencies.cmake
+#     (BLAKE3, googletest, google/benchmark) - bump the tags there by hand;
+#   - the Chocolatey packages installed in the workflows (winfsp, innosetup) -
+#     see issue #67 about pinning them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    # One PR per week for all action bumps rather than one PR per action.
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
+    labels: ["ci", "dependencies"]
+    open-pull-requests-limit: 5
