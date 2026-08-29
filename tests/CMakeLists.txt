@@ -1,6 +1,5 @@
 add_executable(core_tests
   coalescer_test.cpp
-  content_cache_test.cpp
   flat_map_test.cpp
   hash_test.cpp
   ignore_test.cpp

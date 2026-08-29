@@ -15,6 +15,9 @@ struct WslAgentSpec {
   std::string wsl_root;    // the ext4 directory to serve
   std::uint32_t port = 0;  // port the agent listens on
   std::string listen;      // full listen endpoint; empty = tcp://127.0.0.1:<port>
+  // Per-mount shared secret. Passed through the environment (forwarded into the
+  // distro via WSLENV) rather than argv, which is world-readable.
+  std::string token;
 };
 
 /// Best-effort discovery of the running WSL2 utility VM's GUID (via `hcsdiag

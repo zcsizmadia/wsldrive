@@ -32,6 +32,9 @@ class RootServer {
     // /proc and /sys, and foreign mounts like /mnt/c) are reported but not
     // descended into. Turn off only to deliberately serve across mounts.
     bool one_file_system = true;
+    // Shared secret a peer must present in its Hello. Empty disables the check
+    // (only when the operator passes --insecure-no-auth).
+    std::string token;
   };
 
   explicit RootServer(Options opts);
@@ -80,6 +83,11 @@ class RootServer {
 
   std::mutex peers_mu_;
   std::vector<net::FrameChannel*> peers_;
+  // broadcast() sends outside peers_mu_ so a slow peer cannot stall everyone;
+  // this counter lets a departing session wait until no send still holds its
+  // channel pointer.
+  std::condition_variable peers_cv_;
+  std::size_t broadcasts_in_flight_ = 0;
 };
 
 }  // namespace wsld::agent

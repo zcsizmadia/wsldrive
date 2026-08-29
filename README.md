@@ -294,26 +294,26 @@ content cache, ignore rules, name escaping, path utils), all unit-tested. `src/n
 
 ## Security
 
-**The agent does not authenticate its peer.** `wsldrived` serves reads *and* write-through mutations
-(write, create, mkdir, unlink, rmdir, rename, truncate) to whoever connects — there is no token and no
-peer check. Anything that can reach the socket can read and modify the served tree with your
-permissions:
+`wsldrived` serves reads *and* write-through mutations (write, create, mkdir, unlink, rmdir, rename,
+truncate), so a peer that gets past the handshake can modify the served tree with your permissions.
 
-- **Direction A** — the agent listens on loopback *inside the distro*, so any process in that distro can
-  reach it while the mount is up.
-- **Direction B** — the client listens on loopback on the WSL side, so any local process can reach it.
+**Peers authenticate with a per-mount shared secret.** The launcher generates a 128-bit token from the
+platform CSPRNG and passes it to both ends through the *environment* (forwarded across the WSL boundary
+with `WSLENV`, so it never appears in a command line, which any local process can read). The agent
+compares it in constant time during the `Hello` handshake and drops the session on mismatch. This is
+automatic for `wsldrive mount` — you never see the token.
 
-Auto-launch (`--distro` / `--win-agent`) narrows the window considerably: the agent runs with
-`--exit-when-idle`, serving exactly one session and exiting when the mount ends. A long-lived
-`wsldrived --listen` is the exposed case.
+Running the agent by hand requires the same: set `WSLDRIVE_TOKEN` in its environment and in the
+client's. `wsldrived` **refuses to start** without one unless you pass `--insecure-no-auth`, which
+accepts any local peer — only do that on a machine where you trust every process.
 
-Practical guidance: **serve a tree you are willing to expose to every process on that machine**, and
-don't run a long-lived agent on a shared or untrusted host. Peer authentication (a per-mount shared
-secret passed by the launcher) is planned; until then this is the trust boundary.
+Paths from a peer are confined to the served root: `..`, absolute and drive-letter paths are rejected
+and the resolved path is re-checked against the root. Note that a **symlink inside the tree is
+followed**, so a link pointing outside the root resolves to its target — don't serve a tree containing
+links you would not expose.
 
-Paths from a peer are confined to the served root — `..`, absolute and drive-letter paths are rejected
-and the resolved path is re-checked against the root — but note that a **symlink inside the tree is
-followed**, so a link pointing outside the root resolves to its target.
+Release binaries are **unsigned** (Windows SmartScreen will warn); each release publishes
+`SHA256SUMS.txt` so downloads can be verified.
 
 ## License
 

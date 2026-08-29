@@ -22,7 +22,7 @@
 namespace wsld::proto {
 
 inline constexpr std::uint32_t kMagic = 0x444C5357;  // "WSLD" when read as little-endian bytes
-inline constexpr std::uint16_t kVersion = 1;
+inline constexpr std::uint16_t kVersion = 2;  // 2: Hello carries an auth token
 inline constexpr std::size_t kHeaderSize = 24;
 inline constexpr std::uint32_t kMaxPayload = 64u << 20;  // 64 MiB per frame
 
@@ -122,6 +122,9 @@ struct Hello {
   std::uint32_t protocol_version = kVersion;
   std::uint64_t capabilities = 0;
   std::string_view agent;  // free-form "name/version" for diagnostics
+  // Shared secret proving the peer was started by the same launcher. Empty when
+  // the agent runs with --insecure-no-auth.
+  std::string_view token;
 };
 
 struct InvalidationOp {

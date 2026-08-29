@@ -22,7 +22,12 @@ enum class Errc : std::uint8_t {
   Unsupported,       // feature not available on this platform / build
   Timeout,
   ProtocolError,     // peer sent a well-formed frame we did not expect
+  Unauthorized,      // peer did not present the expected authentication token
 };
+
+/// Highest valid Errc. Decoders validate a wire error code against this, so a
+/// new value must be added to the enum ABOVE this line.
+inline constexpr Errc kLastErrc = Errc::Unauthorized;
 
 constexpr const char* to_string(Errc e) noexcept {
   switch (e) {
@@ -42,6 +47,7 @@ constexpr const char* to_string(Errc e) noexcept {
     case Errc::Unsupported: return "unsupported";
     case Errc::Timeout: return "timeout";
     case Errc::ProtocolError: return "protocol error";
+    case Errc::Unauthorized: return "unauthorized";
   }
   return "unknown";
 }

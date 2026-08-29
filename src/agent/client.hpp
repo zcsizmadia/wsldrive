@@ -54,6 +54,10 @@ class RemoteRoot {
   RemoteRoot(const RemoteRoot&) = delete;
   RemoteRoot& operator=(const RemoteRoot&) = delete;
 
+  /// Shared secret presented in the Hello handshake; must match the agent's.
+  /// Set before connect().
+  void set_auth_token(std::string token) { token_ = std::move(token); }
+
   /// Starts the reader thread and performs the Hello handshake.
   [[nodiscard]] Result<proto::Hello> connect(std::chrono::milliseconds timeout = std::chrono::seconds(10));
 
@@ -155,6 +159,7 @@ class RemoteRoot {
   void enqueue_prefetch(std::string dir);
   void prefetch_loop();
 
+  std::string token_;  // presented in Hello
   std::unique_ptr<net::FrameChannel> ch_;
   std::thread reader_;
   std::atomic<bool> closed_{false};  // connection is dead (set by reader on EOF or by close())

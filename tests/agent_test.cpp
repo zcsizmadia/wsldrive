@@ -1,5 +1,6 @@
 #include "agent/client.hpp"
 #include "agent/scanner.hpp"
+#include "core/auth_token.hpp"
 #include "agent/server.hpp"
 #include "platform/watcher.hpp"
 #ifdef _WIN32
@@ -115,8 +116,12 @@ TEST_F(AgentTest, ReadAttributes) {
 /// Runs a RootServer on a loopback TCP listener with one accept thread.
 class LoopbackServer {
  public:
-  explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20))
-      : server_({.root = std::move(root), .watch = watch, .coalescer = {}, .snapshot_chunk_bytes = chunk_bytes}) {
+  explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20), std::string token = {})
+      : server_({.root = std::move(root),
+                 .watch = watch,
+                 .coalescer = {},
+                 .snapshot_chunk_bytes = chunk_bytes,
+                 .token = std::move(token)}) {
     auto l = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
     if (!l) throw std::runtime_error("bind failed");
     listener_ = std::move(*l);
@@ -289,6 +294,40 @@ TEST_F(AgentTest, ChunkedSnapshotReassembles) {
   EXPECT_TRUE(c->with_tree([](const MetadataTree& t) { return t.lookup("chunk_199.dat").has_value(); }));
   // The reply really was split across many frames.
   EXPECT_GT(c->stats().snapshot_bytes, 256u);
+}
+
+TEST_F(AgentTest, RejectsAPeerWithoutTheSharedSecret) {
+  // The agent serves reads and mutations, so an unauthenticated peer could read
+  // or destroy the whole tree. With a token configured, only a peer presenting
+  // it gets past the handshake.
+  LoopbackServer srv(root_, /*watch=*/false, 4u << 20, "s3cret-token");
+
+  auto wrong = connect_client(srv.endpoint());
+  ASSERT_NE(wrong, nullptr);
+  wrong->set_auth_token("not-the-token");
+  const auto rejected = wrong->connect();
+  ASSERT_FALSE(rejected.has_value()) << "a bad token must not be accepted";
+  EXPECT_EQ(rejected.error(), Errc::Unauthorized) << "the reason must be reported, not a generic error";
+
+  auto absent = connect_client(srv.endpoint());
+  ASSERT_NE(absent, nullptr);
+  EXPECT_FALSE(absent->connect().has_value()) << "no token must not be accepted";
+
+  auto good = connect_client(srv.endpoint());
+  ASSERT_NE(good, nullptr);
+  good->set_auth_token("s3cret-token");
+  ASSERT_TRUE(good->connect().has_value());
+  ASSERT_TRUE(good->fetch_snapshot().has_value());
+  EXPECT_TRUE(good->read("README.md", 0, 16).has_value());
+}
+
+TEST(AuthToken, GeneratesDistinctHexSecrets) {
+  const std::string a = generate_auth_token();
+  const std::string b = generate_auth_token();
+  ASSERT_FALSE(a.empty()) << "no entropy source available";
+  EXPECT_EQ(a.size(), 32u);  // 128 bits as hex
+  EXPECT_NE(a, b);
+  EXPECT_EQ(a.find_first_not_of("0123456789abcdef"), std::string::npos);
 }
 
 TEST_F(AgentTest, ReadCacheEvictsLeastRecentlyUsed) {
@@ -639,7 +678,7 @@ TEST(WslLaunch, BuildsCommand) {
 #else
 TEST(WinLaunch, BuildsCommand) {
   const std::string cmd = platform::build_win_agent_command(
-      {.exe = "/mnt/c/wsldrived.exe", .win_root = "C:/proj", .connect = "hv://{guid}:5700"});
+      {.exe = "/mnt/c/wsldrived.exe", .win_root = "C:/proj", .connect = "hv://{guid}:5700", .token = {}});
   EXPECT_NE(cmd.find("/mnt/c/wsldrived.exe"), std::string::npos);
   EXPECT_NE(cmd.find("--root C:/proj"), std::string::npos);
   EXPECT_NE(cmd.find("--connect hv://{guid}:5700"), std::string::npos);

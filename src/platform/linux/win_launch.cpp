@@ -5,6 +5,7 @@
 
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -61,6 +62,18 @@ Result<void> WinAgent::start(const WinAgentSpec& spec) {
   if (pid < 0) return fail(Errc::IoError);
   if (pid == 0) {
     // Child: run the Windows agent via WSL interop (binfmt routes the .exe).
+    // The token goes in the environment, not argv: a command line is readable by
+    // any local process. WSLENV forwards it across the interop boundary.
+    if (!spec.token.empty()) {
+      ::setenv("WSLDRIVE_TOKEN", spec.token.c_str(), 1);
+      const char* existing = ::getenv("WSLENV");
+      std::string wslenv = existing != nullptr ? std::string(existing) : std::string();
+      if (wslenv.find("WSLDRIVE_TOKEN") == std::string::npos) {
+        if (!wslenv.empty()) wslenv.push_back(':');
+        wslenv += "WSLDRIVE_TOKEN/w";  // /w: pass from WSL to the Windows process
+      }
+      ::setenv("WSLENV", wslenv.c_str(), 1);
+    }
     ::execl(spec.exe.c_str(), spec.exe.c_str(), "--root", spec.win_root.c_str(), "--connect", spec.connect.c_str(),
             "--exit-when-idle", static_cast<char*>(nullptr));
     _exit(127);
