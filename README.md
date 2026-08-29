@@ -213,8 +213,10 @@ wsldrive mount /tmp/win --win-root 'C:/project' \
 Or attach to an agent started on Windows yourself:
 
 ```bash
-# on Windows:  wsldrived.exe --root C:\project --listen tcp://0.0.0.0:7788
+# on Windows:  wsldrived.exe --root C:\project --listen tcp://127.0.0.1:7788
 # in WSL:      wsldrive mount /tmp/win --connect tcp://127.0.0.1:7788
+# Keep the agent on loopback: WSL2 forwards localhost, so binding 0.0.0.0 buys
+# nothing and would expose a read-write file server to the whole network.
 ```
 
 ### Enabling the Hyper-V socket transport
