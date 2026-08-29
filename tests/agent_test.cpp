@@ -255,6 +255,50 @@ TEST_F(AgentTest, ScannerReportsSymlinks) {
   ASSERT_TRUE(link.has_value());
   EXPECT_EQ(t.node(*link).attr.kind, NodeKind::Symlink);
 }
+
+TEST_F(AgentTest, ReadlinkReturnsTheStoredTarget) {
+  // A link that is listed but cannot be read makes every symlink in a served
+  // home directory (.cache, toolchain links, node_modules) look broken.
+  std::error_code ec;
+  fs::create_symlink("main.cpp", root_ / "src" / "rel_link", ec);
+  ASSERT_FALSE(ec);
+  fs::create_symlink("/nowhere/at/all", root_ / "dangling", ec);
+  ASSERT_FALSE(ec);
+
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  auto rel = c->readlink("src/rel_link");
+  ASSERT_TRUE(rel.has_value()) << to_string(rel.error());
+  EXPECT_EQ(*rel, "main.cpp");
+  // A dangling link still reports its target - readlink() does not resolve it.
+  auto dangling = c->readlink("dangling");
+  ASSERT_TRUE(dangling.has_value());
+  EXPECT_EQ(*dangling, "/nowhere/at/all");
+  // Not a link, not there, not inside the root.
+  EXPECT_EQ(c->readlink("README.md").error(), Errc::InvalidArgument);
+  EXPECT_EQ(c->readlink("nope").error(), Errc::NotFound);
+  EXPECT_EQ(c->readlink("../etc/passwd").error(), Errc::InvalidPath);
+
+  // The second call is served from the cache: no round-trip. Prove it by
+  // changing the link on disk behind the client's back.
+  fs::remove(root_ / "src" / "rel_link");
+  fs::create_symlink("../README.md", root_ / "src" / "rel_link", ec);
+  ASSERT_FALSE(ec);
+  EXPECT_EQ(*c->readlink("src/rel_link"), "main.cpp") << "expected the cached target";
+  // ...and an invalidation for that path drops the cached target.
+  srv.server().notify(FsEvent{FsEventKind::Modified, "src/rel_link"});
+  bool refreshed = false;
+  for (int i = 0; i < 100 && !refreshed; ++i) {
+    std::this_thread::sleep_for(20ms);
+    auto again = c->readlink("src/rel_link");
+    refreshed = again.has_value() && *again == "../README.md";
+  }
+  EXPECT_TRUE(refreshed) << "the invalidation must evict the cached link target";
+}
 #endif
 
 TEST_F(AgentTest, IgnoreRulesExcludeFromSnapshot) {

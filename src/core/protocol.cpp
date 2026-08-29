@@ -493,4 +493,12 @@ Result<ReadManyResponse> read_read_many_response(Reader& r) {
   return p;
 }
 
+void write_readlink_response(Writer& w, const ReadlinkResponse& p) { w.string(p.target); }
+
+Result<ReadlinkResponse> read_readlink_response(Reader& r) noexcept {
+  auto t = r.string();
+  if (!t) return fail(t.error());
+  return ReadlinkResponse{*t};
+}
+
 }  // namespace wsld::proto

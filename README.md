@@ -151,7 +151,7 @@ stream socket. Two transports:
 | ext4 | Windows view |
 |---|---|
 | case-sensitive names | case-preserving; case-colliding siblings flagged, the shadowed one hidden |
-| symlinks | reported as symlinks/reparse points |
+| symlinks | readable (`readlink`, following); relative targets resolve on the mount, absolute ones name the serving side; creating links is not supported |
 | mode bits | synthesised attributes (`READONLY` when no write bit); no ACL emulation |
 | ns mtime | truncated to 100 ns |
 | hard links | reported as independent files (`st_nlink` not preserved) — known limitation |

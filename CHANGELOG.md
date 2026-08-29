@@ -52,9 +52,10 @@ installer that leaves you with a drive that comes back after every reboot.
 
 - The mount follows a **symlink inside the tree** to its target, even outside the
   served root — so do not serve a tree containing links you would not expose.
-- **Symlinks are listed but cannot be followed through the mount.** They are
-  reported as links, but there is no `readlink` support yet, so opening one from
-  the other side fails. A tree full of symlinks will show them as broken.
+- **Symlinks can be read but not created** through the mount: `readlink` and
+  following a link work (a relative target resolves on the mount; an absolute
+  target names a path on the *serving* side, so from the other OS it dangles),
+  but `ln -s` on the mount is not supported yet.
 - Hard links are reported as independent files (`st_nlink` is not preserved).
 - Names the tree cannot represent — a backslash, which systemd uses in unit
   filenames — are dropped from the mount and reported as `N entries dropped`.

@@ -297,6 +297,26 @@ TEST(Fuzz, DecodersAreBounded) {
   }
 }
 
+TEST(Messages, ReadlinkRoundTrip) {
+  std::vector<std::byte> buf;
+  Writer w(buf);
+  write_path_request(w, PathRequest{.path = "src/link"});
+  write_readlink_response(w, ReadlinkResponse{.target = "../lib/target.so"});
+  write_readlink_response(w, ReadlinkResponse{.target = ""});  // a link to nothing is still a link
+  Reader r(buf);
+  auto q = read_path_request(r);
+  ASSERT_TRUE(q.has_value());
+  EXPECT_EQ(q->path, "src/link");
+  auto p = read_readlink_response(r);
+  ASSERT_TRUE(p.has_value());
+  EXPECT_EQ(p->target, "../lib/target.so");
+  auto empty = read_readlink_response(r);
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_EQ(empty->target, "");
+  EXPECT_TRUE(r.empty());
+  EXPECT_EQ(read_readlink_response(r).error(), Errc::Truncated);
+}
+
 TEST(Frame, WriteFrameFillsHeader) {
   std::vector<std::byte> buf;
   write_frame(buf, MsgType::Hello, 42, [](Writer& w) { write_hello(w, Hello{.agent = "t", .token = {}}); });
