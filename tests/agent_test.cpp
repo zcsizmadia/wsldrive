@@ -360,6 +360,33 @@ TEST_F(AgentTest, ServesNothingBeforeAuthentication) {
   EXPECT_TRUE(fs::exists(root_ / "README.md")) << "the file must still be there";
 }
 
+TEST_F(AgentTest, UnauthenticatedPeerReceivesNoInvalidations) {
+  // Joining the broadcast set is a privilege too: invalidation frames carry the
+  // path and attributes of everything changing under the root, so a peer that
+  // connects and stays silent must not be fed that stream.
+  LoopbackServer srv(root_, /*watch=*/true, 4u << 20, "s3cret-token");
+  if (!srv.server().watching()) GTEST_SKIP() << "no filesystem watcher on this platform";
+
+  auto sock = net::connect(srv.endpoint());
+  ASSERT_TRUE(sock.has_value());
+  net::FrameChannel silent(std::move(*sock));  // connects, never authenticates
+
+  // Churn the tree so invalidations are generated and broadcast.
+  for (int i = 0; i < 5; ++i) {
+    write_file(root_ / ("churn" + std::to_string(i) + ".txt"), "x");
+    std::this_thread::sleep_for(60ms);
+  }
+  std::this_thread::sleep_for(500ms);
+
+  // The silent peer must have been sent nothing at all.
+  auto f = silent.receive(300ms);
+  if (f.has_value()) {
+    ADD_FAILURE() << "unauthenticated peer received a frame of type " << static_cast<int>(f->header.type);
+  } else {
+    EXPECT_EQ(f.error(), Errc::Timeout) << "expected silence, got " << to_string(f.error());
+  }
+}
+
 TEST(AuthToken, GeneratesDistinctHexSecrets) {
   const std::string a = generate_auth_token();
   const std::string b = generate_auth_token();

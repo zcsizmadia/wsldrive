@@ -130,6 +130,13 @@ void RootServer::flush_loop() {
   }
 }
 
+bool RootServer::add_peer(net::FrameChannel& ch) {
+  std::lock_guard lock(peers_mu_);
+  if (stopping_) return false;
+  peers_.push_back(&ch);
+  return true;
+}
+
 void RootServer::broadcast(const std::vector<std::byte>& frame) {
   // Copy the peer list, then send outside the lock: holding peers_mu_ across
   // socket writes let one slow or stuck peer stall invalidation delivery to
@@ -152,11 +159,18 @@ void RootServer::serve(net::FrameChannel& ch) {
   // Per-session authentication state. With no token configured the operator has
   // explicitly opted out (--insecure-no-auth), so the session starts open.
   bool authed = opts_.token.empty();
+  // Joining the broadcast set is itself a privilege: invalidation frames carry
+  // the path and attributes of everything changing under the served root, so an
+  // unauthenticated peer that simply connects and stays silent must not receive
+  // them. Register only once the session is authenticated (immediately, when the
+  // operator opted out of authentication entirely).
+  bool registered = false;
   {
     std::lock_guard lock(peers_mu_);
     if (stopping_) return;
-    peers_.push_back(&ch);
   }
+  if (authed && !(registered = add_peer(ch))) return;
+
   for (;;) {
     auto f = ch.receive(std::chrono::milliseconds(200));
     if (!f) {
@@ -167,6 +181,9 @@ void RootServer::serve(net::FrameChannel& ch) {
       break;  // peer disconnected or I/O error
     }
     if (auto r = handle(*f, ch, authed); !r) break;
+    // A successful Hello promotes the session; only then does it start receiving
+    // invalidations.
+    if (authed && !registered && !(registered = add_peer(ch))) break;
   }
   {
     // Deregister, then wait for any in-flight broadcast to finish: it holds a
@@ -263,7 +280,11 @@ bool is_contained_relative(std::string_view norm) {
     // directory they appear in. Only on Windows: these are legal filenames on
     // Linux, and rejecting them there would deny access to real files.
     {
-      std::string stem(comp.substr(0, comp.find('.')));
+      // Win32 strips trailing dots and spaces before resolving, so "CON " is
+      // still the console device; trim them before comparing.
+      std::string_view trimmed = comp;
+      while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '.')) trimmed.remove_suffix(1);
+      std::string stem(trimmed.substr(0, trimmed.find('.')));
       for (char& c : stem) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
       static constexpr std::string_view kReserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
                                                        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
