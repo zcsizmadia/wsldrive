@@ -196,8 +196,10 @@ if ($Uninstall) {
   Plan "unregister hvsocket service GUIDs (ports $FirstPort..$($FirstPort+$PortCount-1))"
   if (-not $DryRun) { & "$PSScriptRoot\register-hvsocket.ps1" -FirstPort $FirstPort -Count $PortCount -Unregister | Out-Null }
   foreach ($d in $distros) {
-    Plan "remove staged ~/.local/bin/wsldrive and wsldrived from distro $d"
-    if (-not $DryRun) { & wsl.exe -d $d -- sh -c 'rm -f ~/.local/bin/wsldrive ~/.local/bin/wsldrived' 2>$null | Out-Null }
+    # The agent exits on its own when its client goes away, but not instantly;
+    # a fresh install right after this would race it for the port.
+    Plan "end the wsldrive agent/client in distro $d and remove staged ~/.local/bin/wsldrive and wsldrived"
+    if (-not $DryRun) { & wsl.exe -d $d -- sh -c 'pkill -x wsldrived; pkill -x wsldrive; rm -f ~/.local/bin/wsldrive ~/.local/bin/wsldrived' 2>$null | Out-Null }
   }
   if (Test-Path "$env:LOCALAPPDATA\wsldrive") {
     Plan "delete $env:LOCALAPPDATA\wsldrive (staging copies)"
@@ -533,12 +535,17 @@ if ($running.Count -gt 0 -or (Get-Process wsldrive,wsldrivew -ErrorAction Silent
     Plan "stop task $($t.TaskName)"
     if (-not $DryRun) { Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue }
   }
-  Plan 'end any leftover wsldrive / wsldrivew processes'
+  Plan 'end any leftover wsldrive / wsldrivew processes (and the agents in the distros)'
   if (-not $DryRun) {
     Get-Process wsldrive,wsldrivew -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # A previous agent still winding down would hold the loopback port the new
+    # mount is about to use, and the first start would fail.
+    foreach ($d in @($mounts | ForEach-Object { $_.Distro } | Select-Object -Unique)) {
+      & wsl.exe -d $d -- sh -c 'pkill -x wsldrived; pkill -x wsldrive; true' 2>$null | Out-Null
+    }
     Start-Sleep -Milliseconds 800   # let the file handles drop
+    Warn 'Mounted drives were unmounted so the binaries could be replaced; they are re-started below.'
   }
-  Warn 'Mounted drives were unmounted so the binaries could be replaced; they are re-started below.'
 }
 
 # --- copy binaries (a no-op when a packaged installer already placed them here) ---
