@@ -14,6 +14,7 @@
 #include <memory>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -113,6 +114,7 @@ void RootServer::flush_loop() {
     proto::InvalidationBatch batch;
     batch.generation = generation_.fetch_add(1) + 1;
     batch.ops.reserve(planned.size());
+    std::vector<std::string> expand_dirs;
     for (PlannedOp& op : planned) {
       // Ignored paths are absent from the client's tree; skip their events. (Kind
       // does not tell us dir vs file for removes, so test both interpretations.)
@@ -136,36 +138,84 @@ void RootServer::flush_loop() {
       // a rename) is reported by the watcher as one entry, yet a renamed one
       // brings its whole subtree along. Without this the peers would show it
       // empty until the next remount.
-      const bool expand = op.appeared && out.kind == InvalidationKind::Upsert && out.attr.kind == NodeKind::Directory;
-      const std::string dir = out.path;
+      if (op.appeared && out.kind == InvalidationKind::Upsert && out.attr.kind == NodeKind::Directory)
+        expand_dirs.push_back(out.path);
       batch.ops.push_back(std::move(out));
-      if (expand) append_subtree(dir, batch.ops);
     }
-    if (!batch.ops.empty()) {
-      std::vector<std::byte> frame;
-      proto::write_frame(frame, proto::MsgType::Invalidation, 0, [&](proto::Writer& w) { proto::write_invalidation(w, batch); });
-      broadcast(frame);
-    }
+    if (!expand_dirs.empty()) append_subtrees(std::move(expand_dirs), batch.ops);
+    if (!batch.ops.empty()) broadcast_batch(batch);
     lock.lock();
   }
 }
 
-void RootServer::append_subtree(const std::string& rel, std::vector<proto::InvalidationOp>& ops) {
-  // scan_tree() hands out entries with a parent INDEX (0 = the scanned root, k =
-  // the k-th entry), so keep every entry's path by index to build the children's.
-  std::vector<std::string> rels{rel};
-  const std::string prefix = rel + "/";
-  (void)scan_tree(
-      join_relative(opts_.root, rel),
-      [&](const SnapshotEntry& e) {
-        std::string p = rels[e.parent] + "/" + std::string(e.name);
-        ops.push_back(proto::InvalidationOp{InvalidationKind::Upsert, p, e.attr});
-        rels.push_back(std::move(p));
-      },
-      // Ignore rules are relative to the served root, not to this subtree.
-      ignore_.empty() ? agent::SkipPredicate{}
-                      : [&](std::string_view sub, bool is_dir) { return ignore_.ignored(prefix + std::string(sub), is_dir); },
-      opts_.one_file_system);
+void RootServer::append_subtrees(std::vector<std::string> dirs, std::vector<proto::InvalidationOp>& ops) {
+  // A `cp -r` reports every new directory, nested ones included; enumerate only
+  // the topmost of each nest (the scan below descends anyway) and never repeat a
+  // path that already has its own op in this batch.
+  std::sort(dirs.begin(), dirs.end());
+  std::unordered_set<std::string_view> present;
+  for (const proto::InvalidationOp& o : ops) present.insert(o.path);
+  const std::size_t before = ops.size();
+  std::size_t appended = 0;
+  bool over = false;
+  std::string last_root;
+  for (const std::string& rel : dirs) {
+    if (!last_root.empty() && wsld::path_is_under(std::string_view(rel), std::string_view(last_root)))
+      continue;  // covered by its ancestor's scan
+    last_root = rel;
+    // scan_tree() hands out entries with a parent INDEX (0 = the scanned root, k
+    // = the k-th entry), so keep every entry's path by index.
+    std::vector<std::string> rels{rel};
+    const std::string prefix = rel + "/";
+    (void)scan_tree(
+        join_relative(opts_.root, rel),
+        [&](const SnapshotEntry& e) {
+          std::string p = rels[e.parent] + "/" + std::string(e.name);
+          if (++appended > opts_.max_expanded_entries) over = true;
+          if (!over && !present.contains(p)) ops.push_back(proto::InvalidationOp{InvalidationKind::Upsert, p, e.attr});
+          rels.push_back(std::move(p));
+        },
+        // Once over budget, decline every subdirectory so the scan winds down
+        // quickly. Ignore rules are relative to the served root, not the subtree.
+        [&](std::string_view sub, bool is_dir) {
+          if (over) return true;
+          return !ignore_.empty() && ignore_.ignored(prefix + std::string(sub), is_dir);
+        },
+        opts_.one_file_system);
+    if (over) break;
+  }
+  if (over) {
+    // Too much to describe entry by entry: drop the partial expansion and have
+    // the peers take a fresh snapshot instead - the same path the watcher's own
+    // overflow takes, and bounded on both ends.
+    ops.resize(before);
+    ops.push_back(proto::InvalidationOp{InvalidationKind::Rescan, std::string{}, {}});
+  }
+}
+
+void RootServer::broadcast_batch(const proto::InvalidationBatch& batch) {
+  // Every frame is a complete InvalidationBatch (same generation); the client
+  // applies them in order, so splitting is invisible to it. Chunk by the
+  // encoded size so one big rename cannot produce a frame above kMaxPayload.
+  const std::size_t budget = std::min<std::size_t>(opts_.snapshot_chunk_bytes, proto::kMaxPayload / 2);
+  std::vector<std::byte> frame;
+  std::size_t first = 0;
+  while (first < batch.ops.size()) {
+    proto::InvalidationBatch chunk;
+    chunk.generation = batch.generation;
+    std::size_t bytes = 0;
+    std::size_t last = first;
+    for (; last < batch.ops.size(); ++last) {
+      bytes += batch.ops[last].path.size() + 32;  // kind + length + attrs, generously
+      if (bytes > budget && last > first) break;
+    }
+    chunk.ops.assign(batch.ops.begin() + static_cast<std::ptrdiff_t>(first),
+                     batch.ops.begin() + static_cast<std::ptrdiff_t>(last));
+    frame.clear();
+    proto::write_frame(frame, proto::MsgType::Invalidation, 0, [&](proto::Writer& w) { proto::write_invalidation(w, chunk); });
+    broadcast(frame);
+    first = last;
+  }
 }
 
 bool RootServer::add_peer(net::FrameChannel& ch) {
@@ -211,12 +261,20 @@ void RootServer::serve(net::FrameChannel& ch) {
 
   // A silent peer never trips the gate in handle(), so it is dropped on a clock
   // instead: it must have authenticated by this deadline or the session ends.
+  // Until then the channel also refuses anything but a small frame, and a frame
+  // that starts arriving must finish within the same window - a Hello is a few
+  // hundred bytes, and a peer that sends one byte and stops, or a header
+  // claiming 64 MiB and nothing more, must not hold this thread or that memory.
   const auto handshake_deadline = std::chrono::steady_clock::now() + opts_.handshake_timeout;
+  constexpr std::uint32_t kPreAuthMaxPayload = 4096;
+  if (!authed) ch.set_receive_limits(kPreAuthMaxPayload, opts_.handshake_timeout);
 
   for (;;) {
     auto f = ch.receive(std::chrono::milliseconds(200));
     if (!f) {
       if (f.error() == Errc::Timeout) {
+        // Either nothing arrived in this poll, or a frame started and did not
+        // finish within the handshake window (only possible while unauthed).
         if (stopping_) break;
         if (!authed && std::chrono::steady_clock::now() >= handshake_deadline) {
           (void)send_error(0, Errc::Timeout, "handshake timeout", ch);
@@ -224,11 +282,13 @@ void RootServer::serve(net::FrameChannel& ch) {
         }
         continue;
       }
-      break;  // peer disconnected or I/O error
+      break;  // peer disconnected, oversized pre-auth frame, or I/O error
     }
+    const bool was_authed = authed;
     if (auto r = handle(*f, ch, authed); !r) break;
-    // A successful Hello promotes the session; only then does it start receiving
-    // invalidations.
+    // A successful Hello promotes the session: full-size frames from here on,
+    // and only then does it start receiving invalidations.
+    if (authed && !was_authed) ch.set_receive_limits(proto::kMaxPayload, std::chrono::milliseconds(0));
     if (authed && !registered && !(registered = add_peer(ch))) break;
   }
   {
@@ -377,29 +437,61 @@ Errc map_fs_error(const std::error_code& ec) {
 // the write then fails with a sharing violation, which is exactly the shape of
 // git's lock-file dance (write config.lock, rename over config): git init aborted
 // mid-way on the mount about one run in three. Git for Windows retries this
-// itself; so does the agent, for about a second.
-bool is_transient_share_error(const std::error_code& ec) noexcept {
+// itself; so does the agent, for about a quarter of a second (1+2+...+128 ms).
+//
+// Which errors are worth waiting out: a sharing/lock violation always is. Windows
+// reports a rename OVER a held-open file as ERROR_ACCESS_DENIED too, so that
+// code cannot simply be excluded - but it is also the permanent answer for a
+// read-only file (git marks its pack files read-only) or a directory, and
+// retrying those would freeze the whole mount for the duration on every such
+// file. The attribute check tells the two apart.
+constexpr int kShareRetryMaxDelayMs = 128;
+
 #ifdef _WIN32
-  return ec.category() == std::system_category() &&
-         (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_LOCK_VIOLATION ||
-          ec.value() == ERROR_ACCESS_DENIED);
+bool is_readonly_or_dir(const std::filesystem::path& p) noexcept {
+  const DWORD a = ::GetFileAttributesW(p.c_str());
+  return a != INVALID_FILE_ATTRIBUTES && (a & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY)) != 0;
+}
+bool transient_share_error(DWORD err, const std::filesystem::path& target) noexcept {
+  if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION) return true;
+  return err == ERROR_ACCESS_DENIED && !is_readonly_or_dir(target);
+}
+#endif
+
+bool is_transient_share_error(const std::error_code& ec, const std::filesystem::path& target) noexcept {
+#ifdef _WIN32
+  return ec.category() == std::system_category() && transient_share_error(static_cast<DWORD>(ec.value()), target);
 #else
   (void)ec;
+  (void)target;
   return false;
 #endif
 }
 
+// `target` is the file whose state decides whether waiting can help (for a
+// rename, the destination being replaced).
 template <class Op>
-std::error_code with_share_retry(Op&& op) {
+std::error_code with_share_retry(const std::filesystem::path& target, Op&& op) {
   std::error_code ec = op();
-  for (int delay_ms = 1; ec && is_transient_share_error(ec) && delay_ms <= 512; delay_ms *= 2) {
+  for (int delay_ms = 1; ec && is_transient_share_error(ec, target) && delay_ms <= kShareRetryMaxDelayMs;
+       delay_ms *= 2) {
     std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
     ec = op();
   }
   return ec;
 }
 
-// fopen() reports the same condition through errno (EACCES); same remedy.
+// fopen() folds every Win32 failure into errno EACCES; the OS error is still in
+// _doserrno, so the same distinction applies.
+bool fopen_failed_transiently(const std::filesystem::path& p) noexcept {
+#ifdef _WIN32
+  return errno == EACCES && transient_share_error(static_cast<DWORD>(_doserrno), p);
+#else
+  (void)p;
+  return false;
+#endif
+}
+
 std::FILE* fopen_with_retry(const std::filesystem::path& p, const char* mode) {
   std::FILE* fp = nullptr;
   for (int delay_ms = 1;; delay_ms *= 2) {
@@ -409,7 +501,7 @@ std::FILE* fopen_with_retry(const std::filesystem::path& p, const char* mode) {
 #else
     fp = std::fopen(p.c_str(), mode);
 #endif
-    if (fp != nullptr || errno != EACCES || delay_ms > 512) return fp;
+    if (fp != nullptr || !fopen_failed_transiently(p) || delay_ms > kShareRetryMaxDelayMs) return fp;
     std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
   }
 }
@@ -468,7 +560,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!q) return fail(q.error());
       auto full = resolve(q->path);
       if (!full) return reject(full.error(), q->path);
-      const std::error_code ec = with_share_retry([&] {
+      const std::error_code ec = with_share_retry(*full, [&] {
         std::error_code e;
         fs::resize_file(*full, q->size, e);
         return e;
@@ -496,7 +588,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       std::error_code ec;
       if (fs::is_directory(*full, ec)) return reject(Errc::IsADirectory, q->path);
       bool removed = false;
-      ec = with_share_retry([&] {
+      ec = with_share_retry(*full, [&] {
         std::error_code e;
         removed = fs::remove(*full, e);
         return e;
@@ -525,7 +617,7 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       auto to = resolve(q->to);
       if (!from) return reject(from.error(), q->from);
       if (!to) return reject(to.error(), q->to);
-      const std::error_code ec = with_share_retry([&] {
+      const std::error_code ec = with_share_retry(*to, [&] {
         std::error_code e;
         fs::rename(*from, *to, e);
         return e;

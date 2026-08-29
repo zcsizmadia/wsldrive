@@ -70,6 +70,7 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
 
 Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
   const auto t0 = std::chrono::steady_clock::now();
+  std::lock_guard serialise(snapshot_mu_);  // see snapshot_mu_
   {
     // From here until the tree is replaced, apply_invalidation() also records
     // every batch so the ones the snapshot does not include can be replayed.

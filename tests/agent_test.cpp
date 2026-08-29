@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -122,13 +123,14 @@ TEST_F(AgentTest, ReadAttributes) {
 class LoopbackServer {
  public:
   explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20), std::string token = {},
-                          std::chrono::milliseconds handshake_timeout = 10s)
+                          std::chrono::milliseconds handshake_timeout = 10s, std::size_t max_expanded = 100000)
       : server_({.root = std::move(root),
                  .watch = watch,
                  .coalescer = {},
                  .snapshot_chunk_bytes = chunk_bytes,
                  .token = std::move(token),
-                 .handshake_timeout = handshake_timeout}) {
+                 .handshake_timeout = handshake_timeout,
+                 .max_expanded_entries = max_expanded}) {
     auto l = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
     if (!l) throw std::runtime_error("bind failed");
     listener_ = std::move(*l);
@@ -468,6 +470,107 @@ TEST_F(AgentTest, SilentPeerIsDroppedAfterTheHandshakeTimeout) {
   ASSERT_TRUE(good->connect().has_value());
   std::this_thread::sleep_for(600ms);  // well past the handshake window
   EXPECT_TRUE(good->ping().has_value()) << "an authenticated session must not be timed out";
+}
+
+TEST_F(AgentTest, PartialPreAuthFrameCannotHoldASession) {
+  // The handshake deadline used to be checked only between frames: a peer that
+  // sent one byte, or a header announcing 64 MiB and nothing more, parked the
+  // session thread in recv forever (and reserved the 64 MiB). 32 of those
+  // locked every real client out; one hung an auto-launched agent for good.
+  LoopbackServer srv(root_, /*watch=*/false, 4u << 20, "s3cret-token", /*handshake_timeout=*/400ms);
+
+  {  // one byte, then silence
+    auto sock = net::connect(srv.endpoint());
+    ASSERT_TRUE(sock.has_value());
+    const std::byte one{0x57};
+    ASSERT_TRUE(sock->send_all(std::span<const std::byte>(&one, 1)).has_value());
+    net::FrameChannel ch(std::move(*sock));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto f = ch.receive(5s);  // the server may say why (Error) before hanging up
+    if (f.has_value()) {
+      EXPECT_EQ(f->header.type, proto::MsgType::Error);
+      f = ch.receive(5s);
+    }
+    ASSERT_FALSE(f.has_value()) << "the session must be closed";
+    EXPECT_NE(f.error(), Errc::Timeout) << "closed, not merely quiet";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 3s);
+  }
+  {  // a header claiming a huge payload, before authenticating
+    auto sock = net::connect(srv.endpoint());
+    ASSERT_TRUE(sock.has_value());
+    std::array<std::byte, proto::kHeaderSize> hdr{};
+    proto::FrameHeader h;
+    h.type = proto::MsgType::Hello;
+    h.payload_len = 32u << 20;
+    proto::encode_header(h, hdr);
+    ASSERT_TRUE(sock->send_all(hdr).has_value());
+    net::FrameChannel ch(std::move(*sock));
+    auto f = ch.receive(5s);
+    if (f.has_value()) f = ch.receive(5s);
+    ASSERT_FALSE(f.has_value()) << "an oversized pre-auth frame must end the session";
+    EXPECT_NE(f.error(), Errc::Timeout);
+  }
+  // Authentication still works, and an authenticated session may send big frames.
+  auto good = connect_client(srv.endpoint());
+  ASSERT_NE(good, nullptr);
+  good->set_auth_token("s3cret-token");
+  ASSERT_TRUE(good->connect().has_value());
+  ASSERT_TRUE(good->fetch_snapshot().has_value());
+  std::vector<std::byte> big(1u << 20, std::byte{'b'});
+  ASSERT_TRUE(good->create_file("big.bin").has_value());
+  EXPECT_TRUE(good->write("big.bin", 0, big).has_value()) << "post-auth frames must not be capped";
+}
+
+TEST_F(AgentTest, RenamedDirectoryExpansionIsChunkedAndCapped) {
+  // One renamed directory used to be described in ONE invalidation frame; a big
+  // enough tree exceeded the frame limit and every peer dropped its connection.
+  // Now the batch is split into frames, and past a budget the peers are told to
+  // Rescan instead of being sent the world.
+  {  // chunking: tiny frames, a directory with many entries
+    LoopbackServer srv(root_, /*watch=*/false, /*chunk_bytes=*/256);
+    auto c = connect_client(srv.endpoint());
+    ASSERT_NE(c, nullptr);
+    ASSERT_TRUE(c->connect().has_value());
+    ASSERT_TRUE(c->fetch_snapshot().has_value());
+    fs::create_directories(root_ / "moved");
+    for (int i = 0; i < 60; ++i) write_file(root_ / "moved" / ("f" + std::to_string(i)), "x");
+    const auto batches_before = c->stats().invalidation_batches;
+    srv.server().notify(FsEvent{FsEventKind::RenamedTo, "moved"});
+    bool complete = false;
+    for (int i = 0; i < 200 && !complete; ++i) {
+      std::this_thread::sleep_for(25ms);
+      complete = c->with_tree([](const MetadataTree& t) {
+        std::size_t n = 0;
+        if (const auto d = t.lookup("moved")) t.for_each_child(*d, [&](NodeId) { ++n; });
+        return n == 60;
+      });
+    }
+    EXPECT_TRUE(complete) << "every entry of the renamed directory must arrive";
+    EXPECT_GT(c->stats().invalidation_batches - batches_before, 1u) << "the expansion should have been split into several frames";
+  }
+  {  // cap: a budget of 5 entries turns the expansion into a Rescan
+    fs::remove_all(root_ / "moved");
+    LoopbackServer srv(root_, /*watch=*/false, 4u << 20, {}, 10s, /*max_expanded=*/5);
+    auto c = connect_client(srv.endpoint());
+    ASSERT_NE(c, nullptr);
+    ASSERT_TRUE(c->connect().has_value());
+    ASSERT_TRUE(c->fetch_snapshot().has_value());
+    std::atomic<bool> saw_rescan{false};
+    c->set_invalidation_hook([&](const proto::InvalidationBatch& b) {
+      for (const auto& op : b.ops)
+        if (op.kind == InvalidationKind::Rescan) saw_rescan = true;
+    });
+    fs::create_directories(root_ / "big");
+    for (int i = 0; i < 20; ++i) write_file(root_ / "big" / ("f" + std::to_string(i)), "x");
+    srv.server().notify(FsEvent{FsEventKind::RenamedTo, "big"});
+    bool complete = false;
+    for (int i = 0; i < 200 && !complete; ++i) {
+      std::this_thread::sleep_for(25ms);
+      complete = c->with_tree([](const MetadataTree& t) { return t.lookup("big/f19").has_value(); });
+    }
+    EXPECT_TRUE(saw_rescan) << "over budget, the peers must be told to rescan";
+    EXPECT_TRUE(complete) << "the rescan must bring the contents in";
+  }
 }
 
 TEST(AuthToken, GeneratesDistinctHexSecrets) {
@@ -960,6 +1063,19 @@ TEST_F(AgentTest, MutationsRetryWhileAnotherProcessBrieflyHoldsTheFile) {
   EXPECT_EQ(read_disk(root_ / "config"), "new");
   EXPECT_FALSE(fs::exists(root_ / "doomed"));
   EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s) << "retry must give up within a reasonable time";
+
+  // A READ-ONLY target is a permanent refusal, not a held-open file: it must
+  // fail fast, not stall the mount for the whole retry budget (git marks its
+  // pack files read-only, so this is a common case).
+  write_file(root_ / "ro.txt", "ro");
+  write_file(root_ / "over.lock", "n");
+  ASSERT_TRUE(::SetFileAttributesW((root_ / "ro.txt").c_str(), FILE_ATTRIBUTE_READONLY));
+  const auto t1 = std::chrono::steady_clock::now();
+  auto refused = c->rename("over.lock", "ro.txt");
+  const auto took = std::chrono::steady_clock::now() - t1;
+  EXPECT_FALSE(refused.has_value()) << "renaming over a read-only file is refused by Windows";
+  EXPECT_LT(took, 150ms) << "a permanent refusal must not be retried for the full budget";
+  ::SetFileAttributesW((root_ / "ro.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
 }
 
 TEST(WslLaunch, BuildsCommand) {

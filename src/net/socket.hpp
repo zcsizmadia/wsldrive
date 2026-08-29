@@ -62,6 +62,10 @@ class Socket {
   [[nodiscard]] Result<std::size_t> recv_some(std::span<std::byte> buf) noexcept;
   /// Receives exactly buf.size() bytes.
   [[nodiscard]] Result<void> recv_exact(std::span<std::byte> buf) noexcept;
+  /// Same, but gives up with Errc::Timeout once `deadline` passes - so a peer
+  /// that trickles bytes cannot park the caller forever.
+  [[nodiscard]] Result<void> recv_exact(std::span<std::byte> buf,
+                                        std::chrono::steady_clock::time_point deadline) noexcept;
   /// Waits until the socket is readable or `timeout` elapses. Returns true if
   /// readable, false on timeout. Lets a receive loop poll a stop flag.
   [[nodiscard]] Result<bool> wait_readable(std::chrono::milliseconds timeout) noexcept;

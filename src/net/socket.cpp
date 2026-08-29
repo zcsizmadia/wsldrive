@@ -227,6 +227,20 @@ Result<void> Socket::recv_exact(std::span<std::byte> buf) noexcept {
   return {};
 }
 
+Result<void> Socket::recv_exact(std::span<std::byte> buf, std::chrono::steady_clock::time_point deadline) noexcept {
+  while (!buf.empty()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return fail(Errc::Timeout);
+    auto ready = wait_readable(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) + std::chrono::milliseconds(1));
+    if (!ready) return fail(ready.error());
+    if (!*ready) return fail(Errc::Timeout);
+    auto n = recv_some(buf);
+    if (!n) return fail(n.error());
+    buf = buf.subspan(*n);
+  }
+  return {};
+}
+
 Result<bool> Socket::wait_readable(std::chrono::milliseconds timeout) noexcept {
   const int n = wait_read(s_, timeout);
   if (n > 0) return true;

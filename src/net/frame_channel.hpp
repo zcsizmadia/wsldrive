@@ -48,6 +48,17 @@ class FrameChannel {
   /// if none did. Once a header starts, the full frame is read (blocking).
   [[nodiscard]] Result<Frame> receive(std::chrono::milliseconds timeout);
 
+  /// Bounds what receive() will accept: frames with a payload above
+  /// `max_payload` are rejected (TooLarge), and once a frame has started
+  /// arriving the rest must be in within `frame_timeout` (0 = no limit). A
+  /// server tightens both until the peer has authenticated - an unauthenticated
+  /// peer must not be able to reserve 64 MiB or park a session thread with a
+  /// half-sent frame.
+  void set_receive_limits(std::uint32_t max_payload, std::chrono::milliseconds frame_timeout) noexcept {
+    max_payload_ = max_payload;
+    frame_timeout_ = frame_timeout;
+  }
+
   void shutdown() noexcept { sock_.shutdown(); }
   void close() noexcept { sock_.close(); }
   [[nodiscard]] bool valid() const noexcept { return sock_.valid(); }
@@ -63,6 +74,8 @@ class FrameChannel {
   std::vector<std::byte> send_buf_;
   std::vector<std::byte> recv_buf_;
   Stats stats_;
+  std::uint32_t max_payload_ = proto::kMaxPayload;
+  std::chrono::milliseconds frame_timeout_{0};
 };
 
 }  // namespace wsld::net
