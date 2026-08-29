@@ -21,7 +21,14 @@ namespace {
 
 std::int64_t to_unix_ns(fs::file_time_type t) noexcept {
   using namespace std::chrono;
+  // Two spellings of the same conversion: MSVC only has clock_cast; libstdc++
+  // has file_clock::to_sys since GCC 11 but clock_cast only since GCC 13, and
+  // the release binaries are built with GCC 12 (for Ubuntu 22.04).
+#ifdef _MSC_VER
   const auto sys = clock_cast<system_clock>(t);
+#else
+  const auto sys = file_clock::to_sys(t);
+#endif
   return duration_cast<nanoseconds>(sys.time_since_epoch()).count();
 }
 
