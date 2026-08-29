@@ -45,8 +45,10 @@ class RemoteRoot {
     std::uint64_t read_miss_fetch_ns = 0;
     std::uint64_t prefetch_files = 0;
     std::uint64_t prefetch_bytes = 0;
-    // Snapshots re-fetched because the agent's watcher overflowed (Rescan).
+    // Snapshots re-fetched because the agent's watcher overflowed (Rescan), and
+    // re-fetches that failed (the mirror is then stale until the next one).
     std::uint64_t rescans = 0;
+    std::uint64_t rescan_failures = 0;
   };
 
   using InvalidationHook = std::function<void(const proto::InvalidationBatch&)>;

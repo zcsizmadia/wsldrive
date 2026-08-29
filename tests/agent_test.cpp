@@ -5,6 +5,10 @@
 #include "platform/watcher.hpp"
 #ifdef _WIN32
 #include "platform/win/wsl_launch.hpp"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
 #include "platform/linux/win_launch.hpp"
 #endif
@@ -626,6 +630,14 @@ TEST_F(AgentTest, WriteThroughMutations) {
   EXPECT_TRUE(c->with_tree([](const MetadataTree& t) {
     return !t.lookup("top.txt").has_value() && t.lookup("top2.txt").has_value();
   }));
+  // Renaming a directory must carry its subtree in the mirror - the file inside
+  // is still there on disk, so it had better still be visible.
+  ASSERT_TRUE(c->rename("sub2", "Docs/moved").has_value());
+  EXPECT_EQ(read_disk(root_ / "Docs" / "moved" / "x.txt"), "data");
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) {
+    return !t.lookup("sub2").has_value() && t.lookup("Docs/moved/x.txt").has_value();
+  })) << "the renamed directory lost its contents in the mirror";
+  ASSERT_TRUE(c->rename("Docs/moved", "sub2").has_value());  // put it back for the checks below
 
   // unlink + rmdir (rmdir refuses non-empty).
   EXPECT_EQ(c->rmdir("sub2").error(), Errc::AlreadyExists);  // directory_not_empty
@@ -822,6 +834,20 @@ TEST_F(AgentTest, LiveInvalidationsReachTheClient) {
   EXPECT_TRUE(client->with_tree([](const MetadataTree& t) {
     return !t.lookup("README.md").has_value() && t.lookup("README.rst").has_value();
   }));
+
+  // Rename a DIRECTORY behind the client's back. The watcher reports only the
+  // directory; the agent must enumerate what it brought along, or the mirror
+  // shows an empty directory until remount.
+  fs::rename(root_ / "src", root_ / "src_moved");
+  ASSERT_TRUE(wait_for([](const auto& ops) {
+    for (const auto& op : ops)
+      if (op.kind == InvalidationKind::Upsert && op.path == "src_moved/main.cpp") return true;
+    return false;
+  })) << "the renamed directory's contents were never announced";
+  EXPECT_TRUE(client->with_tree([](const MetadataTree& t) {
+    return !t.lookup("src/main.cpp").has_value() && t.lookup("src_moved/main.cpp").has_value() &&
+           t.lookup("src_moved/new_file.cpp").has_value();
+  }));
   EXPECT_GE(client->stats().invalidation_batches, 1u);
   EXPECT_GT(client->stats().generation, 1u);
 }
@@ -896,6 +922,46 @@ TEST_F(AgentTest, SnapshotReplaysInvalidationsThatArriveDuringTheFetch) {
 }
 
 #ifdef _WIN32
+TEST_F(AgentTest, MutationsRetryWhileAnotherProcessBrieflyHoldsTheFile) {
+  // Windows: the search indexer or an antivirus scanner opens a just-written
+  // file for a moment without FILE_SHARE_DELETE. A rename or delete landing in
+  // that window fails with a sharing violation - which is precisely git's
+  // lock-file dance, and it made `git init` abort on the mount one run in three.
+  // The agent must ride it out the way Git for Windows does.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  write_file(root_ / "config.lock", "new");
+  write_file(root_ / "config", "old");
+  write_file(root_ / "doomed", "x");
+
+  // Hold both targets open with read sharing only, then let go after a while.
+  auto hold = [&](const fs::path& p) {
+    return ::CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  };
+  HANDLE h1 = hold(root_ / "config");
+  HANDLE h2 = hold(root_ / "doomed");
+  ASSERT_NE(h1, INVALID_HANDLE_VALUE);
+  ASSERT_NE(h2, INVALID_HANDLE_VALUE);
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(150ms);
+    ::CloseHandle(h1);
+    ::CloseHandle(h2);
+  });
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto renamed = c->rename("config.lock", "config");
+  auto unlinked = c->unlink("doomed");
+  releaser.join();
+  EXPECT_TRUE(renamed.has_value()) << "rename over a briefly-held file must succeed: " << (renamed ? "" : to_string(renamed.error()));
+  EXPECT_TRUE(unlinked.has_value()) << "delete of a briefly-held file must succeed";
+  EXPECT_EQ(read_disk(root_ / "config"), "new");
+  EXPECT_FALSE(fs::exists(root_ / "doomed"));
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s) << "retry must give up within a reasonable time";
+}
+
 TEST(WslLaunch, BuildsCommand) {
   const std::string cmd = platform::build_wsl_command(
       {.distro = "Ubuntu", .agent_path = "/opt/wsldrived", .wsl_root = "/home/u/proj", .port = 51789});

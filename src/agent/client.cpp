@@ -476,7 +476,11 @@ void RemoteRoot::rescan_loop() {
     // fetch_snapshot() replaces the mirror and replays whatever changed while
     // the request was in flight, so the tree is current again — not merely as
     // of the moment the agent started scanning.
-    if (!fetch_snapshot()) continue;  // connection gone or a bad reply; nothing more to do here
+    if (!fetch_snapshot()) {  // connection gone or a bad reply; nothing more to do here
+      std::lock_guard s(stats_mu_);
+      ++stats_.rescan_failures;
+      continue;
+    }
     {
       // Directories may have changed without per-path events, so let the
       // read-ahead visit them again on the next miss.
@@ -630,15 +634,19 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
   if ((*p)->type != proto::MsgType::Ok) return fail(Errc::ProtocolError);
   drop_cached(from);
   drop_cached(to);
+  const std::string nfrom = normalize_path(from);
+  const std::string nto = normalize_path(to);
+  if (nfrom == nto) return {};  // the OS treated it as a no-op; so does the mirror
   std::unique_lock lock(tree_mu_);
-  Attributes moved{.size = 0, .mtime_ns = 0, .mode = 0644, .kind = NodeKind::File};
-  bool have = false;
-  if (const auto id = tree_.lookup(from, LookupMode::Exact)) {
-    moved = tree_.node(*id).attr;
-    have = true;
-  }
-  (void)tree_.remove_path(from);
-  if (have) (void)tree_.upsert_path(to, moved);
+  (void)tree_.remove_path(nto);  // rename replaces whatever was at the destination
+  const auto id = tree_.lookup(nfrom, LookupMode::Exact);
+  if (!id) return {};  // not mirrored (yet); the watcher's invalidation will add it
+  // Move the NODE, not just its attributes: a renamed directory keeps its whole
+  // subtree, and re-creating it empty at the new path would hide everything in
+  // it until the next remount.
+  const auto [parent, leaf] = split_parent(nto);
+  const auto new_parent = parent.empty() ? Result<NodeId>(tree_.root()) : tree_.ensure_directory_path(parent);
+  if (!new_parent || !tree_.rename(*id, *new_parent, leaf)) (void)tree_.remove_path(nfrom);  // best effort
   return {};
 }
 

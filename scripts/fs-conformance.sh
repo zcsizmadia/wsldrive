@@ -65,7 +65,7 @@ check "truncate"               "truncate -s 3 '$MNT/a.txt' && [ \$(stat -c%s '$M
 check "mkdir -p (nested)"      "mkdir -p '$MNT/d/sub/deeper'"
 check "readdir sees entries"   "ls '$MNT/d/sub' >/dev/null && ls '$MNT' | grep -q a.txt"
 check "rename file"            "mv '$MNT/a.txt' '$MNT/d/b.txt' && [ -f '$MNT/d/b.txt' ]"
-check "rename directory"       "mv '$MNT/d/sub' '$MNT/d/sub2' && [ -d '$MNT/d/sub2' ]"
+check "rename directory keeps contents" "mv '$MNT/d/sub' '$MNT/d/sub2' && [ -d '$MNT/d/sub2/deeper' ]"
 check "unlink"                 "cp '$MNT/d/b.txt' '$MNT/gone.txt' && rm '$MNT/gone.txt' && [ ! -e '$MNT/gone.txt' ]"
 check "rmdir"                  "rmdir '$MNT/d/sub2/deeper' && [ ! -d '$MNT/d/sub2/deeper' ]"
 check "missing file is ENOENT" "! cat '$MNT/nope.txt'"
@@ -75,6 +75,16 @@ check "chmod is accepted"      "chmod 755 '$MNT/d/b.txt'"
 check "chmod on a directory"   "chmod 700 '$MNT/d'"
 check "touch (utimens)"        "touch '$MNT/d/b.txt'"
 check "touch creates a file"   "touch '$MNT/new.txt' && [ -f '$MNT/new.txt' ]"
+
+echo "== changes made behind the mount's back (watcher) =="
+ext_rename() {   # a directory renamed on the backing store must show its contents on the mount
+  mkdir -p "$WORK/ext/inner" && echo x > "$WORK/ext/inner/f" || return 1
+  sleep 0.5
+  mv "$WORK/ext" "$WORK/ext2" || return 1
+  for _ in $(seq 1 50); do [ -f "$MNT/ext2/inner/f" ] && return 0; sleep 0.1; done
+  return 1
+}
+check "external dir rename shows contents" "ext_rename"
 
 echo "== symlinks served by the agent =="
 check "symlink is a symlink"      "[ -L '$MNT/lnk' ]"
@@ -94,7 +104,7 @@ check "many small files"       "many_files"
 check "seek + partial read"    "[ \"\$(dd if='$MNT/d/b.txt' bs=1 skip=1 count=1 2>/dev/null)\" = e ]"
 
 echo "== a multi-step tool workload (git exercises many ops at once) =="
-check "git init"               "git init -q '$MNT/repo'"
+check "git init"               "git init -q '$MNT/repo' && [ -f '$MNT/repo/.git/HEAD' ]"
 check "git add + commit"       "cd '$MNT/repo' && echo x > f.txt && git add . && git -c user.email=a@b -c user.name=c commit -qm first"
 check "git status is clean"    "cd '$MNT/repo' && [ -z \"\$(git status --porcelain)\" ]"
 check "git log reads back"     "cd '$MNT/repo' && git log --oneline | grep -q first"
