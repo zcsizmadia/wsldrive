@@ -79,54 +79,29 @@ wsldrive mount /tmp/win --win-root 'C:/project' --win-agent /mnt/c/.../wsldrived
 
 Direction A is also fast over plain loopback TCP and does not require hvsocket.
 
-## Real-world: cloning dotnet/runtime with git
+## What wsldrive speeds up, and what it does not
 
-The synthetic numbers above use a generated tree. This one uses a real repository
-and the tool developers actually wait on: **dotnet/runtime, 58,082 files, 952 MB**
-(shallow clone). Every arm clones from a *local source on ext4*, so the network is
-out of the measurement and what is left is the target filesystem. "walk" is
-`find <tree> -type f | wc -l`.
+The cost of the OS cross-boundary paths is **per operation**, not per byte, so
+that is where the gains are and are not:
 
-**WSL's git writing to a Windows folder** (Direction B, over Hyper-V sockets):
+- **Big wins — metadata and many-small-file work.** `stat`, `readdir`, negative
+  lookups and opens are answered from the client's in-RAM mirror without
+  crossing the boundary at all, so enumerating or scanning a tree is many times
+  faster. Anything that touches thousands of files (indexers, build systems,
+  search, status-style commands) is in this category.
+- **Little or no win — bulk sequential I/O.** Streaming a handful of large files
+  is something the built-in paths already do at reasonable speed; there is no
+  per-file overhead left for wsldrive to remove, and measurements there come out
+  roughly level.
+- **Not the point — one-off bulk transfers.** If the goal is simply to get a
+  copy of a tree onto the other side once, an archive stream (one sequential
+  transfer, then unpack natively) beats any filesystem doing the work file by
+  file. wsldrive exists for trees you keep *working with* across the boundary,
+  where copying is not an option because both sides must see the same live
+  files.
 
-| target | `git clone` | walk |
-|--------|------------:|-----:|
-| native ext4 (in WSL, reference floor) | 6.2 s | 0.1 s |
-| `/mnt/c` (virtiofs) | 272.6 s | 13.1 s |
-| **wsldrive** | **91.5 s** (3.0× faster) | **1.4 s** (9.4× faster) |
-
-Targeting the Windows filesystem from WSL costs **44×** on a clone with `/mnt/c`;
-wsldrive brings that to ~15×. The walk gap is larger (9.4×) because metadata is
-served from the client's RAM mirror, while a clone is dominated by writes, which
-are write-through and must cross the boundary either way. Neither approaches
-native ext4 — the goal is to beat the boundary path, not to remove the boundary.
-
-**Windows git working on a repo that lives in WSL** (Direction A) — the same
-58k-file repo, reached two ways. `git log --oneline -1` is there to show the
-fixed per-command overhead:
-
-| access path | walk | `git status` | `git log -1` |
-|-------------|-----:|-------------:|-------------:|
-| `\\wsl.localhost` (Plan 9) | 28.0 s | 2.2 s | 0.10 s |
-| **wsldrive `W:`** | **5.7 s** (4.9×) | **1.1 s** (2.0×) | **0.06 s** (1.7×) |
-
-Enumerating the tree is where the RAM mirror shows most (4.9×); `git status`
-also reads content, so it gains less.
-
-### What this test caught
-
-Running a real tool found two defects that the entire unit-test suite missed,
-both fixed:
-
-- **`chmod` was not implemented**, so `git init` and `git clone` aborted on any
-  mount with `could not set 'core.filemode'`. A git repository could not live on
-  a Direction B mount at all.
-- **Every file reported `uid 0`**, so git refused to operate on repos there with
-  `detected dubious ownership`.
-
-`scripts/fs-conformance.sh` now mounts a filesystem and exercises this class of
-operation (create/rename/truncate/chmod/utimens, data integrity, and a real
-git add/commit/log/branch cycle) so it cannot regress; CI runs it on every push.
+Writes are write-through, so they cross the boundary either way; wsldrive
+reduces the surrounding metadata cost rather than the write itself.
 
 ## Cold reads — prefetch-on-mount
 

@@ -3,9 +3,8 @@
 #
 # Exercises the operations real tools depend on, against a live mount, and fails
 # if any regress. Unit tests cannot catch these: a missing FUSE callback only
-# shows up when something actually calls it. This exists because `chmod` was
-# unimplemented, which made `git init`/`git clone` abort on a mount ("could not
-# set 'core.filemode'") even though every unit test passed.
+# shows up when something actually calls it — an unimplemented chmod, say,
+# passes the entire unit suite and then breaks any tool that probes file modes.
 #
 # Self-contained: starts an agent serving a temp directory and mounts it with the
 # Linux client over loopback, so it runs anywhere libfuse3 is available (including
@@ -64,7 +63,7 @@ check "unlink"                 "cp '$MNT/d/b.txt' '$MNT/gone.txt' && rm '$MNT/go
 check "rmdir"                  "rmdir '$MNT/d/sub2/deeper' && [ ! -d '$MNT/d/sub2/deeper' ]"
 check "missing file is ENOENT" "! cat '$MNT/nope.txt'"
 
-echo "== metadata operations (the chmod class of bug) =="
+echo "== metadata operations =="
 check "chmod is accepted"      "chmod 755 '$MNT/d/b.txt'"
 check "chmod on a directory"   "chmod 700 '$MNT/d'"
 check "touch (utimens)"        "touch '$MNT/d/b.txt'"
@@ -81,7 +80,7 @@ many_files() {   # a loop is clearer as a function than as a quoted eval string
 check "many small files"       "many_files"
 check "seek + partial read"    "[ \"\$(dd if='$MNT/d/b.txt' bs=1 skip=1 count=1 2>/dev/null)\" = e ]"
 
-echo "== git: the workflow that found the chmod bug =="
+echo "== a multi-step tool workload (git exercises many ops at once) =="
 check "git init"               "git init -q '$MNT/repo'"
 check "git add + commit"       "cd '$MNT/repo' && echo x > f.txt && git add . && git -c user.email=a@b -c user.name=c commit -qm first"
 check "git status is clean"    "cd '$MNT/repo' && [ -z \"\$(git status --porcelain)\" ]"
