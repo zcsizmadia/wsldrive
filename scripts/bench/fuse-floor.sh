@@ -39,7 +39,18 @@ up=no
 for _ in $(seq 1 100); do mountpoint -q "$MP" && { up=yes; break; }; sleep 0.1; done
 if [ "$up" != yes ]; then echo "MOUNT FAILED"; cat /tmp/fb-mount.log /tmp/fb-agent.log; exit 1; fi
 
-ms() { local S E; S=$(date +%s%N); "$@" >/dev/null 2>&1; E=$(date +%s%N); echo $(( (E-S)/1000000 )); }
+# Wall-clock timing, retried on a non-positive result: WSL's clock is NTP-synced
+# and can step backwards between the two reads, which showed up as a negative
+# sample that would then sort to the front of a median.
+ms() {
+  local S E d i
+  for i in 1 2 3; do
+    S=$(date +%s%N); "$@" >/dev/null 2>&1; E=$(date +%s%N)
+    d=$(( (E-S)/1000000 ))
+    if [ "$d" -gt 0 ]; then echo "$d"; return 0; fi
+  done
+  echo "$d"  # give up and report it; a caller can see it is not a real timing
+}
 walk()    { find "$MP" -type f | wc -l; }
 readall() { find "$MP" -type f -print0 | xargs -0 cat; }
 statall() { find "$MP" -type f -exec stat -c %s {} +; }

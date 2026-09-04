@@ -141,3 +141,63 @@ case.
 - **Directory read-ahead**: on a read miss, the file's directory is bulk-fetched
   in one `ReadMany` request (with an async prefetcher for large directories), so
   a sequential reader pays one round-trip per directory rather than per file.
+
+## Mount-side serving floor (kernel page cache + FUSE connection tuning)
+
+The numbers above measure the whole path, so the boundary dominates them and the
+mount's own cost is hard to see. `scripts/bench/fuse-floor.sh` isolates it: the
+agent and the mount both run **inside WSL** and talk over loopback TCP
+(sub-millisecond), so what is left is the FUSE upcall cost, the client's RAM
+cache and the kernel page cache. 3000 files, medians of 5 warm runs, three
+interleaved A/B pairs.
+
+| workload (Direction B mount, libfuse) | before | after | speedup |
+|---------------------------------------|-------:|------:|--------:|
+| warm read (whole tree)                | 424 ms | 233 ms | **1.8×** |
+| warm read, 8 readers in parallel      | 151 ms |  83 ms | **1.8×** |
+| cold read (first pass)                | ~449 ms | 439 ms | 1.0× |
+| walk / stat                           | 11-15 ms | 11-15 ms | unchanged |
+
+What changed: the mount had `kernel_cache = 0`, so the kernel dropped a file's
+pages on every open and re-asked the daemon for bytes the client already held in
+RAM. It now uses `auto_cache` (pages kept, revalidated against `(mtime, size)`
+on the next open — and `getattr` is answered from the in-RAM mirror, so the
+check costs no round-trip), plus deliberate `max_write` / `max_readahead` /
+`max_background` and splice negotiation instead of defaults. Metadata is
+untouched because it was already served from RAM, and cold reads are bounded by
+the boundary fetch rather than by the mount.
+
+**Direction A (WinFsp) is unchanged** by this: 259-291 ms before, 256-263 ms
+after, inside the run-to-run variance. Its baseline was already at the level
+Direction B has now reached, which is what you would expect if the Windows cache
+manager was already retaining the pages that libfuse was throwing away.
+
+### Measured and rejected: `fuse_loop_mt`
+
+The single-threaded `fuse_loop()` looked like an obvious bottleneck — it retires
+one request at a time — so the multi-threaded loop was tried and measured:
+
+| config | warm read | 8 parallel |
+|---|--:|--:|
+| baseline | 443 ms | 150 ms |
+| `fuse_loop_mt` only | 465 ms | 222 ms |
+| `auto_cache` + tuning + `fuse_loop_mt` | 289 ms | 117 ms |
+| **`auto_cache` + tuning, single-threaded** | **210 ms** | **78 ms** |
+
+It lost in every configuration, so it was not adopted. Behind the page cache the
+daemon is barely on the request path, and the requests that do reach it spend
+their time under `RemoteRoot`'s single cache mutex, which more threads only
+contend for. The case this comparison cannot see is parallel *cold* reads across
+a real boundary; that is worth re-measuring after the cache-lock contention is
+addressed, and the loop carries a comment saying so.
+
+### Staleness window
+
+Letting the kernel keep pages puts a bound on how late a far-side change can be
+noticed. The mount punches the affected pages out as invalidations arrive; with
+a file held open across a far-side rewrite, kernel 6.18 served:
+
+| | stale for |
+|---|--:|
+| with the invalidation punch | 5 ms |
+| without it (attribute timeout only) | 981 ms |
