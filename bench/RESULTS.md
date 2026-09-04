@@ -153,10 +153,10 @@ interleaved A/B pairs.
 
 | workload (Direction B mount, libfuse) | before | after | speedup |
 |---------------------------------------|-------:|------:|--------:|
-| warm read (whole tree)                | 424 ms | 233 ms | **1.8×** |
-| warm read, 8 readers in parallel      | 151 ms |  83 ms | **1.8×** |
-| cold read (first pass)                | ~449 ms | 439 ms | 1.0× |
-| walk / stat                           | 11-15 ms | 11-15 ms | unchanged |
+| warm read (whole tree)                | 400 ms | 222 ms | **1.8×** |
+| warm read, 8 readers in parallel      | 149 ms |  78 ms | **1.9×** |
+| cold read (first pass)                | ~400 ms | ~380 ms | 1.05× |
+| walk / stat                           | 10-15 ms | 10-15 ms | unchanged |
 
 What changed: the mount had `kernel_cache = 0`, so the kernel dropped a file's
 pages on every open and re-asked the daemon for bytes the client already held in
@@ -167,10 +167,20 @@ check costs no round-trip), plus deliberate `max_write` / `max_readahead` /
 untouched because it was already served from RAM, and cold reads are bounded by
 the boundary fetch rather than by the mount.
 
-**Direction A (WinFsp) is unchanged** by this: 259-291 ms before, 256-263 ms
-after, inside the run-to-run variance. Its baseline was already at the level
-Direction B has now reached, which is what you would expect if the Windows cache
-manager was already retaining the pages that libfuse was throwing away.
+**Direction A (WinFsp) is unchanged** by this — 274 ms before, 274 ms after,
+median of six runs each. Its baseline was already at the level Direction B has
+now reached, which is what you would expect if the Windows cache manager was
+already retaining the pages that libfuse was throwing away.
+
+That one needed care to establish, and the trap is worth writing down. Run the
+pairs one way round (before, then after) and Direction A looks **12% faster**
+after the change; run them the other way (after, then before) and it looks
+faster *before*. Whichever variant runs **second in a pair** measures ~10%
+quicker, because the WSL VM, the agent's page cache and the Windows cache
+manager all keep warming across runs. Only pooling both orderings cancels it,
+and then the two medians land on the same number. A one-directional A/B here
+would have reported a win that does not exist — so alternate the order for
+anything measured through a real mount, not just interleaved pairs.
 
 ### Measured and rejected: `fuse_loop_mt`
 
@@ -201,3 +211,19 @@ a file held open across a far-side rewrite, kernel 6.18 served:
 |---|--:|
 | with the invalidation punch | 5 ms |
 | without it (attribute timeout only) | 981 ms |
+
+### Reproducing these
+
+```bash
+# in WSL, from the repo root
+bash scripts/bench/gen-tree.sh ~/fuse-floor-bench 3000
+bash scripts/bench/fuse-floor.sh "$PWD/build/linux-release/src/tools" ~/fuse-floor-bench 51901 5
+```
+
+For an A/B, build the comparison commit into a separate tree
+(`git worktree add /tmp/base <ref>`) and run the same script against both binary
+directories in **alternating order**, for the reason above. Pick ports outside
+Windows' reserved TCP ranges — they are dynamic, so read them off
+`netsh interface ipv4 show excludedportrange protocol=tcp` rather than assuming
+a fixed window; a reserved port shows up as `MOUNT FAILED`, because WSL2 honours
+the reservation too.
