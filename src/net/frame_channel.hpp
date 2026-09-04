@@ -59,6 +59,9 @@ class FrameChannel {
     frame_timeout_ = frame_timeout;
   }
 
+  /// Bounds how long one send may block; see Socket::set_send_timeout.
+  void set_send_timeout(std::chrono::milliseconds timeout) noexcept { sock_.set_send_timeout(timeout); }
+
   void shutdown() noexcept { sock_.shutdown(); }
   void close() noexcept { sock_.close(); }
   [[nodiscard]] bool valid() const noexcept { return sock_.valid(); }

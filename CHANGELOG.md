@@ -1,6 +1,41 @@
 # Changelog
 
-## v0.9.0 — first public release
+## Unreleased
+
+### Performance
+
+- **The mount lets the kernel cache file pages.** `auto_cache` replaces
+  `kernel_cache = 0`, so repeat reads are served from the page cache instead of
+  re-entering the daemon for bytes the client already holds in RAM; the pages
+  are revalidated against `(mtime, size)` on the next open, and a background
+  thread drops them as soon as an invalidation says the far side changed. The
+  FUSE connection (`max_write`, `max_readahead`, `max_background`, splice and
+  parallel-dirops capabilities) is now negotiated deliberately rather than left
+  at its defaults. Measured on the Direction B mount with the boundary taken out
+  of the picture: **warm reads 1.8× faster, eight parallel readers 1.8× faster**
+  (`bench/RESULTS.md`). Direction A is unchanged — WinFsp was already caching.
+- **Reads resolve the way the mount does.** The mount looks paths up
+  case-insensitively but the client resolved them exactly, so a program opening
+  `readme.md` for a stored `README.md` bypassed the read cache and the
+  read-ahead entirely on every such open.
+
+### Fixed
+
+- A directory that is removed or renamed now takes its subtree's cached file
+  contents with it, instead of leaving them resident and unreachable.
+- `write()` and `truncate()` move the mirror's version on, so a read-ahead
+  already in flight cannot cache pre-write bytes that then pass validation.
+- A symlink reports its target's length as its size, not 0. The
+  `malloc(st_size + 1)` + `readlink()` idiom was getting a zero-length buffer.
+- A peer that authenticates and then stops reading can no longer stall
+  invalidation delivery to every other peer, or hang the agent's shutdown.
+- A watcher that keeps overflowing can no longer drive back-to-back
+  re-snapshots; they are spaced by a doubling back-off and the replay buffer is
+  bounded. The Windows watcher's own buffer grows from 64 KiB to 1 MiB, which
+  is what decides how often an overflow happens at all.
+
+## v0.9.0
+ — first public release
 
 Native-speed file access across the WSL2 boundary, in both directions, with an
 installer that leaves you with a drive that comes back after every reboot.

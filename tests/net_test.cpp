@@ -3,8 +3,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace wsld::net {
 namespace {
@@ -117,6 +119,35 @@ TEST(Socket, TcpLoopbackFrames) {
   ch.shutdown();
   ch.close();
   server.join();
+}
+
+TEST(Socket, SendToAPeerThatStopsReadingTimesOutInsteadOfBlocking) {
+  // The agent bounds its broadcast sends this way. Without the deadline a peer
+  // that authenticates and then stops reading fills its socket buffer and parks
+  // the sender forever - which stalled invalidation delivery to every other
+  // peer and hung the agent's shutdown.
+  auto listener = Listener::bind(*Endpoint::parse("tcp://127.0.0.1:0"));
+  ASSERT_TRUE(listener.has_value()) << last_socket_error();
+
+  auto client = connect(listener->local());
+  ASSERT_TRUE(client.has_value());
+  client->set_receive_buffer(1024);  // a tiny window, and nothing ever reads it
+
+  auto peer = listener->accept(std::chrono::seconds(5));
+  ASSERT_TRUE(peer.has_value());
+  peer->set_send_timeout(std::chrono::milliseconds(200));
+
+  // Push far more than the far end can buffer. Without the deadline this never
+  // returns; with it, one send runs out of time and reports it.
+  const std::vector<std::byte> chunk(1u << 20);
+  const auto t0 = std::chrono::steady_clock::now();
+  Result<void> r{};
+  for (int i = 0; i < 64 && r.has_value(); ++i) r = peer->send_all(chunk);
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  ASSERT_FALSE(r.has_value()) << "a peer that never reads must not absorb 64 MiB";
+  EXPECT_EQ(r.error(), Errc::Timeout) << "and the failure must be distinguishable from a broken pipe";
+  EXPECT_LT(elapsed, std::chrono::seconds(30)) << "the send must give up on its own deadline";
 }
 
 TEST(Socket, ConnectRefused) {

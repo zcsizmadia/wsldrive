@@ -62,6 +62,12 @@ class RemoteRoot {
   /// Set before connect().
   void set_auth_token(std::string token) { token_ = std::move(token); }
 
+  /// How this client resolves paths against the mirror. It must match what the
+  /// caller resolves with: the mount looks paths up case-insensitively, and a
+  /// read that resolved one way but keyed its cache the other missed the cache
+  /// on every differently-spelled open (and, against a Linux agent, failed).
+  void set_lookup_mode(LookupMode mode) noexcept { lookup_mode_.store(mode, std::memory_order_relaxed); }
+
   /// Starts the reader thread and performs the Hello handshake.
   [[nodiscard]] Result<proto::Hello> connect(std::chrono::milliseconds timeout = std::chrono::seconds(10));
 
@@ -171,7 +177,32 @@ class RemoteRoot {
   void apply_invalidation(std::span<const std::byte> payload);
   void fail_all_pending();
   void drop_cached(std::string_view path);  // evict one read-cache entry
+  // Evicts every cached entry at or below `dir`. A directory that is removed or
+  // renamed away takes its subtree's cached contents with it; the cache is
+  // path-keyed, so those entries would otherwise stay resident and unreachable
+  // until LRU pressure happened to evict them.
+  void drop_cached_prefix(std::string_view dir);
   void cache_put(std::string path, std::int64_t mtime_ns, std::uint64_t size, std::vector<std::byte> data);
+
+  LookupMode mode() const noexcept { return lookup_mode_.load(std::memory_order_relaxed); }
+
+  // What a read needs to know about a path: whether it is a cacheable file, the
+  // version to validate against, and the key its cache entry should use.
+  struct ReadTarget {
+    bool is_file = false;
+    std::int64_t mtime_ns = 0;
+    std::uint64_t size = 0;
+    // Set only when `path` was not already spelled the way the tree stores it,
+    // so the common case costs no allocation.
+    std::string canonical;
+  };
+  [[nodiscard]] ReadTarget resolve_for_read(std::string_view path) const;
+
+  // A local mtime for an optimistic mirror update, strictly newer than
+  // `previous`. Its only job is to differ from the value a concurrent read may
+  // already have cached under, so that entry fails validation instead of
+  // serving pre-write bytes; the watcher's event replaces it with the real one.
+  [[nodiscard]] static std::int64_t bump_mtime(std::int64_t previous) noexcept;
 
   // Background read-ahead: on a read miss, the file's directory is queued and a
   // worker bulk-fetches its not-yet-cached siblings so later reads hit the cache.
@@ -192,6 +223,9 @@ class RemoteRoot {
   std::mutex pending_mu_;
   std::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending_;
 
+  // Atomic because the mount sets it after connect() has started the reader.
+  std::atomic<LookupMode> lookup_mode_{LookupMode::Exact};
+
   mutable std::shared_mutex tree_mu_;
   MetadataTree tree_;
   // While a snapshot request is in flight, invalidations are applied to the old
@@ -200,6 +234,12 @@ class RemoteRoot {
   // by tree_mu_ (write side).
   bool snapshot_in_flight_ = false;
   std::vector<proto::InvalidationBatch> snapshot_replay_;
+  // Cap on buffered batches: a watcher that keeps overflowing would otherwise
+  // grow this without bound for as long as the snapshot request is in flight.
+  // Past the cap the replay is known to be incomplete, so the snapshot it feeds
+  // cannot be trusted and another rescan is scheduled instead.
+  static constexpr std::size_t kMaxSnapshotReplay = 4096;
+  bool snapshot_replay_overflow_ = false;
   // One snapshot fetch at a time: the mount-time fetch and a Rescan-triggered
   // one overlapping would each end the other's replay recording.
   std::mutex snapshot_mu_;
@@ -217,6 +257,15 @@ class RemoteRoot {
   std::condition_variable rs_cv_;
   bool rs_requested_ = false;  // a Rescan arrived; coalesces any number of them
   bool rs_stop_ = false;
+  // Back-off between full re-snapshots. Each load_snapshot holds tree_mu_
+  // exclusively and blocks every mount operation behind it, so a watcher that
+  // overflows repeatedly (one `npm install` fills the buffer) must not be able
+  // to run them back to back. Doubles per consecutive rescan, reset by a quiet
+  // spell.
+  static constexpr std::chrono::milliseconds kRescanMinInterval{500};
+  static constexpr std::chrono::milliseconds kRescanMaxInterval{30'000};
+  std::chrono::steady_clock::time_point rs_last_{};
+  std::chrono::milliseconds rs_backoff_{kRescanMinInterval};
 
   mutable std::mutex stats_mu_;
   Stats stats_;

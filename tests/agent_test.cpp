@@ -123,13 +123,15 @@ TEST_F(AgentTest, ReadAttributes) {
 class LoopbackServer {
  public:
   explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20), std::string token = {},
-                          std::chrono::milliseconds handshake_timeout = 10s, std::size_t max_expanded = 100000)
+                          std::chrono::milliseconds handshake_timeout = 10s, std::size_t max_expanded = 100000,
+                          std::chrono::milliseconds broadcast_timeout = 5s)
       : server_({.root = std::move(root),
                  .watch = watch,
                  .coalescer = {},
                  .snapshot_chunk_bytes = chunk_bytes,
                  .token = std::move(token),
                  .handshake_timeout = handshake_timeout,
+                 .broadcast_timeout = broadcast_timeout,
                  .max_expanded_entries = max_expanded}) {
     auto l = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
     if (!l) throw std::runtime_error("bind failed");
@@ -1054,6 +1056,211 @@ TEST_F(AgentTest, SnapshotReplaysInvalidationsThatArriveDuringTheFetch) {
   }
   EXPECT_TRUE(present) << "an invalidation delivered during the fetch was lost to the tree replacement";
 }
+TEST_F(AgentTest, APeerThatStopsReadingDoesNotStallInvalidationsForTheOthers) {
+  // broadcast() ran on the single flusher thread with no send deadline. A peer
+  // that authenticated and then stopped reading filled its socket buffer and
+  // parked the flusher there for good: no other peer received another
+  // invalidation, and stop() hung joining the flusher.
+  //
+  // End-to-end cover for the two user-visible properties: the other peers keep
+  // receiving, and shutdown still returns. It does not guarantee the send
+  // deadline fires on any given run - whether the churn fills the stuck peer's
+  // buffer depends on how the coalescer batches it. The deadline itself is
+  // covered deterministically by Socket.SendToAPeerThatStopsReadingTimesOut...
+  LoopbackServer srv(root_, /*watch=*/true, 4u << 20, "s3cret-token", 10s, 100000,
+                     /*broadcast_timeout=*/300ms);
+  if (!srv.server().watching()) GTEST_SKIP() << "no filesystem watcher on this platform";
+
+  // The stuck peer. A tiny receive buffer makes the agent's send block after
+  // very little data, so the stall does not need megabytes of churn to provoke.
+  auto stuck_sock = net::connect(srv.endpoint());
+  ASSERT_TRUE(stuck_sock.has_value());
+  stuck_sock->set_receive_buffer(2048);
+  net::FrameChannel stuck(std::move(*stuck_sock));
+  {
+    std::vector<std::byte> pl;
+    proto::Writer w(pl);
+    proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                       .capabilities = 0,
+                                       .agent = "stuck/1",
+                                       .token = "s3cret-token"});
+    ASSERT_TRUE(stuck.send(proto::MsgType::Hello, 1, pl).has_value());
+    auto ack = stuck.receive(5s);  // reads the HelloAck, then never reads again
+    ASSERT_TRUE(ack.has_value());
+    ASSERT_EQ(ack->header.type, proto::MsgType::HelloAck);
+  }
+
+  // A healthy peer, draining normally.
+  auto good = connect_client(srv.endpoint());
+  ASSERT_NE(good, nullptr);
+  good->set_auth_token("s3cret-token");
+  ASSERT_TRUE(good->connect().has_value());
+  ASSERT_TRUE(good->fetch_snapshot().has_value());
+  const std::size_t before = good->with_tree([](const MetadataTree& t) { return t.size(); });
+
+  // Churn well past the stuck peer's buffer. Long names so each op carries real
+  // bytes; whether these arrive as per-path ops or collapse into a Rescan, the
+  // healthy peer's tree has to grow either way.
+  const std::string pad(80, 'p');
+  for (int i = 0; i < 500; ++i) write_file(root_ / ("churn-" + pad + std::to_string(i) + ".txt"), "x");
+
+  bool progressed = false;
+  for (int i = 0; i < 300 && !progressed; ++i) {
+    std::this_thread::sleep_for(50ms);
+    progressed = good->with_tree([](const MetadataTree& t) { return t.size(); }) > before + 400;
+  }
+  EXPECT_TRUE(progressed) << "a peer that stopped reading must not stop delivery to everyone else";
+  // LoopbackServer's destructor calls stop(), which hung here before the fix -
+  // reaching the end of this test is the other half of what is being asserted.
+}
+
+TEST_F(AgentTest, ReadCacheHitsOnADifferentlyCasedSpelling) {
+  // The mount resolves case-insensitively (a Windows volume has to), so a
+  // program opening `readme.md` for a stored `README.md` reaches the client with
+  // its own spelling. Keyed on that spelling the cache missed on every such
+  // open, the read-ahead was bypassed, and the request went out for a path a
+  // case-sensitive agent does not have.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  c->set_lookup_mode(LookupMode::CaseInsensitive);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto str = [](const std::vector<std::byte>& v) {
+    return std::string(reinterpret_cast<const char*>(v.data()), v.size());
+  };
+
+  auto stored = c->read("README.md", 0, 100);  // seeded "# readme\n"
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(str(*stored), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_misses, 1u);
+
+  auto lower = c->read("readme.md", 0, 100);
+  ASSERT_TRUE(lower.has_value()) << "a differently cased path must resolve to the stored file";
+  EXPECT_EQ(str(*lower), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_hits, 1u) << "and be served by the entry the first read cached";
+  EXPECT_EQ(c->stats().read_cache_misses, 1u);
+
+  // read_into() resolves the same way, so it reaches the same entry.
+  std::vector<std::byte> buf(100);
+  auto n = c->read_into("ReadMe.MD", 0, buf);
+  ASSERT_TRUE(n.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(buf.data()), *n), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_hits, 2u);
+}
+
+TEST_F(AgentTest, WriteAndTruncateMoveTheMirrorVersionOn) {
+  // A read-ahead already in flight when a write lands can be holding pre-write
+  // bytes and about to cache them under the old (mtime, size). If the mirror
+  // still agreed with that pair the entry would validate and serve stale
+  // content - until the watcher's event, or for good without a watcher. Moving
+  // the version on makes that entry fail validation instead.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto mtime_of = [&](std::string_view p) {
+    return c->with_tree([&](const MetadataTree& t) -> std::int64_t {
+      const auto id = t.lookup(p);
+      return id ? t.node(*id).attr.mtime_ns : 0;
+    });
+  };
+
+  const std::int64_t before = mtime_of("README.md");
+  ASSERT_TRUE(c->write("README.md", 0, as_bytes("XXXXX")).has_value());  // same length on purpose
+  const std::int64_t after_write = mtime_of("README.md");
+  EXPECT_GT(after_write, before) << "a same-length write must still change the version";
+
+  ASSERT_TRUE(c->truncate("README.md", 3).has_value());
+  EXPECT_GT(mtime_of("README.md"), after_write);
+}
+
+TEST_F(AgentTest, ACaseOnlyRenameKeepsTheDirectoryAndItsSubtree) {
+  // Once paths resolve case-insensitively, the destination of `src` -> `SRC`
+  // resolves to the source. Treating that as "something is already there,
+  // remove it" would delete the very thing being renamed, subtree and all.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  c->set_lookup_mode(LookupMode::CaseInsensitive);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto has = [&](std::string_view p) {
+    return c->with_tree([&](const MetadataTree& t) { return t.lookup(p, LookupMode::Exact).has_value(); });
+  };
+  ASSERT_TRUE(has("src/include/a.hpp"));
+
+  ASSERT_TRUE(c->rename("src", "SRC").has_value());
+  EXPECT_TRUE(has("SRC/include/a.hpp")) << "the subtree must move with the directory, not be deleted";
+  EXPECT_FALSE(has("src/include/a.hpp"));
+}
+
+TEST_F(AgentTest, RenamingADirectoryEvictsItsSubtreeFromTheReadCache) {
+  // The content cache is keyed by path, so moving a directory leaves every
+  // entry below the old prefix cached but unreachable: dead weight against the
+  // byte budget until LRU pressure happened to evict it.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  ASSERT_TRUE(c->read("src/main.cpp", 0, 100).has_value());
+  ASSERT_TRUE(c->read("src/include/a.hpp", 0, 100).has_value());
+  EXPECT_GT(c->stats().read_cache_bytes, 0u);
+
+  ASSERT_TRUE(c->rename("src", "src2").has_value());
+  EXPECT_EQ(c->stats().read_cache_bytes, 0u) << "the subtree's contents must leave the cache with it";
+
+  auto r = c->read("src2/main.cpp", 0, 100);  // still readable under the new path
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->data()), r->size()), "int main() {}\n");
+}
+
+TEST_F(AgentTest, RemovingADirectoryEvictsItsSubtreeFromTheReadCache) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  ASSERT_TRUE(c->read("src/include/a.hpp", 0, 100).has_value());
+  EXPECT_GT(c->stats().read_cache_bytes, 0u);
+
+  ASSERT_TRUE(c->unlink("src/include/a.hpp").has_value());
+  ASSERT_TRUE(c->rmdir("src/include").has_value());
+  EXPECT_EQ(c->stats().read_cache_bytes, 0u);
+}
+
+// Creating a symlink needs a privilege (or Developer Mode) on Windows, so this
+// runs where the rest of the symlink coverage does - see ScannerReportsSymlinks.
+#ifndef _WIN32
+TEST_F(AgentTest, SymlinkSizeIsTheTargetLength) {
+  // POSIX says st_size of a symlink is its target's length, and the readlink
+  // idiom is malloc(st_size + 1): a reported 0 hands the caller a buffer too
+  // small for any target at all.
+  std::error_code ec;
+  constexpr std::string_view kTarget = "main.cpp";
+  fs::create_symlink(kTarget, root_ / "src" / "link_to_main", ec);
+  ASSERT_FALSE(ec);
+  std::vector<std::string> names;
+  std::vector<SnapshotEntry> entries;
+  auto stats = scan_tree(root_, [&](const SnapshotEntry& e) {
+    names.emplace_back(e.name);
+    entries.push_back(e);
+  });
+  ASSERT_TRUE(stats.has_value());
+  for (std::size_t i = 0; i < entries.size(); ++i) entries[i].name = names[i];
+  MetadataTree t;
+  ASSERT_TRUE(t.load_snapshot(entries).has_value());
+  const auto link = t.lookup("src/link_to_main");
+  ASSERT_TRUE(link.has_value());
+  ASSERT_EQ(t.node(*link).attr.kind, NodeKind::Symlink);
+  EXPECT_EQ(t.node(*link).attr.size, kTarget.size());
+}
+#endif
+
 
 #ifdef _WIN32
 TEST_F(AgentTest, MutationsRetryWhileAnotherProcessBrieflyHoldsTheFile) {

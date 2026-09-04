@@ -3,7 +3,9 @@
 #include "core/path.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 namespace wsld::agent {
@@ -70,6 +72,7 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
 
 Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
   const auto t0 = std::chrono::steady_clock::now();
+  bool incomplete = false;
   std::lock_guard serialise(snapshot_mu_);  // see snapshot_mu_
   {
     // From here until the tree is replaced, apply_invalidation() also records
@@ -85,6 +88,7 @@ Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
       std::unique_lock lock(self.tree_mu_);
       self.snapshot_in_flight_ = false;
       self.snapshot_replay_.clear();
+      self.snapshot_replay_overflow_ = false;
     }
   } end_recording{*this};
 
@@ -114,11 +118,22 @@ Result<void> RemoteRoot::fetch_snapshot(std::chrono::milliseconds timeout) {
     }
     snapshot_replay_.clear();
     snapshot_in_flight_ = false;
+    incomplete = snapshot_replay_overflow_;
+    snapshot_replay_overflow_ = false;
   }
-  std::lock_guard lock(stats_mu_);
-  stats_.generation = (*p)->snap_generation;
-  stats_.snapshot_bytes = (*p)->snap_bytes;
-  stats_.last_snapshot_time = std::chrono::steady_clock::now() - t0;
+  {
+    std::lock_guard lock(stats_mu_);
+    stats_.generation = (*p)->snap_generation;
+    stats_.snapshot_bytes = (*p)->snap_bytes;
+    stats_.last_snapshot_time = std::chrono::steady_clock::now() - t0;
+  }
+  // Changes that landed during the fetch were dropped, so this tree has holes.
+  // Ask for another one; rescan_loop's back-off keeps that from spinning.
+  if (incomplete) {
+    std::lock_guard lock(rs_mu_);
+    rs_requested_ = true;
+    rs_cv_.notify_one();
+  }
   return {};
 }
 
@@ -145,29 +160,47 @@ std::vector<std::byte> slice(const std::vector<std::byte>& data, std::uint64_t o
 }
 }  // namespace
 
+std::int64_t RemoteRoot::bump_mtime(std::int64_t previous) noexcept {
+  const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  return std::max(now, previous + 1);  // strictly newer even if the clock steps back
+}
+
+RemoteRoot::ReadTarget RemoteRoot::resolve_for_read(std::string_view path) const {
+  ReadTarget t;
+  const LookupMode m = mode();
+  std::shared_lock lock(tree_mu_);
+  auto id = tree_.lookup(path, LookupMode::Exact);
+  if (!id && m != LookupMode::Exact) {
+    id = tree_.lookup(path, m);
+    // Only a differently-spelled path needs the copy. Everything downstream has
+    // to use the spelling that actually exists: the cache key (or every open of
+    // `readme.md` for `README.md` misses), the read-ahead batch, and the path
+    // the agent has to resolve on a possibly case-sensitive filesystem.
+    if (id) t.canonical = tree_.path_of(*id);
+  }
+  if (!id) return t;
+  const auto& n = tree_.node(*id);
+  t.is_file = n.attr.kind == NodeKind::File;
+  t.mtime_ns = n.attr.mtime_ns;
+  t.size = n.attr.size;
+  return t;
+}
+
 Result<std::size_t> RemoteRoot::read_into(std::string_view path, std::uint64_t offset, std::span<std::byte> out,
                                           std::chrono::milliseconds timeout) {
   // Fast path: a cached file is copied straight into the caller's buffer. A
   // mount reads a file in chunks, so avoiding the intermediate vector saves one
   // allocation and one copy per chunk.
-  std::int64_t mtime = 0;
-  std::uint64_t size = 0;
-  bool is_file = false;
-  {
-    std::shared_lock lock(tree_mu_);
-    if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
-      const auto& n = tree_.node(*id);
-      is_file = n.attr.kind == NodeKind::File;
-      mtime = n.attr.mtime_ns;
-      size = n.attr.size;
-    }
-  }
-  if (is_file && size <= kMaxCacheableFile) {
+  const ReadTarget t = resolve_for_read(path);
+  const std::string_view key = t.canonical.empty() ? path : std::string_view(t.canonical);
+  if (t.is_file && t.size <= kMaxCacheableFile) {
     std::shared_ptr<const std::vector<std::byte>> hit;
     {
       std::lock_guard lock(rcache_mu_);
-      if (const auto it = rcache_.find(path);
-          it != rcache_.end() && it->second.mtime_ns == mtime && it->second.size == size) {
+      if (const auto it = rcache_.find(key);
+          it != rcache_.end() && it->second.mtime_ns == t.mtime_ns && it->second.size == t.size) {
         lru_.splice(lru_.begin(), lru_, it->second.lru);
         hit = it->second.data;
       }
@@ -182,8 +215,9 @@ Result<std::size_t> RemoteRoot::read_into(std::string_view path, std::uint64_t o
       return n;
     }
   }
-  // Miss (or an uncacheable file): reuse the read path, then hand the bytes over.
-  auto data = read(path, offset, static_cast<std::uint32_t>(std::min<std::size_t>(out.size(), 0xFFFFFFFFu)), timeout);
+  // Miss (or an uncacheable file): reuse the read path with the canonical
+  // spelling, so it caches under the key this function will look for next time.
+  auto data = read(key, offset, static_cast<std::uint32_t>(std::min<std::size_t>(out.size(), 0xFFFFFFFFu)), timeout);
   if (!data) return fail(data.error());
   const std::size_t n = std::min(out.size(), data->size());
   if (n > 0) std::memcpy(out.data(), data->data(), n);
@@ -192,20 +226,12 @@ Result<std::size_t> RemoteRoot::read_into(std::string_view path, std::uint64_t o
 
 Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint64_t offset, std::uint32_t length,
                                                 std::chrono::milliseconds timeout) {
-  // Version and cacheability come from the in-RAM mirror.
-  std::int64_t mtime = 0;
-  std::uint64_t size = 0;
-  bool is_file = false;
-  {
-    std::shared_lock lock(tree_mu_);
-    if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
-      const auto& n = tree_.node(*id);
-      is_file = n.attr.kind == NodeKind::File;
-      mtime = n.attr.mtime_ns;
-      size = n.attr.size;
-    }
-  }
-  if (!is_file || size > kMaxCacheableFile) return read_remote(path, offset, length, timeout);
+  // Version, cacheability and the canonical spelling come from the in-RAM mirror.
+  const ReadTarget t = resolve_for_read(path);
+  const std::string_view key = t.canonical.empty() ? path : std::string_view(t.canonical);
+  const std::int64_t mtime = t.mtime_ns;
+  const std::uint64_t size = t.size;
+  if (!t.is_file || size > kMaxCacheableFile) return read_remote(key, offset, length, timeout);
 
   {
     // Take a reference to the buffer under the lock, then copy the requested
@@ -214,7 +240,7 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
     std::shared_ptr<const std::vector<std::byte>> hit;
     {
       std::lock_guard lock(rcache_mu_);
-      if (const auto it = rcache_.find(path);
+      if (const auto it = rcache_.find(key);
           it != rcache_.end() && it->second.mtime_ns == mtime && it->second.size == size) {
         lru_.splice(lru_.begin(), lru_, it->second.lru);  // most-recently-used
         hit = it->second.data;
@@ -232,8 +258,9 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
   // siblings in one bulk round-trip so a sequential reader over a directory pays
   // one request per directory, not one per file. The async prefetcher then picks
   // up any siblings beyond this batch.
-  const std::string target(path);
-  const std::string dir(split_parent(path).first);
+  const std::string target(key);
+  // `key` is canonical, so its parent is too and an Exact lookup is right below.
+  const std::string dir(split_parent(key).first);
   std::vector<std::string> batch{target};
   std::vector<std::pair<std::int64_t, std::uint64_t>> meta{{mtime, size}};
   std::uint64_t bytes = size;
@@ -267,7 +294,7 @@ Result<std::vector<std::byte>> RemoteRoot::read(std::string_view path, std::uint
       }
   }
   if (!have_target) {  // bulk path unavailable; fetch the target directly
-    auto whole = read_remote(path, 0, static_cast<std::uint32_t>(size), timeout);
+    auto whole = read_remote(key, 0, static_cast<std::uint32_t>(size), timeout);
     if (!whole) return whole;
     target_bytes = *whole;
     cache_put(target, mtime, size, std::move(*whole));
@@ -472,6 +499,20 @@ void RemoteRoot::rescan_loop() {
       rs_cv_.wait(lock, [&] { return rs_stop_ || rs_requested_; });
       if (rs_stop_) return;
       rs_requested_ = false;  // any Rescan arriving from here on schedules another pass
+
+      // Back-off. A full re-snapshot holds tree_mu_ exclusively for as long as
+      // it takes to rebuild the tree (~200 ms per million nodes) and every
+      // mount operation waits behind it, so an agent whose watcher keeps
+      // overflowing must not be able to trigger them back to back.
+      const auto now = std::chrono::steady_clock::now();
+      if (rs_last_.time_since_epoch() != std::chrono::steady_clock::duration::zero()) {
+        // A quiet spell means the storm is over; start from the floor again.
+        if (now - rs_last_ > kRescanMaxInterval) rs_backoff_ = kRescanMinInterval;
+        const auto earliest = rs_last_ + rs_backoff_;
+        if (now < earliest && rs_cv_.wait_until(lock, earliest, [&] { return rs_stop_; })) return;
+        rs_backoff_ = std::min(rs_backoff_ * 2, kRescanMaxInterval);
+      }
+      rs_last_ = std::chrono::steady_clock::now();
     }
     if (closed_) return;
     // fetch_snapshot() replaces the mirror and replays whatever changed while
@@ -512,6 +553,33 @@ void RemoteRoot::drop_cached(std::string_view path) {
   std::lock_guard lock(rcache_mu_);
   if (const auto it = rcache_.find(path); it != rcache_.end()) cache_erase(it);
   if (const auto it = link_cache_.find(path); it != link_cache_.end()) link_cache_.erase(it);
+  std::lock_guard s(stats_mu_);
+  stats_.read_cache_bytes = rcache_bytes_;  // an eviction changes the total too
+}
+
+void RemoteRoot::drop_cached_prefix(std::string_view dir) {
+  std::lock_guard lock(rcache_mu_);
+  if (dir.empty()) {  // the whole served tree
+    while (!rcache_.empty()) cache_erase(rcache_.begin());
+    link_cache_.clear();
+  } else {
+    std::string prefix(dir);
+    prefix.push_back('/');
+    const auto under = [&](std::string_view k) { return k == dir || k.starts_with(prefix); };
+    for (auto it = rcache_.begin(); it != rcache_.end();) {
+      if (!under(it->first)) {
+        ++it;
+        continue;
+      }
+      const auto next = std::next(it);  // cache_erase invalidates only `it`
+      cache_erase(it);
+      it = next;
+    }
+    for (auto it = link_cache_.begin(); it != link_cache_.end();)
+      it = under(it->first) ? link_cache_.erase(it) : std::next(it);
+  }
+  std::lock_guard s(stats_mu_);
+  stats_.read_cache_bytes = rcache_bytes_;
 }
 
 Result<std::string> RemoteRoot::readlink(std::string_view path, std::chrono::milliseconds timeout) {
@@ -579,12 +647,20 @@ Result<std::uint64_t> RemoteRoot::write(std::string_view path, std::uint64_t off
   const std::uint64_t end = offset + resp->written;
   drop_cached(path);
   std::unique_lock lock(tree_mu_);
-  if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
+  if (const auto id = tree_.lookup(path, mode())) {
     Attributes a = tree_.node(*id).attr;
     a.size = std::max(a.size, end);
+    // Move the version on. A read-ahead that fetched this file just before the
+    // write can still be in flight with the pre-write bytes, about to cache
+    // them under the old (mtime, size) - which the tree would still agree with,
+    // so validation would pass and serve stale content. With the mtime bumped
+    // that entry fails validation and the next read refetches, instead of
+    // waiting on the watcher's event (or staying stale for good without one).
+    a.mtime_ns = bump_mtime(a.mtime_ns);
     (void)tree_.set_attributes(*id, a);
   } else {
-    (void)tree_.upsert_path(path, Attributes{.size = end, .mtime_ns = 0, .mode = 0644, .kind = NodeKind::File});
+    (void)tree_.upsert_path(
+        path, Attributes{.size = end, .mtime_ns = bump_mtime(0), .mode = 0644, .kind = NodeKind::File});
   }
   note_mutation(path, resp->generation);
   return resp->written;
@@ -602,9 +678,10 @@ Result<void> RemoteRoot::truncate(std::string_view path, std::uint64_t size, std
   if (!gen) return fail(gen.error());
   drop_cached(path);
   std::unique_lock lock(tree_mu_);
-  if (const auto id = tree_.lookup(path, LookupMode::Exact)) {
+  if (const auto id = tree_.lookup(path, mode())) {
     Attributes a = tree_.node(*id).attr;
     a.size = size;
+    a.mtime_ns = bump_mtime(a.mtime_ns);  // same race as write(); same fix
     (void)tree_.set_attributes(*id, a);
   }
   note_mutation(path, *gen);
@@ -639,7 +716,7 @@ Result<void> RemoteRoot::unlink(std::string_view path, std::chrono::milliseconds
   if (!gen) return fail(gen.error());
   drop_cached(path);
   std::unique_lock lock(tree_mu_);
-  (void)tree_.remove_path(path);
+  (void)tree_.remove_path(path, mode());
   note_mutation(path, *gen);
   return {};
 }
@@ -654,8 +731,9 @@ Result<void> RemoteRoot::rmdir(std::string_view path, std::chrono::milliseconds 
   proto::Reader r((*p)->payload);
   auto gen = take_ack(r);
   if (!gen) return fail(gen.error());
+  drop_cached_prefix(path);  // the directory's whole subtree leaves the cache with it
   std::unique_lock lock(tree_mu_);
-  (void)tree_.remove_path(path);
+  (void)tree_.remove_path(path, mode());
   note_mutation(path, *gen);
   return {};
 }
@@ -675,11 +753,26 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
   const std::string nfrom = normalize_path(from);
   const std::string nto = normalize_path(to);
   if (nfrom == nto) return {};  // the OS treated it as a no-op; so does the mirror
+  // Moving a directory moves its whole subtree, and the content cache is keyed
+  // by path: every entry under the old prefix is now unreachable, and anything
+  // cached under the new one predates the move.
+  {
+    std::shared_lock probe(tree_mu_);
+    if (const auto src = tree_.lookup(nfrom, mode()); src && tree_.node(*src).is_dir()) {
+      probe.unlock();
+      drop_cached_prefix(nfrom);
+      drop_cached_prefix(nto);
+    }
+  }
   std::unique_lock lock(tree_mu_);
   note_mutation(nfrom, *gen);
   note_mutation(nto, *gen);
-  (void)tree_.remove_path(nto);  // rename replaces whatever was at the destination
-  const auto id = tree_.lookup(nfrom, LookupMode::Exact);
+  const auto id = tree_.lookup(nfrom, mode());
+  // A rename replaces whatever was at the destination - unless the destination
+  // resolves to the source itself, which is what a case-only rename (`foo` ->
+  // `FOO`) does once paths resolve case-insensitively. Removing it there would
+  // delete the very thing being renamed, subtree and all.
+  if (const auto victim = tree_.lookup(nto, mode()); victim && victim != id) (void)tree_.remove(*victim);
   if (!id) return {};  // not mirrored (yet); the watcher's invalidation will add it
   // Move the NODE, not just its attributes: a renamed directory keeps its whole
   // subtree, and re-creating it empty at the new path would hide everything in
@@ -811,6 +904,9 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
   auto batch = proto::read_invalidation(r);
   if (!batch) return;
   bool rescan = false;
+  // Directories the batch removes. Collected while the tree can still say they
+  // were directories, and swept out of the content cache once the lock is free.
+  std::vector<std::string> removed_dirs;
   {
     std::unique_lock lock(tree_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
@@ -826,14 +922,26 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
       }
       switch (op.kind) {
         case InvalidationKind::Upsert: (void)tree_.upsert_path(op.path, op.attr); break;
-        case InvalidationKind::Remove: (void)tree_.remove_path(op.path); break;
+        case InvalidationKind::Remove:
+          if (const auto id = tree_.lookup(op.path, mode()); id && tree_.node(*id).is_dir())
+            removed_dirs.push_back(op.path);
+          (void)tree_.remove_path(op.path, mode());
+          break;
         case InvalidationKind::Rescan: rescan = true; break;  // handled below, off this thread
       }
     }
     // A snapshot being fetched right now will replace this tree; keep the batch
-    // so fetch_snapshot() can replay it if the snapshot pre-dates it.
-    if (snapshot_in_flight_) snapshot_replay_.push_back(*batch);
+    // so fetch_snapshot() can replay it if the snapshot pre-dates it. Bounded:
+    // a watcher that keeps overflowing would otherwise grow this for as long as
+    // the request is in flight. Past the cap the replay can no longer be
+    // complete, so the snapshot it feeds is not trustworthy either and
+    // fetch_snapshot() asks for another one.
+    if (snapshot_in_flight_) {
+      if (snapshot_replay_.size() < kMaxSnapshotReplay) snapshot_replay_.push_back(*batch);
+      else snapshot_replay_overflow_ = true;
+    }
   }
+  for (const std::string& d : removed_dirs) drop_cached_prefix(d);
   if (rescan) {
     // The agent's watcher overflowed: per-path events were lost, so the mirror
     // can no longer be trusted. Re-fetch the snapshot on the rescan thread —

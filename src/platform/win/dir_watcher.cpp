@@ -1,7 +1,7 @@
 // ReadDirectoryChangesW + I/O completion port watcher.
 //
-// One directory handle, one 64 KiB notification buffer, one thread. The buffer
-// is re-armed immediately after each completion; if the kernel ran out of room
+// One directory handle, one notification buffer, one thread. The buffer is
+// re-armed immediately after each completion; if the kernel ran out of room
 // (zero-length completion or ERROR_NOTIFY_ENUM_DIR) an Overflow event is
 // emitted so the coalescer schedules a rescan.
 #include "platform/watcher.hpp"
@@ -9,14 +9,22 @@
 
 #include <windows.h>
 
-#include <array>
 #include <atomic>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace wsld::platform {
 
 namespace {
+
+// Notification buffer size. The documented 64 KiB ceiling applies only to a
+// directory on a network share; locally the buffer can be as large as we care
+// to pin, and its size is what decides how often the kernel runs out of room.
+// An overflow is expensive far out of proportion to the memory: it costs the
+// client a full re-snapshot, which holds its tree lock against every mount
+// operation. A single `npm install` overruns 64 KiB.
+constexpr std::size_t kWatchBufferBytes = 1u << 20;
 
 constexpr ULONG_PTR kKeyChanges = 1;
 constexpr ULONG_PTR kKeyStop = 2;
@@ -84,8 +92,10 @@ class Win32Watcher final : public Watcher {
 
   void dispatch(DWORD bytes, std::string& path) {
     // Copy out first: the kernel may not touch buf_ until re-armed, but keeping
-    // the parse and the callback off the live buffer is cheap insurance.
-    std::array<std::byte, 64 * 1024> local;
+    // the parse and the callback off the live buffer is cheap insurance. The
+    // scratch buffer is a member, not a local - at this size it has no business
+    // on the stack.
+    std::vector<std::byte>& local = scratch_;
     std::memcpy(local.data(), buf_.data(), bytes);
     std::size_t off = 0;
     for (;;) {
@@ -113,7 +123,10 @@ class Win32Watcher final : public Watcher {
   HANDLE iocp_;
   WatchCallback cb_;
   OVERLAPPED ov_{};
-  alignas(DWORD) std::array<std::byte, 64 * 1024> buf_{};
+  // Heap-allocated, so `new` gives it stricter alignment than
+  // FILE_NOTIFY_INFORMATION needs.
+  std::vector<std::byte> buf_ = std::vector<std::byte>(kWatchBufferBytes);
+  std::vector<std::byte> scratch_ = std::vector<std::byte>(kWatchBufferBytes);
   std::thread thread_;
   std::atomic<bool> stopped_{false};
 };

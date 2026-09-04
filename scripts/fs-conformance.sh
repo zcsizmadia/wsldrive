@@ -95,6 +95,37 @@ ext_rename() {   # a directory renamed on the backing store must show its conten
 }
 check "external dir rename shows contents" "ext_rename"
 
+# The mount lets the kernel keep a file's pages across opens (auto_cache), so a
+# file whose contents change on the backing store must still read back new on
+# the next open. Without the revalidation these two checks read the old bytes.
+ext_content() {
+  echo old-content > "$WORK/ec.txt" || return 1
+  for _ in $(seq 1 50); do [ -f "$MNT/ec.txt" ] && break; sleep 0.1; done
+  [ "$(cat "$MNT/ec.txt")" = old-content ] || return 1   # warms the page cache
+  echo new-content > "$WORK/ec.txt" || return 1
+  for _ in $(seq 1 50); do
+    [ "$(cat "$MNT/ec.txt")" = new-content ] && return 0
+    sleep 0.1
+  done
+  echo "mount still reads: $(cat "$MNT/ec.txt")"
+  return 1
+}
+check "external content change is seen on re-open" "ext_content"
+
+ext_grow() {   # same, where the file also changes length
+  printf 'aa\n' > "$WORK/eg.txt" || return 1
+  for _ in $(seq 1 50); do [ -f "$MNT/eg.txt" ] && break; sleep 0.1; done
+  [ "$(wc -c < "$MNT/eg.txt")" = 3 ] || return 1
+  printf 'bbbbbbbbbb\n' > "$WORK/eg.txt" || return 1
+  for _ in $(seq 1 50); do
+    [ "$(wc -c < "$MNT/eg.txt")" = 11 ] && [ "$(cat "$MNT/eg.txt")" = bbbbbbbbbb ] && return 0
+    sleep 0.1
+  done
+  echo "mount reads $(wc -c < "$MNT/eg.txt") bytes: $(cat "$MNT/eg.txt")"
+  return 1
+}
+check "external size change is seen on re-open" "ext_grow"
+
 echo "== symlinks served by the agent =="
 check "symlink is a symlink"      "[ -L '$MNT/lnk' ]"
 check "readlink gives the target" "[ \"\$(readlink '$MNT/lnk')\" = lt.txt ]"

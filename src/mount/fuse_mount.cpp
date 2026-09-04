@@ -34,11 +34,15 @@ using TimespecT = struct timespec;
 
 #include <algorithm>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace wsld::mount {
 
@@ -67,6 +71,21 @@ WriteHandle* handle_of(struct fuse_file_info* fi) {
 
 // Flushes a write handle's buffer to the agent. Returns 0 or a negative errno.
 int flush_handle(WriteHandle* h);
+
+// Largest number of paths waiting for a kernel page-cache punch. Past this the
+// mount stops queueing: `auto_cache` still revalidates each file on its next
+// open, so the effect of dropping one is a late invalidation, not a stale read.
+constexpr std::size_t kInvalQueueCap = 4096;
+
+// Inverse of to_rel(): a tree key (relative, '/'-separated) as the absolute
+// path FUSE uses. '/' is never escaped, so the whole path escapes in one go.
+std::string to_fuse_path(std::string_view rel) {
+#ifdef _WIN32
+  return "/" + escape_for_windows(rel);
+#else
+  return "/" + std::string(rel);
+#endif
+}
 
 #ifdef _WIN32
 // winfsp-x64.dll is delay-loaded; load it (default search path, then the
@@ -338,11 +357,56 @@ int op_utimens(const char* path, const TimespecT[2], struct fuse_file_info*) {
   });
 }
 
-void* op_init(struct fuse_conn_info*, struct fuse_config* cfg) {
-  cfg->kernel_cache = 0;
+// Cache policy and connection negotiation. Everything here is FUSE-level
+// negotiation the mount previously left at its defaults; none of it needs a
+// kernel change.
+void* op_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
+  // Let the kernel keep a file's pages across opens and revalidate them against
+  // (mtime, size) on the next open, instead of dropping them unconditionally.
+  // `kernel_cache` would skip the revalidation entirely; `auto_cache` is the
+  // same win for repeat reads without trusting the cache blindly, and getattr
+  // is answered from the in-RAM mirror, so the check costs no round-trip. The
+  // revalidation happens on open; FuseMount's invalidation hook covers the gap
+  // between opens and shortens the window (see the comment on that thread).
+  cfg->auto_cache = 1;
   cfg->entry_timeout = 1.0;
   cfg->attr_timeout = 1.0;
   cfg->negative_timeout = 1.0;
+
+  if (conn != nullptr) {
+    // Bigger payload per upcall. The transport already moves whole files in one
+    // bulk request, so per-request cost dominates and a small cap just
+    // multiplies the crossings. These are requests: the kernel clamps them.
+    // max_read is deliberately not set here: libfuse cross-checks it against the
+    // `-o max_read=` mount option and aborts the mount if the two disagree
+    // ("init() and fuse_session_new() requested different maximum read size").
+    // Raising max_write lifts the negotiated page count, which raises the read
+    // size with it, so setting it separately buys nothing.
+    conn->max_write = 1u << 20;
+    conn->max_readahead = 1u << 20;
+    // How many async requests the kernel keeps in flight. The default bounds
+    // the read-ahead this client already implements, so raise it.
+    conn->max_background = 64;
+    conn->congestion_threshold = 48;
+
+    // Capabilities must be filtered through `capable`: the offered set differs
+    // between libfuse and WinFsp-FUSE, and asking for one that is not on offer
+    // is an error rather than a no-op.
+    unsigned want = FUSE_CAP_ASYNC_READ | FUSE_CAP_PARALLEL_DIROPS | FUSE_CAP_SPLICE_READ |
+                    FUSE_CAP_SPLICE_WRITE | FUSE_CAP_SPLICE_MOVE;
+#ifdef FUSE_CAP_CACHE_SYMLINKS
+    want |= FUSE_CAP_CACHE_SYMLINKS;  // libfuse only; WinFsp-FUSE does not offer it
+#endif
+    conn->want |= (want & conn->capable);
+    // Deliberately not requested:
+    //  - FUSE_CAP_ATOMIC_O_TRUNC would hand a truncating open to op_open, which
+    //    ignores fi->flags, so the truncation would be silently lost. Without
+    //    it the kernel sends a separate setattr and op_truncate runs.
+    //  - FUSE_CAP_WRITEBACK_CACHE would buffer writes in the kernel behind the
+    //    --writeback coalescing this mount already does, with different flush
+    //    points for the two.
+    //  - FUSE_CAP_AUTO_INVAL_DATA covers the same ground as auto_cache above.
+  }
   return fuse_get_context()->private_data;
 }
 
@@ -381,6 +445,12 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
 
   static Context context;  // FUSE keeps a single mount per process here
   context.root = &root_;
+  // Every handler below resolves case-insensitively (a Windows volume has to,
+  // and Direction B keeps the same behaviour so both mounts agree). The client
+  // has to resolve the same way, or a read of `readme.md` against a stored
+  // `README.md` passes the lookup here and then misses the cache, the
+  // read-ahead, and - against a case-sensitive agent - the file itself.
+  root_.set_lookup_mode(LookupMode::CaseInsensitive);
   context.writeback = writeback;
   static fuse_operations ops = make_ops();
 
@@ -403,16 +473,81 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
   fuse_ = f;
   mountpoint_ = mountpoint;
   mounted_.store(true);
+
+  // Drop the kernel's cached pages for a path the far side changed. Without
+  // this the change is still not lost - the kernel notices it when the
+  // attribute cache expires - but it is late by up to attr_timeout: with a file
+  // held open across a far-side rewrite, kernel 6.18 kept serving the old bytes
+  // for 981 ms, against 5 ms with this punch in place.
+  //
+  // It runs on its own thread because fuse_invalidate_path() blocks until the
+  // kernel has dropped the pages, and doing that on RemoteRoot's reader thread
+  // would stall every other reply behind it. (`wsldrive watch` installs a hook
+  // too, but it is a separate subcommand that never mounts.)
+  {
+    std::lock_guard lock(inval_mu_);
+    inval_stop_ = false;
+    inval_queue_.clear();
+  }
+  inval_ = std::thread([this] { inval_loop(); });
+  root_.set_invalidation_hook([this](const proto::InvalidationBatch& b) {
+    std::lock_guard lock(inval_mu_);
+    if (inval_stop_) return;
+    for (const auto& op : b.ops) {
+      // A Rescan says the agent lost track of individual paths, so there is no
+      // path to punch; auto_cache revalidates each file on its next open.
+      if (op.kind == InvalidationKind::Rescan) continue;
+      if (inval_queue_.size() >= kInvalQueueCap) break;
+      inval_queue_.push_back(to_fuse_path(op.path));
+    }
+    inval_cv_.notify_one();
+  });
+
   loop_ = std::thread([this] {
+    // Deliberately single-threaded. fuse_loop_mt() was measured against this
+    // (3000 files, agent and mount both in WSL over loopback, so only the
+    // serving path is timed) and lost in every configuration: a warm read pass
+    // went 210 -> 289 ms and eight parallel readers 78 -> 117 ms. With the page
+    // cache doing the repeat reads the daemon is barely on the path, and the
+    // requests that do reach it spend their time under RemoteRoot's single
+    // cache mutex, which more threads only contend for. Revisit only after that
+    // contention is addressed, and re-measure parallel cold reads across a real
+    // boundary - the one case this comparison could not see.
     fuse_loop(static_cast<struct fuse*>(fuse_));
     mounted_.store(false);
   });
   return {};
 }
 
+void FuseMount::inval_loop() {
+  for (;;) {
+    std::string path;
+    {
+      std::unique_lock lock(inval_mu_);
+      inval_cv_.wait(lock, [this] { return inval_stop_ || !inval_queue_.empty(); });
+      if (inval_stop_) return;
+      path = std::move(inval_queue_.front());
+      inval_queue_.pop_front();
+    }
+    // Best effort: a failure here means the kernel had nothing cached for the
+    // path, which is the common case and not worth reporting.
+    (void)fuse_invalidate_path(static_cast<struct fuse*>(fuse_), path.c_str());
+  }
+}
+
 void FuseMount::unmount() {
   if (fuse_ == nullptr) return;
   auto* f = static_cast<struct fuse*>(fuse_);
+  // Stop feeding the invalidation thread, and join it, before the fuse handle
+  // it dereferences goes away.
+  root_.set_invalidation_hook({});
+  {
+    std::lock_guard lock(inval_mu_);
+    inval_stop_ = true;
+    inval_queue_.clear();
+  }
+  inval_cv_.notify_all();
+  if (inval_.joinable()) inval_.join();
   fuse_exit(f);
   fuse_unmount(f);
   if (loop_.joinable()) loop_.join();
