@@ -290,8 +290,8 @@ Result<NodeId> MetadataTree::upsert_path(std::string_view path, const Attributes
   return upsert(*dir, leaf, attr);
 }
 
-Result<void> MetadataTree::remove_path(std::string_view path) {
-  const auto id = lookup(path, LookupMode::Exact);
+Result<void> MetadataTree::remove_path(std::string_view path, LookupMode mode) {
+  const auto id = lookup(path, mode);
   if (!id) return fail(Errc::NotFound);
   return remove(*id);
 }

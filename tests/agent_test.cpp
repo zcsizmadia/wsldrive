@@ -1054,6 +1054,133 @@ TEST_F(AgentTest, SnapshotReplaysInvalidationsThatArriveDuringTheFetch) {
   }
   EXPECT_TRUE(present) << "an invalidation delivered during the fetch was lost to the tree replacement";
 }
+TEST_F(AgentTest, ReadCacheHitsOnADifferentlyCasedSpelling) {
+  // The mount resolves case-insensitively (a Windows volume has to), so a
+  // program opening `readme.md` for a stored `README.md` reaches the client with
+  // its own spelling. Keyed on that spelling the cache missed on every such
+  // open, the read-ahead was bypassed, and the request went out for a path a
+  // case-sensitive agent does not have.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  c->set_lookup_mode(LookupMode::CaseInsensitive);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto str = [](const std::vector<std::byte>& v) {
+    return std::string(reinterpret_cast<const char*>(v.data()), v.size());
+  };
+
+  auto stored = c->read("README.md", 0, 100);  // seeded "# readme\n"
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(str(*stored), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_misses, 1u);
+
+  auto lower = c->read("readme.md", 0, 100);
+  ASSERT_TRUE(lower.has_value()) << "a differently cased path must resolve to the stored file";
+  EXPECT_EQ(str(*lower), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_hits, 1u) << "and be served by the entry the first read cached";
+  EXPECT_EQ(c->stats().read_cache_misses, 1u);
+
+  // read_into() resolves the same way, so it reaches the same entry.
+  std::vector<std::byte> buf(100);
+  auto n = c->read_into("ReadMe.MD", 0, buf);
+  ASSERT_TRUE(n.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(buf.data()), *n), "# readme\n");
+  EXPECT_EQ(c->stats().read_cache_hits, 2u);
+}
+
+TEST_F(AgentTest, WriteAndTruncateMoveTheMirrorVersionOn) {
+  // A read-ahead already in flight when a write lands can be holding pre-write
+  // bytes and about to cache them under the old (mtime, size). If the mirror
+  // still agreed with that pair the entry would validate and serve stale
+  // content - until the watcher's event, or for good without a watcher. Moving
+  // the version on makes that entry fail validation instead.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto mtime_of = [&](std::string_view p) {
+    return c->with_tree([&](const MetadataTree& t) -> std::int64_t {
+      const auto id = t.lookup(p);
+      return id ? t.node(*id).attr.mtime_ns : 0;
+    });
+  };
+
+  const std::int64_t before = mtime_of("README.md");
+  ASSERT_TRUE(c->write("README.md", 0, as_bytes("XXXXX")).has_value());  // same length on purpose
+  const std::int64_t after_write = mtime_of("README.md");
+  EXPECT_GT(after_write, before) << "a same-length write must still change the version";
+
+  ASSERT_TRUE(c->truncate("README.md", 3).has_value());
+  EXPECT_GT(mtime_of("README.md"), after_write);
+}
+
+TEST_F(AgentTest, RenamingADirectoryEvictsItsSubtreeFromTheReadCache) {
+  // The content cache is keyed by path, so moving a directory leaves every
+  // entry below the old prefix cached but unreachable: dead weight against the
+  // byte budget until LRU pressure happened to evict it.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  ASSERT_TRUE(c->read("src/main.cpp", 0, 100).has_value());
+  ASSERT_TRUE(c->read("src/include/a.hpp", 0, 100).has_value());
+  EXPECT_GT(c->stats().read_cache_bytes, 0u);
+
+  ASSERT_TRUE(c->rename("src", "src2").has_value());
+  EXPECT_EQ(c->stats().read_cache_bytes, 0u) << "the subtree's contents must leave the cache with it";
+
+  auto r = c->read("src2/main.cpp", 0, 100);  // still readable under the new path
+  ASSERT_TRUE(r.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->data()), r->size()), "int main() {}\n");
+}
+
+TEST_F(AgentTest, RemovingADirectoryEvictsItsSubtreeFromTheReadCache) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  ASSERT_TRUE(c->read("src/include/a.hpp", 0, 100).has_value());
+  EXPECT_GT(c->stats().read_cache_bytes, 0u);
+
+  ASSERT_TRUE(c->unlink("src/include/a.hpp").has_value());
+  ASSERT_TRUE(c->rmdir("src/include").has_value());
+  EXPECT_EQ(c->stats().read_cache_bytes, 0u);
+}
+
+// Creating a symlink needs a privilege (or Developer Mode) on Windows, so this
+// runs where the rest of the symlink coverage does - see ScannerReportsSymlinks.
+#ifndef _WIN32
+TEST_F(AgentTest, SymlinkSizeIsTheTargetLength) {
+  // POSIX says st_size of a symlink is its target's length, and the readlink
+  // idiom is malloc(st_size + 1): a reported 0 hands the caller a buffer too
+  // small for any target at all.
+  std::error_code ec;
+  constexpr std::string_view kTarget = "main.cpp";
+  fs::create_symlink(kTarget, root_ / "src" / "link_to_main", ec);
+  ASSERT_FALSE(ec);
+  std::vector<std::string> names;
+  std::vector<SnapshotEntry> entries;
+  auto stats = scan_tree(root_, [&](const SnapshotEntry& e) {
+    names.emplace_back(e.name);
+    entries.push_back(e);
+  });
+  ASSERT_TRUE(stats.has_value());
+  for (std::size_t i = 0; i < entries.size(); ++i) entries[i].name = names[i];
+  MetadataTree t;
+  ASSERT_TRUE(t.load_snapshot(entries).has_value());
+  const auto link = t.lookup("src/link_to_main");
+  ASSERT_TRUE(link.has_value());
+  ASSERT_EQ(t.node(*link).attr.kind, NodeKind::Symlink);
+  EXPECT_EQ(t.node(*link).attr.size, kTarget.size());
+}
+#endif
+
 
 #ifdef _WIN32
 TEST_F(AgentTest, MutationsRetryWhileAnotherProcessBrieflyHoldsTheFile) {

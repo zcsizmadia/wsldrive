@@ -91,7 +91,10 @@ class MetadataTree {
   /// '\\' separators; leading separators are ignored.
   Result<NodeId> ensure_directory_path(std::string_view path);
   Result<NodeId> upsert_path(std::string_view path, const Attributes& attr);
-  Result<void> remove_path(std::string_view path);
+  /// Removes the node at `path`, resolved with `mode` - a client that looks
+  /// paths up case-insensitively must remove them the same way or it leaves
+  /// the node behind under its real spelling.
+  Result<void> remove_path(std::string_view path, LookupMode mode = LookupMode::Exact);
 
   /// Replaces the whole tree with the given snapshot.
   Result<void> load_snapshot(std::span<const SnapshotEntry> entries);
