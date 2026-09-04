@@ -70,6 +70,13 @@ class Socket {
   /// readable, false on timeout. Lets a receive loop poll a stop flag.
   [[nodiscard]] Result<bool> wait_readable(std::chrono::milliseconds timeout) noexcept;
 
+  /// Bounds how long a single send may block (SO_SNDTIMEO). Without it a peer
+  /// that stops reading fills its socket buffer and parks the sender for good.
+  /// Zero clears the bound. A send that times out reports Errc::Timeout and
+  /// may have written part of the buffer, so the stream is only good for
+  /// dropping afterwards.
+  void set_send_timeout(std::chrono::milliseconds timeout) noexcept;
+
   void set_nodelay(bool on) noexcept;
   void shutdown() noexcept;
   void close() noexcept;

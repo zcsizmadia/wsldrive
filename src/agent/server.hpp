@@ -41,6 +41,11 @@ class RootServer {
     // that connects and sends nothing would hold a session slot forever — 32 of
     // them lock every legitimate client out of a --listen agent.
     std::chrono::milliseconds handshake_timeout = std::chrono::seconds(10);
+    /// How long a single broadcast send may block on one peer. A peer that
+    /// authenticates and then stops reading fills its socket buffer; without a
+    /// bound the flusher blocks in that send forever, no other peer receives
+    /// another invalidation, and stop() hangs joining the flusher.
+    std::chrono::milliseconds broadcast_timeout = std::chrono::seconds(5);
     // A directory that appears by rename is enumerated into the invalidation
     // batch so peers see its contents. Past this many entries the enumeration
     // stops and the peers are told to Rescan instead: bounded work on the

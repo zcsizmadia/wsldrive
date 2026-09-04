@@ -83,10 +83,15 @@ void RootServer::stop() {
     std::lock_guard lock(coalescer_mu_);
     coalescer_cv_.notify_all();
   }
+  // Shut the peers down first, then join. A flusher parked in a send to a peer
+  // that stopped reading would otherwise be joined while it is still blocked;
+  // shutdown() fails that send and releases it. This also unblocks every
+  // session thread parked in receive(), so serve() returns.
+  {
+    std::lock_guard lock(peers_mu_);
+    for (net::FrameChannel* peer : peers_) peer->shutdown();
+  }
   if (flusher_.joinable()) flusher_.join();
-  // Unblock every session thread parked in receive(); serve() then returns.
-  std::lock_guard lock(peers_mu_);
-  for (net::FrameChannel* peer : peers_) peer->shutdown();
 }
 
 void RootServer::on_event(const FsEvent& ev) {
@@ -228,6 +233,7 @@ void RootServer::broadcast_batch(const proto::InvalidationBatch& batch) {
 bool RootServer::add_peer(net::FrameChannel& ch) {
   std::lock_guard lock(peers_mu_);
   if (stopping_) return false;
+  ch.set_send_timeout(opts_.broadcast_timeout);  // see Options::broadcast_timeout
   peers_.push_back(&ch);
   return true;
 }
@@ -243,7 +249,13 @@ void RootServer::broadcast(const std::vector<std::byte>& frame) {
     targets = peers_;
     ++broadcasts_in_flight_;  // keeps a departing session from destroying a channel mid-send
   }
-  for (net::FrameChannel* peer : targets) (void)peer->send_raw(frame);
+  // A peer that has stopped draining its socket must not hold this thread: the
+  // send is bounded (SO_SNDTIMEO, set in add_peer), and one that runs out of
+  // time gets shut down. That unblocks its session thread in receive(), which
+  // ends the session and deregisters it - this thread cannot remove it here,
+  // because the session owns the channel.
+  for (net::FrameChannel* peer : targets)
+    if (auto r = peer->send_raw(frame); !r && r.error() == Errc::Timeout) peer->shutdown();
   {
     std::lock_guard lock(peers_mu_);
     if (--broadcasts_in_flight_ == 0) peers_cv_.notify_all();

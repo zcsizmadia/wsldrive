@@ -184,17 +184,39 @@ Result<void> Socket::send_all(std::span<const std::byte> data) noexcept {
 #ifdef _WIN32
     const int chunk = static_cast<int>(std::min<std::size_t>(data.size(), 1u << 30));
     const int n = ::send(static_cast<SOCKET>(s_), reinterpret_cast<cbuf_ptr>(data.data()), chunk, 0);
-    if (n == SOCKET_ERROR) return fail(Errc::IoError);
+    if (n == SOCKET_ERROR) {
+      // SO_SNDTIMEO expiry, i.e. the peer has stopped draining its socket.
+      const int err = last_socket_error();
+      if (err == WSAETIMEDOUT) return fail(Errc::Timeout);
+      return fail(err == WSAECONNRESET || err == WSAECONNABORTED ? Errc::ConnectionClosed : Errc::IoError);
+    }
 #else
     const ssize_t n = ::send(s_, data.data(), data.size(), MSG_NOSIGNAL);
     if (n < 0) {
       if (errno == EINTR) continue;
+      // EAGAIN/EWOULDBLOCK here is SO_SNDTIMEO expiry (the socket is blocking
+      // otherwise), i.e. the peer has stopped draining its socket.
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return fail(Errc::Timeout);
       return fail(errno == EPIPE || errno == ECONNRESET ? Errc::ConnectionClosed : Errc::IoError);
     }
 #endif
     data = data.subspan(static_cast<std::size_t>(n));
   }
   return {};
+}
+
+void Socket::set_send_timeout(std::chrono::milliseconds timeout) noexcept {
+  if (!valid()) return;
+#ifdef _WIN32
+  const DWORD ms = static_cast<DWORD>(timeout.count());
+  (void)::setsockopt(static_cast<SOCKET>(s_), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms),
+                     static_cast<int>(sizeof(ms)));
+#else
+  timeval tv{};
+  tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
+  tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
+  (void)::setsockopt(s_, SOL_SOCKET, SO_SNDTIMEO, &tv, static_cast<socklen_t>(sizeof(tv)));
+#endif
 }
 
 Result<std::size_t> Socket::recv_some(std::span<std::byte> buf) noexcept {
