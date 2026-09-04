@@ -48,6 +48,27 @@ Attributes attributes_from(const fs::directory_entry& e, std::error_code& ec) no
       a.size = 0;
       ec.clear();
     }
+  } else if (a.kind == NodeKind::Symlink) {
+    // POSIX says st_size of a symlink is the length of its target, and tools
+    // rely on it: the readlink(2) idiom is to malloc(st_size + 1) and read into
+    // that, which with a reported 0 gives a buffer too small for any target.
+    // file_size() follows the link, so the target has to be read here.
+    //
+    // Measured in the same encoding RootServer::send_readlink puts on the wire
+    // (UTF-8, native separators swapped for '/', which does not change the
+    // length) - a size that disagreed with the bytes readlink returns would be
+    // worse than the 0 it replaces.
+    const fs::path target = fs::read_symlink(e.path(), ec);
+    if (ec) {
+      a.size = 0;
+    } else {
+#ifdef _WIN32
+      a.size = platform::win::to_utf8(target.native()).size();
+#else
+      a.size = target.native().size();
+#endif
+    }
+    ec.clear();
   }
   const auto mtime = e.last_write_time(ec);
   if (!ec) a.mtime_ns = to_unix_ns(mtime);
