@@ -42,6 +42,7 @@ using TimespecT = struct timespec;
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace wsld::mount {
@@ -482,23 +483,27 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
   //
   // It runs on its own thread because fuse_invalidate_path() blocks until the
   // kernel has dropped the pages, and doing that on RemoteRoot's reader thread
-  // would stall every other reply behind it. (`wsldrive watch` installs a hook
-  // too, but it is a separate subcommand that never mounts.)
+  // would stall every other reply behind it.
+  //
+  // The 981ms-to-5ms figure is a libfuse measurement; WinFsp showed no
+  // difference from the page-cache change either way, so this costs nothing
+  // measurable there and is left on for both.
   {
     std::lock_guard lock(inval_mu_);
     inval_stop_ = false;
     inval_queue_.clear();
   }
   inval_ = std::thread([this] { inval_loop(); });
-  root_.set_invalidation_hook([this](const proto::InvalidationBatch& b) {
+  // Only the paths the client actually applied: an op it discarded as stale
+  // relative to its own mutation changed nothing, and punching for it would act
+  // on an event already judged obsolete. This also leaves the raw-batch
+  // InvalidationHook free for `wsldrive watch`.
+  root_.set_invalidated_paths_hook([this](std::span<const std::string> paths) {
     std::lock_guard lock(inval_mu_);
     if (inval_stop_) return;
-    for (const auto& op : b.ops) {
-      // A Rescan says the agent lost track of individual paths, so there is no
-      // path to punch; auto_cache revalidates each file on its next open.
-      if (op.kind == InvalidationKind::Rescan) continue;
+    for (const std::string& p : paths) {
       if (inval_queue_.size() >= kInvalQueueCap) break;
-      inval_queue_.push_back(to_fuse_path(op.path));
+      inval_queue_.push_back(to_fuse_path(p));
     }
     inval_cv_.notify_one();
   });
@@ -539,8 +544,8 @@ void FuseMount::unmount() {
   if (fuse_ == nullptr) return;
   auto* f = static_cast<struct fuse*>(fuse_);
   // Stop feeding the invalidation thread, and join it, before the fuse handle
-  // it dereferences goes away.
-  root_.set_invalidation_hook({});
+  // it dereferences goes away. Harmless where the thread was never started.
+  root_.set_invalidated_paths_hook({});
   {
     std::lock_guard lock(inval_mu_);
     inval_stop_ = true;

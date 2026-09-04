@@ -17,6 +17,7 @@
 #include <string>
 #include <utility>
 #include <shared_mutex>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,6 +53,11 @@ class RemoteRoot {
   };
 
   using InvalidationHook = std::function<void(const proto::InvalidationBatch&)>;
+  /// Paths whose mirrored state a batch actually changed - the ops that were
+  /// applied, not the ones discarded as stale relative to this client's own
+  /// mutation. Separate from InvalidationHook, which reports the raw batch for
+  /// diagnostics (`wsldrive watch`) and so has different callers.
+  using InvalidatedPathsHook = std::function<void(std::span<const std::string>)>;
 
   explicit RemoteRoot(std::unique_ptr<net::FrameChannel> ch);
   ~RemoteRoot();
@@ -149,6 +155,7 @@ class RemoteRoot {
   }
 
   void set_invalidation_hook(InvalidationHook hook);
+  void set_invalidated_paths_hook(InvalidatedPathsHook hook);
   [[nodiscard]] Stats stats() const;
   [[nodiscard]] bool connected() const noexcept { return !closed_.load(); }
   void close();
@@ -270,6 +277,7 @@ class RemoteRoot {
   mutable std::mutex stats_mu_;
   Stats stats_;
   InvalidationHook hook_;
+  InvalidatedPathsHook paths_hook_;
 
   // In-RAM read cache: path -> whole-file contents, validated against the tree's
   // (mtime, size) and dropped on invalidation. LRU-evicted to a byte budget.
