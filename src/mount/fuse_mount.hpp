@@ -4,6 +4,9 @@
 #include "core/error.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -15,6 +18,8 @@ namespace wsld::mount {
 /// over the socket on demand.
 ///
 /// The FUSE event loop runs on its own thread; `unmount()` stops it and joins.
+/// A second thread drops the kernel's cached pages for paths the far side
+/// changes, so the page cache can be trusted between opens.
 class FuseMount {
  public:
   explicit FuseMount(agent::RemoteRoot& root) noexcept : root_(root) {}
@@ -34,11 +39,22 @@ class FuseMount {
   [[nodiscard]] bool mounted() const noexcept { return mounted_.load(); }
 
  private:
+  // Drains `inval_queue_`, dropping the kernel's cached pages for each path.
+  void inval_loop();
+
   agent::RemoteRoot& root_;
   void* fuse_ = nullptr;  // struct fuse*
   std::string mountpoint_;
   std::thread loop_;
   std::atomic<bool> mounted_{false};
+
+  // Paths the far side changed, awaiting a kernel page-cache punch. Fed by the
+  // RemoteRoot invalidation hook, drained by `inval_`.
+  std::thread inval_;
+  std::mutex inval_mu_;
+  std::condition_variable inval_cv_;
+  std::deque<std::string> inval_queue_;
+  bool inval_stop_ = false;
 };
 
 }  // namespace wsld::mount
