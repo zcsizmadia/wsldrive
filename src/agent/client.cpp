@@ -39,6 +39,11 @@ void RemoteRoot::close() {
   });
 }
 
+void RemoteRoot::set_invalidated_paths_hook(InvalidatedPathsHook hook) {
+  std::lock_guard lock(stats_mu_);
+  paths_hook_ = std::move(hook);
+}
+
 void RemoteRoot::set_invalidation_hook(InvalidationHook hook) {
   std::lock_guard lock(stats_mu_);
   hook_ = std::move(hook);
@@ -907,6 +912,11 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
   // Directories the batch removes. Collected while the tree can still say they
   // were directories, and swept out of the content cache once the lock is free.
   std::vector<std::string> removed_dirs;
+  // Paths this batch actually changed. An op discarded as stale relative to
+  // this client's own mutation did not change the mirror, so it must not be
+  // reported as invalidated either - a consumer that drops caches for it would
+  // be acting on an event we already decided was obsolete.
+  std::vector<std::string> applied;
   {
     std::unique_lock lock(tree_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
@@ -920,6 +930,7 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
           local_mutations_.erase(it);                      // caught up; back to normal
         }
       }
+      if (op.kind != InvalidationKind::Rescan) applied.push_back(op.path);
       switch (op.kind) {
         case InvalidationKind::Upsert: (void)tree_.upsert_path(op.path, op.attr); break;
         case InvalidationKind::Remove:
@@ -966,13 +977,16 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
     for (const proto::InvalidationOp& op : batch->ops) pf_seen_.erase(std::string(split_parent(op.path).first));
   }
   InvalidationHook hook;
+  InvalidatedPathsHook paths_hook;
   {
     std::lock_guard lock(stats_mu_);
     ++stats_.invalidation_batches;
     stats_.invalidation_ops += batch->ops.size();
     stats_.generation = batch->generation;
     hook = hook_;
+    paths_hook = paths_hook_;
   }
+  if (paths_hook && !applied.empty()) paths_hook(applied);
   if (hook) hook(*batch);
 }
 
