@@ -205,6 +205,16 @@ Result<void> Socket::send_all(std::span<const std::byte> data) noexcept {
   return {};
 }
 
+void Socket::set_receive_buffer(int bytes) noexcept {
+  if (!valid()) return;
+#ifdef _WIN32
+  (void)::setsockopt(static_cast<SOCKET>(s_), SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes),
+                     static_cast<int>(sizeof(bytes)));
+#else
+  (void)::setsockopt(s_, SOL_SOCKET, SO_RCVBUF, &bytes, static_cast<socklen_t>(sizeof(bytes)));
+#endif
+}
+
 void Socket::set_send_timeout(std::chrono::milliseconds timeout) noexcept {
   if (!valid()) return;
 #ifdef _WIN32

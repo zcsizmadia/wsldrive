@@ -767,8 +767,12 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
   std::unique_lock lock(tree_mu_);
   note_mutation(nfrom, *gen);
   note_mutation(nto, *gen);
-  (void)tree_.remove_path(nto, mode());  // rename replaces whatever was at the destination
   const auto id = tree_.lookup(nfrom, mode());
+  // A rename replaces whatever was at the destination - unless the destination
+  // resolves to the source itself, which is what a case-only rename (`foo` ->
+  // `FOO`) does once paths resolve case-insensitively. Removing it there would
+  // delete the very thing being renamed, subtree and all.
+  if (const auto victim = tree_.lookup(nto, mode()); victim && victim != id) (void)tree_.remove(*victim);
   if (!id) return {};  // not mirrored (yet); the watcher's invalidation will add it
   // Move the NODE, not just its attributes: a renamed directory keeps its whole
   // subtree, and re-creating it empty at the new path would hide everything in

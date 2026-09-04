@@ -77,6 +77,12 @@ class Socket {
   /// dropping afterwards.
   void set_send_timeout(std::chrono::milliseconds timeout) noexcept;
 
+  /// Sets the receive buffer (SO_RCVBUF). Shrinking it makes a peer that
+  /// stops reading back-pressure the sender after very little data, which is
+  /// how the stuck-peer path is exercised in tests. The kernel is free to
+  /// round the value, and usually doubles it.
+  void set_receive_buffer(int bytes) noexcept;
+
   void set_nodelay(bool on) noexcept;
   void shutdown() noexcept;
   void close() noexcept;

@@ -123,13 +123,15 @@ TEST_F(AgentTest, ReadAttributes) {
 class LoopbackServer {
  public:
   explicit LoopbackServer(fs::path root, bool watch, std::size_t chunk_bytes = (4u << 20), std::string token = {},
-                          std::chrono::milliseconds handshake_timeout = 10s, std::size_t max_expanded = 100000)
+                          std::chrono::milliseconds handshake_timeout = 10s, std::size_t max_expanded = 100000,
+                          std::chrono::milliseconds broadcast_timeout = 5s)
       : server_({.root = std::move(root),
                  .watch = watch,
                  .coalescer = {},
                  .snapshot_chunk_bytes = chunk_bytes,
                  .token = std::move(token),
                  .handshake_timeout = handshake_timeout,
+                 .broadcast_timeout = broadcast_timeout,
                  .max_expanded_entries = max_expanded}) {
     auto l = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
     if (!l) throw std::runtime_error("bind failed");
@@ -1054,6 +1056,64 @@ TEST_F(AgentTest, SnapshotReplaysInvalidationsThatArriveDuringTheFetch) {
   }
   EXPECT_TRUE(present) << "an invalidation delivered during the fetch was lost to the tree replacement";
 }
+TEST_F(AgentTest, APeerThatStopsReadingDoesNotStallInvalidationsForTheOthers) {
+  // broadcast() ran on the single flusher thread with no send deadline. A peer
+  // that authenticated and then stopped reading filled its socket buffer and
+  // parked the flusher there for good: no other peer received another
+  // invalidation, and stop() hung joining the flusher.
+  //
+  // End-to-end cover for the two user-visible properties: the other peers keep
+  // receiving, and shutdown still returns. It does not guarantee the send
+  // deadline fires on any given run - whether the churn fills the stuck peer's
+  // buffer depends on how the coalescer batches it. The deadline itself is
+  // covered deterministically by Socket.SendToAPeerThatStopsReadingTimesOut...
+  LoopbackServer srv(root_, /*watch=*/true, 4u << 20, "s3cret-token", 10s, 100000,
+                     /*broadcast_timeout=*/300ms);
+  if (!srv.server().watching()) GTEST_SKIP() << "no filesystem watcher on this platform";
+
+  // The stuck peer. A tiny receive buffer makes the agent's send block after
+  // very little data, so the stall does not need megabytes of churn to provoke.
+  auto stuck_sock = net::connect(srv.endpoint());
+  ASSERT_TRUE(stuck_sock.has_value());
+  stuck_sock->set_receive_buffer(2048);
+  net::FrameChannel stuck(std::move(*stuck_sock));
+  {
+    std::vector<std::byte> pl;
+    proto::Writer w(pl);
+    proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                       .capabilities = 0,
+                                       .agent = "stuck/1",
+                                       .token = "s3cret-token"});
+    ASSERT_TRUE(stuck.send(proto::MsgType::Hello, 1, pl).has_value());
+    auto ack = stuck.receive(5s);  // reads the HelloAck, then never reads again
+    ASSERT_TRUE(ack.has_value());
+    ASSERT_EQ(ack->header.type, proto::MsgType::HelloAck);
+  }
+
+  // A healthy peer, draining normally.
+  auto good = connect_client(srv.endpoint());
+  ASSERT_NE(good, nullptr);
+  good->set_auth_token("s3cret-token");
+  ASSERT_TRUE(good->connect().has_value());
+  ASSERT_TRUE(good->fetch_snapshot().has_value());
+  const std::size_t before = good->with_tree([](const MetadataTree& t) { return t.size(); });
+
+  // Churn well past the stuck peer's buffer. Long names so each op carries real
+  // bytes; whether these arrive as per-path ops or collapse into a Rescan, the
+  // healthy peer's tree has to grow either way.
+  const std::string pad(80, 'p');
+  for (int i = 0; i < 500; ++i) write_file(root_ / ("churn-" + pad + std::to_string(i) + ".txt"), "x");
+
+  bool progressed = false;
+  for (int i = 0; i < 300 && !progressed; ++i) {
+    std::this_thread::sleep_for(50ms);
+    progressed = good->with_tree([](const MetadataTree& t) { return t.size(); }) > before + 400;
+  }
+  EXPECT_TRUE(progressed) << "a peer that stopped reading must not stop delivery to everyone else";
+  // LoopbackServer's destructor calls stop(), which hung here before the fix -
+  // reaching the end of this test is the other half of what is being asserted.
+}
+
 TEST_F(AgentTest, ReadCacheHitsOnADifferentlyCasedSpelling) {
   // The mount resolves case-insensitively (a Windows volume has to), so a
   // program opening `readme.md` for a stored `README.md` reaches the client with
@@ -1114,6 +1174,26 @@ TEST_F(AgentTest, WriteAndTruncateMoveTheMirrorVersionOn) {
 
   ASSERT_TRUE(c->truncate("README.md", 3).has_value());
   EXPECT_GT(mtime_of("README.md"), after_write);
+}
+
+TEST_F(AgentTest, ACaseOnlyRenameKeepsTheDirectoryAndItsSubtree) {
+  // Once paths resolve case-insensitively, the destination of `src` -> `SRC`
+  // resolves to the source. Treating that as "something is already there,
+  // remove it" would delete the very thing being renamed, subtree and all.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  c->set_lookup_mode(LookupMode::CaseInsensitive);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto has = [&](std::string_view p) {
+    return c->with_tree([&](const MetadataTree& t) { return t.lookup(p, LookupMode::Exact).has_value(); });
+  };
+  ASSERT_TRUE(has("src/include/a.hpp"));
+
+  ASSERT_TRUE(c->rename("src", "SRC").has_value());
+  EXPECT_TRUE(has("SRC/include/a.hpp")) << "the subtree must move with the directory, not be deleted";
+  EXPECT_FALSE(has("src/include/a.hpp"));
 }
 
 TEST_F(AgentTest, RenamingADirectoryEvictsItsSubtreeFromTheReadCache) {
