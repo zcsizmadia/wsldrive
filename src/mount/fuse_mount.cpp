@@ -370,9 +370,9 @@ void* op_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   // revalidation happens on open; FuseMount's invalidation hook covers the gap
   // between opens and shortens the window (see the comment on that thread).
   cfg->auto_cache = 1;
-  cfg->entry_timeout = 1.0;
+  cfg->entry_timeout = 0.0;   // EXPERIMENT: is the #88 flake stale name caching?
   cfg->attr_timeout = 1.0;
-  cfg->negative_timeout = 1.0;
+  cfg->negative_timeout = 0.0;
 
   if (conn != nullptr) {
     // Bigger payload per upcall. The transport already moves whole files in one
