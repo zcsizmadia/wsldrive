@@ -149,17 +149,63 @@ try { Start-Transcript -Path $LogPath -Append -ErrorAction Stop | Out-Null } cat
 # ===========================================================================
 Step 'wsldrive installer'
 
+# --- argument quoting -------------------------------------------------------
+# Quote one argument for a Windows command line, by CommandLineToArgvW rules:
+# backslashes are literal except before a quote, so any run of them that ends
+# up adjacent to the closing quote has to be doubled. Without this a value
+# containing a quote ends the argument early, and an InstallDir ending in a
+# backslash escapes the closing quote and swallows the next argument.
+function ConvertTo-WinArg([string] $s) {
+  $s = $s -replace '(\\*)"', '$1$1\"'
+  $s = $s -replace '(\\+)$', '$1$1'
+  return '"' + $s + '"'
+}
+
+# Quote one value for /bin/sh. Anything may appear inside single quotes except
+# a single quote, which is closed, escaped and reopened.
+function ConvertTo-ShQuoted([string] $s) { "'" + ($s -replace "'", "'\'''") + "'" }
+
+# Same, for a path that may start with ~. A leading ~ has to stay OUTSIDE the
+# quotes or the shell stops treating it as a home reference - and ~ is the
+# default mountpoint. Uses ${HOME} rather than a double-quoted expansion,
+# because this ends up inside an already double-quoted Windows argument.
+function ConvertTo-ShPath([string] $s) {
+  if ($s -eq '~') { return '${HOME}' }
+  if ($s.StartsWith('~/')) { return '${HOME}/' + (ConvertTo-ShQuoted $s.Substring(2)) }
+  return ConvertTo-ShQuoted $s
+}
+
 if (-not $DryRun -and -not (Test-Admin)) {
   Warn 'This installer needs Administrator rights (driver, HKLM registry, scheduled task).'
   Warn 'Relaunching elevated...'
   # Rebuild the original invocation (named + switch params) so nothing is lost on relaunch.
-  $argline = @('-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+  #
+  # The elevated process does not inherit this working directory, so a relative
+  # path on the command line no longer resolves over there - which is what made
+  # the README's own `-Config wsldrive.json` fail with "Config file not found"
+  # the moment it relaunched. Make the Windows-side path arguments absolute
+  # first. WslRoot and Mountpoint are deliberately NOT in this list: those are
+  # paths inside the distro, not on this filesystem.
+  $pathParams = @('InstallDir','BinDir','Config','LinuxAgent','WinRoot','LinuxBin','WinFspMsi')
+  $argline = @('-ExecutionPolicy','Bypass','-File',(ConvertTo-WinArg $PSCommandPath))
   foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-    if ($kv.Value -is [switch]) { if ($kv.Value.IsPresent) { $argline += "-$($kv.Key)" } }
-    else { $argline += "-$($kv.Key)"; $argline += "`"$($kv.Value)`"" }
+    if ($kv.Value -is [switch]) {
+      if ($kv.Value.IsPresent) { $argline += "-$($kv.Key)" }
+      continue
+    }
+    $v = [string]$kv.Value
+    if ($v -and $pathParams -contains $kv.Key) {
+      $v = try { (Resolve-Path -LiteralPath $v -ErrorAction Stop).Path }
+           catch { [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $v)) }
+    }
+    $argline += "-$($kv.Key)"
+    $argline += (ConvertTo-WinArg $v)
   }
-  Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argline
-  exit 0
+  $child = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argline -PassThru
+  # Wait, and pass the child's status on. Exiting 0 immediately told a scripted
+  # caller the install had succeeded before it had even begun.
+  $child.WaitForExit()
+  exit $child.ExitCode
 }
 if ($DryRun) { Warn 'DRY RUN — nothing will be changed.' }
 
@@ -642,16 +688,20 @@ foreach ($m in $mounts) {
     $exe = Join-Path $InstallDir 'wsldrive.exe'
     $ag  = if ($agentInWsl.ContainsKey($m.Distro) -and $agentInWsl[$m.Distro]) { $agentInWsl[$m.Distro] }
            elseif ($m.WslHome) { "$($m.WslHome)/.local/bin/wsldrived" } else { '' }
-    $agentArg = if ($ag) { " --agent $ag" } else { '' }
-    $arg = "mount $($m.Drive): --distro $($m.Distro) --wsl-root $($m.WslRoot)$agentArg --port $($m.Port)"
+    $agentArg = if ($ag) { " --agent $(ConvertTo-WinArg $ag)" } else { '' }
+    # Quoted: a distro name or served path with a space would otherwise split.
+    $arg = "mount $($m.Drive): --distro $(ConvertTo-WinArg $m.Distro) --wsl-root $(ConvertTo-WinArg $m.WslRoot)$agentArg --port $($m.Port)"
     Register-MountTask $m.TaskName $exe $arg $false
     Ok "$($m.Drive): <= $($m.Distro):$($m.WslRoot) at logon (TCP :$($m.Port))."
   } else {
     # Runs the Linux client inside WSL; it launches the Windows agent over interop.
     $hvArgB = if ($m.UseHv) { ' --hvsocket' } else { '' }
     $winRootFwd = $m.WinRoot -replace '\\','/'
-    $bcmd = "~/.local/bin/wsldrive mount $($m.Mountpoint) --win-root '$winRootFwd' --win-agent '$agentWslPath' --port $($m.Port)$hvArgB"
-    $arg  = "-d $($m.Distro) -- bash -lc `"mkdir -p $($m.Mountpoint); $bcmd`""
+    # sh-quoted: an unquoted `~/my win` became two words, so the task ran
+    # `mkdir -p ~/my win` (two directories) and mounted the wrong path.
+    $mpSh = ConvertTo-ShPath $m.Mountpoint
+    $bcmd = "~/.local/bin/wsldrive mount $mpSh --win-root $(ConvertTo-ShQuoted $winRootFwd) --win-agent $(ConvertTo-ShQuoted $agentWslPath) --port $($m.Port)$hvArgB"
+    $arg  = "-d $(ConvertTo-WinArg $m.Distro) -- bash -lc `"mkdir -p $mpSh; $bcmd`""
     Register-MountTask $m.TaskName 'wsl.exe' $arg $true
     Ok "$($m.Distro):$($m.Mountpoint) <= $($m.WinRoot) at logon ($(if($m.UseHv){'hvsocket'}else{'TCP'}) :$($m.Port))."
   }
