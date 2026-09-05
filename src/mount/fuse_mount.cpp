@@ -372,7 +372,22 @@ void* op_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   cfg->auto_cache = 1;
   cfg->entry_timeout = 1.0;
   cfg->attr_timeout = 1.0;
-  cfg->negative_timeout = 1.0;
+  // Do NOT cache negative lookups. A tool that asks "does the destination
+  // exist?" immediately before creating it - which is what Rename-Item and
+  // Move-Item do - leaves a cached "no" behind, and with a timeout that answer
+  // outlives the rename that follows it. The name then reads as missing for up
+  // to a second while an enumeration of the same directory lists it: exactly
+  // the split the #88 conformance failures showed, where the mount and the
+  // backing store both already held the right thing and only a per-name lookup
+  // disagreed.
+  //
+  // It costs nothing here. The point of a negative cache is to save round trips
+  // for names that are not there, and this mount answers every lookup from the
+  // in-RAM mirror without crossing the boundary at all. Measured on the
+  // serving-floor benchmark: walk, stat and read all unchanged. Zeroing
+  // entry_timeout as well is a different matter - that put stat up from 14 ms
+  // to ~200 ms and cost most of the read win - so the positive caches stay.
+  cfg->negative_timeout = 0.0;
 
   if (conn != nullptr) {
     // Bigger payload per upcall. The transport already moves whole files in one
