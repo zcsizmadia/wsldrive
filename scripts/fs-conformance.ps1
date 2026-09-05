@@ -104,12 +104,34 @@ if ($TraceInvalidations) {
 
 $script:pass = 0; $script:fail = 0
 # A check passes when its body runs without error and does not return $false.
-function Check([string]$name, [scriptblock]$body) {
+# Side-by-side listing of one mount-relative path, as the mount sees it and as
+# the backing store does. A bare "condition was false" does not say which of the
+# two views was wrong, which is the first thing worth knowing.
+function Dump([string]$rel) {
+  $m = if ($rel) { Join-Path $M $rel } else { $M }
+  $b = if ($rel) { Join-Path $work $rel } else { $work }
+  # Report absence as a value, so "gone on both sides" does not read as the two
+  # views disagreeing.
+  $ml = if (Test-Path -LiteralPath $m) { (Get-ChildItem -Force -LiteralPath $m -EA SilentlyContinue | ForEach-Object Name | Sort-Object) -join ' ' } else { '<absent>' }
+  $bl = if (Test-Path -LiteralPath $b) { (Get-ChildItem -Force -LiteralPath $b -EA SilentlyContinue | ForEach-Object Name | Sort-Object) -join ' ' } else { '<absent>' }
+  $label = if ($rel) { $rel } else { '<root>' }
+  Write-Host "        mount   [$label]: $ml"
+  Write-Host "        backing [$label]: $bl"
+  if ($ml -ne $bl) { Write-Host "        ^^ mount and backing store disagree here" }
+}
+
+# -Dump names mount-relative paths to list from both sides when the check fails.
+# Give it the parent of whatever the check touched, plus the path itself when it
+# is a directory whose contents are the point.
+function Check([string]$name, [scriptblock]$body, [string[]]$Dump = @()) {
   try {
     $r = & $body
     if ($r -is [bool] -and -not $r) { throw 'condition was false' }
     $script:pass++; Write-Host "  ok    $name"
-  } catch { $script:fail++; Write-Host "  FAIL  $name -- $($_.Exception.Message)" }
+  } catch {
+    $script:fail++; Write-Host "  FAIL  $name -- $($_.Exception.Message)"
+    foreach ($p in $Dump) { Dump $p }
+  }
 }
 # Something we knowingly do not support: report it, do not fail the run.
 function Known([string]$name, [scriptblock]$body) {
@@ -126,10 +148,10 @@ Check 'stat reports size'      { (Get-Item "$M\a.txt").Length -eq 11 }
 Check 'truncate'               { $fs = [IO.File]::Open("$M\a.txt", 'Open', 'ReadWrite'); try { $fs.SetLength(3) } finally { $fs.Dispose() }; (Raw "$M\a.txt") -eq 'hel' }
 Check 'mkdir (nested)'         { New-Item -ItemType Directory -Path "$M\d\sub\deeper" | Out-Null; Test-Path "$M\d\sub\deeper" -PathType Container }
 Check 'readdir sees entries'   { (Get-ChildItem "$M\" -Name) -contains 'a.txt' -and (Get-ChildItem "$M\d\sub" -Name) -contains 'deeper' }
-Check 'rename file'            { Move-Item "$M\a.txt" "$M\d\b.txt"; (Test-Path "$M\d\b.txt") -and -not (Test-Path "$M\a.txt") }
-Check 'rename directory keeps contents' { Rename-Item "$M\d\sub" 'sub2'; Test-Path "$M\d\sub2\deeper" }
-Check 'delete file'            { Copy-Item "$M\d\b.txt" "$M\gone.txt"; Remove-Item "$M\gone.txt"; -not (Test-Path "$M\gone.txt") }
-Check 'rmdir'                  { Remove-Item "$M\d\sub2\deeper"; -not (Test-Path "$M\d\sub2\deeper") }
+Check 'rename file'            { Move-Item "$M\a.txt" "$M\d\b.txt"; (Test-Path "$M\d\b.txt") -and -not (Test-Path "$M\a.txt") } -Dump '', 'd'
+Check 'rename directory keeps contents' { Rename-Item "$M\d\sub" 'sub2'; Test-Path "$M\d\sub2\deeper" } -Dump 'd', 'd\sub2', 'd\sub'
+Check 'delete file'            { Copy-Item "$M\d\b.txt" "$M\gone.txt"; Remove-Item "$M\gone.txt"; -not (Test-Path "$M\gone.txt") } -Dump ''
+Check 'rmdir'                  { Remove-Item "$M\d\sub2\deeper"; -not (Test-Path "$M\d\sub2\deeper") } -Dump 'd\sub2'
 Check 'missing file is an error' { try { Raw "$M\nope.txt"; $false } catch [IO.FileNotFoundException] { $true } }
 Check 'case-insensitive lookup'  { (Raw "$M\D\B.TXT") -eq 'hel' }
 
