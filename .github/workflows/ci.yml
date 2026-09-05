@@ -71,9 +71,8 @@ jobs:
       - name: Install WinFsp (runtime + SDK)
         shell: pwsh
         run: |
-          choco install winfsp -y --no-progress
-          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }   # 3010 = success, reboot pending
-          if ($LASTEXITCODE -ne 0) { throw "winfsp install failed ($LASTEXITCODE)" }
+          # Pinned and retried; see scripts/ci/choco-install.ps1.
+          pwsh -NoProfile -File scripts/ci/choco-install.ps1 -Package winfsp
           if (-not (Test-Path 'C:\Program Files (x86)\WinFsp\lib\winfsp-x64.lib')) { throw 'WinFsp SDK not found after install' }
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
@@ -168,9 +167,7 @@ jobs:
       - name: Compile the GUI installer (Inno Setup)
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
-          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }
-          if ($LASTEXITCODE -ne 0) { throw "innosetup install failed ($LASTEXITCODE)" }
+          pwsh -NoProfile -File scripts/ci/choco-install.ps1 -Package innosetup
           # build-installer.ps1 expects the source-tree layout; placeholders again.
           New-Item -ItemType Directory -Force -Path build\msvc-release\src\tools, build\linux-release\src\tools | Out-Null
           foreach ($f in 'wsldrive.exe','wsldrived.exe','wsldrivew.exe') { Set-Content -Path "build\msvc-release\src\tools\$f" -Value 'placeholder' }
