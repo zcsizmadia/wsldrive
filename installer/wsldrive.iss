@@ -167,6 +167,28 @@ begin
   if PageID = PageB.ID then Result := not PageChoices.Values[1];
 end;
 
+{ install.ps1 is given a single -Distro, so when BOTH directions are selected
+  the two mounts necessarily share one. The field on this page was still
+  editable and its value was then silently dropped. Show the distro that will
+  actually be used, and make it clear it is not editable here. }
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = PageB.ID then
+  begin
+    if PageChoices.Values[0] then
+    begin
+      PageB.Values[2] := Trim(PageA.Values[1]);
+      PageB.Edits[2].Enabled := False;
+      PageB.PromptLabels[2].Caption := 'WSL distro (shared with the drive-letter mount):';
+    end
+    else
+    begin
+      PageB.Edits[2].Enabled := True;
+      PageB.PromptLabels[2].Caption := 'WSL distro:';
+    end;
+  end;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   dl: string;
@@ -232,6 +254,23 @@ begin
   Result := a;
 end;
 
+{ Inno copies files at ssInstall, but install.ps1 only stops the mounts at
+  ssPostInstall - so upgrading over a live mount hit abort/retry/ignore on
+  wsldrive.exe, which was still running. Free the binaries first. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Res: Integer;
+begin
+  Result := '';
+  NeedsRestart := False;
+  Exec('powershell.exe',
+       '-NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference=''SilentlyContinue'';' +
+       'Get-ScheduledTask -TaskName ''wsldrive-mount-*'' | Stop-ScheduledTask;' +
+       'Get-Process wsldrive,wsldrivew,wsldrived | Stop-Process -Force;' +
+       'Start-Sleep -Milliseconds 800"',
+       '', SW_HIDE, ewWaitUntilTerminated, Res);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Res: Integer;
@@ -241,7 +280,9 @@ begin
     { Hand off to the script: it copies binaries, stages the Linux agent/client
       into WSL, registers hvsocket (Direction B), and creates the logon tasks. }
     if not Exec('powershell.exe', BuildArgs(), '', SW_SHOW, ewWaitUntilTerminated, Res) then
-      MsgBox('Setup could not run install.ps1.', mbError, MB_OK)
+      MsgBox('Setup could not run install.ps1. The drive was not set up.' + #13#10#13#10
+             + 'If a log was written it is in ' + ExpandConstant('{%TEMP}') + '\wsldrive-install.log',
+             mbError, MB_OK)
     else if Res <> 0 then
       MsgBox('install.ps1 exited with code ' + IntToStr(Res) + '. The drive was not set up.' + #13#10#13#10
              + 'Details are in ' + ExpandConstant('{%TEMP}') + '\wsldrive-install.log', mbError, MB_OK);
