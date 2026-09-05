@@ -370,8 +370,22 @@ void* op_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   // revalidation happens on open; FuseMount's invalidation hook covers the gap
   // between opens and shortens the window (see the comment on that thread).
   cfg->auto_cache = 1;
-  cfg->entry_timeout = 0.0;   // EXPERIMENT: is the #88 flake stale name caching?
+  cfg->entry_timeout = 1.0;
   cfg->attr_timeout = 1.0;
+  // Do NOT cache negative lookups. A tool that asks "does the destination
+  // exist?" immediately before creating it - which is what Rename-Item and
+  // Move-Item do - leaves a cached "no" behind, and with a timeout that answer
+  // outlives the rename that follows it. The name then reads as missing for up
+  // to a second, while an enumeration of the same directory lists it: exactly
+  // the split the #88 conformance failures showed, where the mount and the
+  // backing store both already held the right thing and only a per-name lookup
+  // disagreed.
+  //
+  // It costs nothing here. The point of a negative cache is to avoid round
+  // trips for names that are not there, and this mount answers every lookup
+  // from the in-RAM mirror without crossing the boundary at all. Measured on
+  // the serving-floor benchmark: walk, stat and read are all unchanged, where
+  // zeroing entry_timeout as well put stat up from 14 ms to ~200 ms.
   cfg->negative_timeout = 0.0;
 
   if (conn != nullptr) {
