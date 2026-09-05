@@ -9,6 +9,10 @@
 #include "net/socket.hpp"
 
 #ifdef _WIN32
+// wide.hpp sits under _WIN32, not WSLDRIVE_HAVE_WINFSP: `doctor` needs it and
+// exists in every Windows build, including one made without the WinFsp SDK.
+#include "platform/win/wide.hpp"
+
 #include <windows.h>
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
@@ -38,13 +42,35 @@ namespace {
 
 void print_version(const char* who) { std::printf("%s %s\n", who, std::string(wsld::kVersionString).c_str()); }
 
+#ifdef _WIN32
+// Runs a command with no window and returns its exit code (or a non-zero
+// sentinel if it could not be started). doctor only ever needs pass/fail.
+DWORD run_quiet(std::wstring cmd) {
+  cmd.push_back(L'\0');
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  DWORD code = 1;
+  if (::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    ::WaitForSingleObject(pi.hProcess, 15000);
+    ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hProcess);
+    ::CloseHandle(pi.hThread);
+  }
+  return code;
+}
+
+std::wstring widen(std::string_view s) { return wsld::platform::win::to_wide(s); }
+#endif
+
 void usage() {
   std::fprintf(stderr, "wsldrive %s\n", std::string(wsld::kVersionString).c_str());
   std::fputs(
       "usage:\n"
       "  wsldrive fetch (--connect <endpoint> | --listen <endpoint>) [--watch] [--read <path>] [--lookups N]\n"
 #ifdef _WIN32
-      "  wsldrive doctor                                      (check WinFsp + WSL environment)\n"
+      "  wsldrive doctor [--distro X] [--hvsocket] [--port N] [--pause]\n"
+      "                                                       (check the WinFsp + WSL environment)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
       "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback] [--no-prefetch]  (attach to an agent)\n"
@@ -105,6 +131,22 @@ int main(int argc, char** argv) {
 
 #ifdef _WIN32
   if (command == "doctor") {
+    // doctor [--distro X] [--hvsocket] [--port N] [--pause]
+    std::string want_distro;
+    int want_port = 0;
+    bool check_hv = false;
+    bool pause_at_end = false;
+    for (int i = 2; i < argc; ++i) {
+      const std::string_view a = argv[i];
+      if (a == "--distro" && i + 1 < argc) want_distro = argv[++i];
+      else if (a == "--port" && i + 1 < argc) want_port = std::atoi(argv[++i]);
+      else if (a == "--hvsocket") check_hv = true;
+      else if (a == "--pause") pause_at_end = true;   // the installer runs doctor in a console that closes
+      else {
+        std::fprintf(stderr, "doctor: unknown option %.*s\n", static_cast<int>(a.size()), a.data());
+        return 2;
+      }
+    }
     int problems = 0;
     // WinFsp: present at build time?
 #ifdef WSLDRIVE_HAVE_WINFSP
@@ -163,6 +205,88 @@ int main(int argc, char** argv) {
         ++problems;
       }
     }
+    // The named distro, not just the default one. `mount --distro X` fails for
+    // its own reasons if X is not there, and doctor was not checking it.
+    if (!want_distro.empty()) {
+      if (run_quiet(L"wsl.exe -d " + widen(want_distro) + L" -e true") == 0)
+        std::printf("[ok]   distro '%s' runs commands\n", want_distro.c_str());
+      else {
+        std::printf("[fail] distro '%s' did not run a command (is the name right? `wsl -l -v`)\n",
+                    want_distro.c_str());
+        ++problems;
+      }
+    }
+
+    // The agent staged into the distro by the installer. Without it, a mount
+    // that auto-launches the agent fails at launch rather than at configure.
+    {
+      const std::wstring d = want_distro.empty() ? L"" : L" -d " + widen(want_distro);
+      const std::wstring where = want_distro.empty() ? L"the default distro" : widen(want_distro);
+      if (run_quiet(L"wsl.exe" + d + L" -e sh -c \"test -x \\\"$HOME/.local/bin/wsldrived\\\"\"") == 0)
+        std::printf("[ok]   agent staged in %ls (~/.local/bin/wsldrived)\n", where.c_str());
+      else
+        std::printf("[warn] no agent staged in %ls; `mount --agent <path>` or re-run the installer\n",
+                    where.c_str());  // not a failure: --agent can point elsewhere
+    }
+
+    // Hyper-V socket service GUIDs. Direction B needs these registered, and the
+    // docs send people to doctor to find out - which it could not answer.
+    if (check_hv) {
+      const int first = want_port != 0 ? want_port : 5700;
+      int registered = 0;
+      for (int p = first; p < first + 10; ++p) {
+        wchar_t sub[160]{};
+        _snwprintf_s(sub, _TRUNCATE,
+                     L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Virtualization\\GuestCommunicationServices\\"
+                     L"%08X-facb-11e6-bd58-64006a7986d3",
+                     static_cast<unsigned>(p));
+        HKEY k{};
+        if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+          ++registered;
+          ::RegCloseKey(k);
+        }
+      }
+      if (registered == 10)
+        std::printf("[ok]   hvsocket service GUIDs registered for ports %d-%d\n", first, first + 9);
+      else {
+        std::printf("[fail] only %d/10 hvsocket GUIDs registered for ports %d-%d\n"
+                    "       run scripts\\register-hvsocket.ps1 elevated, then `wsl --shutdown`\n",
+                    registered, first, first + 9);
+        ++problems;
+      }
+    }
+
+    // Is the loopback port actually free? A stale agent holding it turns into a
+    // confusing mount failure later.
+    if (want_port != 0) {
+      wsld::net::init_network();
+      auto ep = wsld::net::Endpoint::parse("tcp://127.0.0.1:" + std::to_string(want_port));
+      bool free_port = false;
+      if (ep) {
+        auto l = wsld::net::Listener::bind(*ep);
+        if (l) {
+          free_port = true;
+          l->close();
+        }
+      }
+      if (free_port) {
+        std::printf("[ok]   TCP port %d is free\n", want_port);
+      } else {
+        std::printf("[fail] TCP port %d is in use (a previous agent still running?)\n", want_port);
+        ++problems;
+      }
+    }
+
+    struct PauseAtExit {
+      bool on;
+      ~PauseAtExit() {
+        if (!on) return;
+        std::printf("\nPress Enter to close...");
+        std::fflush(stdout);
+        (void)std::getchar();
+      }
+    } pause_guard{pause_at_end};
+
     std::printf("\n%s\n", problems == 0 ? "All checks passed. Mount with: wsldrive mount W: --distro <name> --wsl-root <path>"
                                         : "Some checks failed; resolve the items above before mounting.");
     return problems == 0 ? 0 : 1;
