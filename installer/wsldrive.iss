@@ -258,7 +258,7 @@ begin
 end;
 
 [Run]
-Filename: "{app}\wsldrive.exe"; Parameters: "doctor"; Description: "Check the wsldrive environment"; Flags: postinstall runascurrentuser skipifsilent
+Filename: "{app}\wsldrive.exe"; Parameters: "doctor --pause"; Description: "Check the wsldrive environment"; Flags: postinstall runascurrentuser skipifsilent
 
 [UninstallRun]
 Filename: "powershell.exe"; \
