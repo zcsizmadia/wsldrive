@@ -77,12 +77,12 @@ jobs:
       - name: Install WinFsp (SDK) and Inno Setup
         shell: pwsh
         run: |
-          choco install winfsp -y --no-progress
-          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }   # 3010 = success, reboot pending
-          if ($LASTEXITCODE -ne 0) { throw "winfsp install failed ($LASTEXITCODE)" }
-          choco install innosetup -y --no-progress
-          if ($LASTEXITCODE -eq 3010) { $global:LASTEXITCODE = 0 }
-          if ($LASTEXITCODE -ne 0) { throw "innosetup install failed ($LASTEXITCODE)" }
+          # Pinned and retried; see scripts/ci/choco-install.ps1. Both end up
+          # inside the release artifacts - wsldrive.exe links the WinFsp SDK and
+          # the Inno Setup compiler produces wsldrive-setup.exe - so neither is
+          # something to pull at whatever version happens to be current.
+          pwsh -NoProfile -File scripts/ci/choco-install.ps1 -Package winfsp
+          pwsh -NoProfile -File scripts/ci/choco-install.ps1 -Package innosetup
           $inc = 'C:\Program Files (x86)\WinFsp\inc\fuse3\fuse.h'
           $lib = 'C:\Program Files (x86)\WinFsp\lib\winfsp-x64.lib'
           if (-not (Test-Path $inc) -or -not (Test-Path $lib)) {
