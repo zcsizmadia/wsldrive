@@ -16,12 +16,21 @@
 [CmdletBinding()]
 param(
   [string] $Config  = 'release',
-  [string] $Version = '0.1.0',
+  # Defaults to the project version in CMakeLists.txt. Hard-coding it here is
+  # how the script came to stamp 0.1.0 onto a 0.9.0 build.
+  [string] $Version = '',
   [switch] $InstallInno
 )
 
 $ErrorActionPreference = 'Stop'
 $root    = Split-Path -Parent $PSScriptRoot
+
+if (-not $Version) {
+  $cml = Get-Content (Join-Path $root 'CMakeLists.txt') -Raw
+  if ($cml -match '(?m)^\s*VERSION\s+(\d+\.\d+\.\d+)\s*$') { $Version = $Matches[1] }
+  else { throw "could not read VERSION from CMakeLists.txt; pass -Version explicitly" }
+}
+Write-Host "building installer for wsldrive $Version"
 $iss     = Join-Path $root 'installer\wsldrive.iss'
 $binDir  = Join-Path $root "build\msvc-$Config\src\tools"
 $linux   = Join-Path $root 'build\linux-release\src\tools\wsldrive'    # client (Direction B)

@@ -5,6 +5,7 @@
 #include "agent/server.hpp"
 
 #include "core/auth_token.hpp"
+#include "core/version.hpp"
 #include "net/frame_channel.hpp"
 #include "net/socket.hpp"
 
@@ -19,19 +20,28 @@
 namespace {
 
 void usage() {
+  std::fprintf(stderr, "wsldrived %s\n", std::string(wsld::kVersionString).c_str());
   std::fputs(
       "usage: wsldrived --root <dir> (--listen <endpoint> | --connect <endpoint>) [--no-watch] [--exit-when-idle]\n"
       "                 [--cross-filesystems]\n"
       "  endpoints: tcp://host:port | vsock://cid:port | hv://port\n"
       "  --exit-when-idle:    serve a single client session then exit (used by auto-launch)\n"
       "  --cross-filesystems: also descend into mount points below --root. Off by default, so\n"
-      "                       serving / skips /proc, /sys, /dev, /run and foreign mounts like /mnt/c.\n",
+      "                       serving / skips /proc, /sys, /dev, /run and foreign mounts like /mnt/c.\n"
+      "  --version:           print the version and exit.\n",
       stderr);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2) {
+    const std::string_view first = argv[1];
+    if (first == "--version" || first == "-V") {
+      std::printf("wsldrived %s\n", std::string(wsld::kVersionString).c_str());
+      return 0;
+    }
+  }
   std::filesystem::path root;
   std::string listen, connect;
   bool watch = true;

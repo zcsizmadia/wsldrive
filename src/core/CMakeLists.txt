@@ -12,7 +12,7 @@ add_library(wsldrive_core STATIC
 add_library(wsldrive::core ALIAS wsldrive_core)
 
 target_include_directories(wsldrive_core
-  PUBLIC "${CMAKE_SOURCE_DIR}/src"
+  PUBLIC "${CMAKE_SOURCE_DIR}/src" "${CMAKE_BINARY_DIR}/generated"
   PRIVATE "${WSLDRIVE_BLAKE3_INCLUDE_DIR}")
 target_link_libraries(wsldrive_core
   PUBLIC wsldrive::options
