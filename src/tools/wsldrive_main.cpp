@@ -9,6 +9,10 @@
 #include "net/socket.hpp"
 
 #ifdef _WIN32
+// wide.hpp sits under _WIN32, not WSLDRIVE_HAVE_WINFSP: `doctor` needs it and
+// exists in every Windows build, including one made without the WinFsp SDK.
+#include "platform/win/wide.hpp"
+
 #include <windows.h>
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
@@ -18,7 +22,6 @@
 #endif
 #ifdef WSLDRIVE_HAVE_WINFSP
 #include "platform/win/wsl_launch.hpp"
-#include "platform/win/wide.hpp"
 #endif
 #if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
 #include "platform/linux/win_launch.hpp"
