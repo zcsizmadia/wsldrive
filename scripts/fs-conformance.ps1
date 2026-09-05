@@ -67,6 +67,17 @@ function Cleanup {
   Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
 }
 
+# ErrorActionPreference is Stop, so anything unexpected outside a Check - a
+# missing binary, a path that vanished - terminates the script. Without this
+# the drive letter stays mounted and the agent keeps running, and the next run
+# then fails to take the letter. `trap` covers the whole body without having to
+# wrap and re-indent it.
+trap {
+  Write-Host "  ERROR (outside a check): $($_.Exception.Message)"
+  Cleanup
+  exit 97
+}
+
 Write-Host "serving $work $(if ($Writeback) { '(write-back)' } else { '(write-through)' })"
 $agentProc = Start-Process -FilePath $agent -PassThru -NoNewWindow `
   -ArgumentList @('--root', "`"$work`"", '--listen', "tcp://127.0.0.1:$Port") `
