@@ -230,6 +230,31 @@ TEST(Messages, HugeClaimedCountsFailWithoutHugeAllocation) {
   }
 }
 
+TEST(Messages, ReadManyRequestIsCappedEvenWhenTheBytesAreThere) {
+  // The "count beyond the bytes that follow" check above is not enough on its
+  // own: a full 64 MiB frame of one-byte paths carries its own bytes and would
+  // decode to millions of entries, each of which the agent then stats. Bound
+  // the count itself. The client's read-ahead never sends more than 512.
+  const std::size_t over = kMaxReadManyPaths + 1;
+  std::vector<std::byte> buf;
+  Writer w(buf);
+  w.varint(over);
+  for (std::size_t i = 0; i < over; ++i) w.string("f");  // genuinely present
+  Reader r(buf);
+  auto q = read_read_many_request(r);
+  EXPECT_FALSE(q.has_value()) << "a request past the cap must be refused, not decoded";
+
+  // One at the cap still decodes, so the limit is not off by one.
+  std::vector<std::byte> ok_buf;
+  Writer ok_w(ok_buf);
+  ok_w.varint(kMaxReadManyPaths);
+  for (std::size_t i = 0; i < kMaxReadManyPaths; ++i) ok_w.string("f");
+  Reader ok_r(ok_buf);
+  auto good = read_read_many_request(ok_r);
+  ASSERT_TRUE(good.has_value());
+  EXPECT_EQ(good->paths.size(), kMaxReadManyPaths);
+}
+
 TEST(Messages, ReadRequestAndResponse) {
   std::vector<std::byte> buf;
   Writer w(buf);

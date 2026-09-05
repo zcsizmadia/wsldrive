@@ -95,6 +95,13 @@ class RemoteRoot {
   [[nodiscard]] Result<std::size_t> read_into(std::string_view path, std::uint64_t offset, std::span<std::byte> out,
                                               std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
+  /// Ceilings on a streamed snapshot. Nothing else bounds the accumulation, so
+  /// a server that keeps setting the more-frames flag can grow these until the
+  /// client is out of memory. A million nodes is far past any tree worth
+  /// mounting, and the byte cap covers pathological name lengths.
+  static constexpr std::size_t kMaxSnapshotEntries = 1u << 20;
+  static constexpr std::size_t kMaxSnapshotBytes = 1u << 30;  // 1 GiB
+
   /// Largest file the read cache will hold whole; larger reads stream uncached.
   static constexpr std::uint64_t kMaxCacheableFile = 8u << 20;
 

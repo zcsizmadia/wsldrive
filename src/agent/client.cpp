@@ -861,9 +861,17 @@ void RemoteRoot::reader_loop() {
         std::lock_guard lock(pending->mu);
         pending->snap_bytes += f->payload.size();
         proto::Reader r(f->payload);
-        if (auto hdr = proto::read_snapshot_header(r)) {
+        // A server that never clears the more-frames flag would otherwise grow
+        // these two vectors without limit.
+        if (pending->snap_bytes > kMaxSnapshotBytes) {
+          pending->stream_ok = false;
+        } else if (auto hdr = proto::read_snapshot_header(r)) {
           pending->snap_generation = hdr->generation;
           for (std::uint32_t i = 0; i < hdr->count; ++i) {
+            if (pending->snap_entries.size() >= kMaxSnapshotEntries) {
+              pending->stream_ok = false;
+              break;
+            }
             auto e = proto::read_snapshot_entry(r);
             if (!e) {
               pending->stream_ok = false;

@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <system_error>
 #include <thread>
@@ -511,7 +512,23 @@ bool fopen_failed_transiently(const std::filesystem::path& p) noexcept {
 #endif
 }
 
+// Seeks to an absolute byte offset, reporting whether it worked. The platform
+// calls take a signed offset, so anything past the signed range wraps negative
+// and the seek fails - and left unchecked, the stream simply stays where it was
+// (position 0 on a fresh handle), so the caller reads or writes the wrong part
+// of the file rather than getting an error. Callers bound the offset first;
+// this is the check that makes a bound failure loud.
+bool seek_to(std::FILE* fp, std::uint64_t offset) noexcept {
+  if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return false;
+#ifdef _WIN32
+  return _fseeki64(fp, static_cast<long long>(offset), SEEK_SET) == 0;
+#else
+  return fseeko(fp, static_cast<off_t>(offset), SEEK_SET) == 0;
+#endif
+}
+
 std::FILE* fopen_with_retry(const std::filesystem::path& p, const char* mode) {
+
   std::FILE* fp = nullptr;
   for (int delay_ms = 1;; delay_ms *= 2) {
 #ifdef _WIN32
@@ -568,14 +585,17 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!q) return fail(q.error());
       auto full = resolve(q->path);
       if (!full) return reject(full.error(), q->path);
+      // An offset past the ceiling would wrap negative in the seek call below,
+      // which then fails - and an unchecked failure leaves the stream at 0, so
+      // the write silently lands at the start of the file instead.
+      if (q->offset > proto::kMaxFileOffset) return reject(Errc::InvalidArgument, q->path);
       std::FILE* fp = fopen_with_retry(*full, "r+b");
       if (fp == nullptr && errno == ENOENT) fp = fopen_with_retry(*full, "w+b");
       if (fp == nullptr) return reject(Errc::IoError, q->path);
-#ifdef _WIN32
-      _fseeki64(fp, static_cast<long long>(q->offset), SEEK_SET);
-#else
-      fseeko(fp, static_cast<off_t>(q->offset), SEEK_SET);
-#endif
+      if (!seek_to(fp, q->offset)) {
+        std::fclose(fp);
+        return reject(Errc::IoError, q->path);
+      }
       const std::size_t n = q->data.empty() ? 0 : std::fwrite(q->data.data(), 1, q->data.size(), fp);
       std::fclose(fp);
       if (n != q->data.size()) return reject(Errc::IoError, q->path);
@@ -588,6 +608,9 @@ Result<void> RootServer::handle_mutation(const net::Frame& f, net::FrameChannel&
       if (!q) return fail(q.error());
       auto full = resolve(q->path);
       if (!full) return reject(full.error(), q->path);
+      // Without a bound this happily asks the filesystem for an 8 EiB sparse
+      // file.
+      if (q->size > proto::kMaxFileOffset) return reject(Errc::InvalidArgument, q->path);
       const std::error_code ec = with_share_retry(*full, [&] {
         std::error_code e;
         fs::resize_file(*full, q->size, e);
@@ -728,11 +751,10 @@ Result<void> RootServer::send_read(const net::Frame& f, net::FrameChannel& ch) {
     std::FILE* fp = std::fopen(full.c_str(), "rb");
 #endif
     if (fp == nullptr) return send_error(f.header.request_id, Errc::IoError, rel, ch);
-#ifdef _WIN32
-    _fseeki64(fp, static_cast<long long>(offset), SEEK_SET);
-#else
-    fseeko(fp, static_cast<off_t>(offset), SEEK_SET);
-#endif
+    if (!seek_to(fp, offset)) {  // unchecked, this would read from 0 and answer with the wrong bytes
+      std::fclose(fp);
+      return send_error(f.header.request_id, Errc::IoError, rel, ch);
+    }
     const std::size_t got = std::fread(data.data(), 1, data.size(), fp);
     std::fclose(fp);
     data.resize(got);
