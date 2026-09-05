@@ -26,11 +26,18 @@ done
 
 WORK=$(mktemp -d)
 MNT=$(mktemp -d)
+# Scratch that must NOT sit under the served tree (writing there would show up
+# on the mount and disturb the checks) but must still be cleaned up.
+SCRATCH=$(mktemp -d)
 export WSLDRIVE_TOKEN="conformance-$$"
 cleanup() {
   fusermount3 -u "$MNT" 2>/dev/null
-  kill "${AGENT_PID:-0}" "${CLI_PID:-0}" 2>/dev/null
-  rm -rf "$WORK" "$MNT" 2>/dev/null
+  # Never expand to a bare 0: `kill 0` signals the whole process group, which
+  # includes this shell and, in CI, the step running it.
+  [ -n "${AGENT_PID:-}" ] && kill "$AGENT_PID" 2>/dev/null
+  [ -n "${CLI_PID:-}" ] && kill "$CLI_PID" 2>/dev/null
+  rm -rf "$WORK" "$MNT" "$SCRATCH" 2>/dev/null
+  return 0
 }
 trap cleanup EXIT
 
@@ -155,7 +162,7 @@ check "dangling link keeps its target" "[ \"\$(readlink '$MNT/dangling')\" = /no
 
 echo "== data integrity =="
 check "1 MiB round-trip"       "head -c 1048576 /dev/urandom > '$MNT/big.bin' && [ \$(stat -c%s '$MNT/big.bin') -eq 1048576 ]"
-check "content matches"        "cp '$MNT/big.bin' '$WORK/../cmp.bin' 2>/dev/null; cmp -s '$MNT/big.bin' '$WORK/big.bin'"
+check "content matches"        "cp '$MNT/big.bin' '$SCRATCH/cmp.bin' 2>/dev/null; cmp -s '$MNT/big.bin' '$WORK/big.bin'"
 many_files() {   # a loop is clearer as a function than as a quoted eval string
   mkdir -p "$MNT/many" || return 1
   for i in $(seq 1 200); do echo "$i" > "$MNT/many/f$i" || return 1; done
