@@ -1,5 +1,6 @@
 #include "agent/client.hpp"
 
+#include "core/auth_token.hpp"
 #include "core/path.hpp"
 #include "core/version.hpp"
 
@@ -59,23 +60,52 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
   if (!reader_.joinable()) reader_ = std::thread([this] { reader_loop(); });
   if (!prefetch_.joinable()) prefetch_ = std::thread([this] { prefetch_loop(); });
   if (!rescan_.joinable()) rescan_ = std::thread([this] { rescan_loop(); });
+  // Mutual handshake. The old exchange sent the shared secret to whoever
+  // accepted on the endpoint, so anything that bound the port first collected
+  // the secret and could then serve a tree of its own choosing into a drive the
+  // user trusts. Now: we send a nonce, the agent proves it knows the secret,
+  // and only if that checks out do we prove ourselves. The secret itself never
+  // goes on the wire in either direction.
+  const std::string client_nonce = token_.empty() ? std::string() : generate_auth_nonce();
+  if (!token_.empty() && client_nonce.empty()) return fail(Errc::IoError);  // no entropy: refuse
+
   std::vector<std::byte> payload;
   proto::Writer w(payload);
-  proto::write_hello(
-      w, proto::Hello{
-             .protocol_version = proto::kVersion,
-             .capabilities = 0,
-             .agent = agent_string("wsldrive"),
-             .token = token_});
+  proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                     .capabilities = 0,
+                                     .agent = agent_string("wsldrive"),
+                                     .nonce = client_nonce,
+                                     .proof = {}});
   auto p = request(proto::MsgType::Hello, payload, timeout);
   if (!p) return fail(p.error());
-  // An Error reply (e.g. a rejected token) is already decoded by request().
+  // An Error reply (e.g. a rejected peer) is already decoded by request().
   if ((*p)->type != proto::MsgType::HelloAck) return fail(Errc::ProtocolError);
   proto::Reader r((*p)->payload);
   auto ack = proto::read_hello(r);
   if (!ack) return fail(ack.error());
+
+  if (!token_.empty()) {
+    // Check the agent BEFORE proving anything to it. A wrong or absent proof
+    // means this is not the agent our launcher started.
+    const std::string expected = auth_proof(token_, client_nonce, ack->nonce, true);
+    if (!constant_time_equal(ack->proof, expected)) return fail(Errc::Unauthorized);
+
+    std::vector<std::byte> ap;
+    proto::Writer aw(ap);
+    proto::write_hello(aw, proto::Hello{.protocol_version = proto::kVersion,
+                                        .capabilities = 0,
+                                        .agent = {},
+                                        .nonce = {},
+                                        .proof = auth_proof(token_, client_nonce, ack->nonce, false)});
+    auto a = request(proto::MsgType::Auth, ap, timeout);
+    if (!a) return fail(a.error());
+    if ((*a)->type != proto::MsgType::Ok) return fail(Errc::Unauthorized);
+  }
+
   proto::Hello out = *ack;
-  out.agent = {};  // the view would dangle once `p` dies; callers only need version/caps
+  out.agent = {};  // the views would dangle once `p` dies; callers only need version/caps
+  out.nonce = {};
+  out.proof = {};
   return out;
 }
 

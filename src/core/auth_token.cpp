@@ -1,5 +1,7 @@
 #include "core/auth_token.hpp"
 
+#include "core/hash.hpp"
+
 #include <array>
 #include <cstdlib>
 
@@ -49,6 +51,41 @@ std::string auth_token_from_env() {
   const char* v = std::getenv(kAuthTokenEnv);
   return v != nullptr ? std::string(v) : std::string();
 #endif
+}
+
+
+
+namespace {
+
+// Length-prefix every field so that concatenating them cannot be ambiguous:
+// without it, ("ab", "c") and ("a", "bc") would hash identically.
+void feed(Blake3Hasher& h, std::string_view s) {
+  h.update(std::to_string(s.size()));
+  h.update(":");
+  h.update(s);
+}
+
+}  // namespace
+
+std::string generate_auth_nonce() { return generate_auth_token(); }
+
+std::string auth_proof(std::string_view token, std::string_view client_nonce, std::string_view server_nonce,
+                       bool from_server) {
+  Blake3Hasher h;
+  feed(h, "wsldrive-auth-v1");                     // domain separation
+  feed(h, from_server ? "server" : "client");      // direction, so proofs are not interchangeable
+  feed(h, token);
+  feed(h, client_nonce);
+  feed(h, server_nonce);
+  return h.finalize().hex();
+}
+
+bool constant_time_equal(std::string_view a, std::string_view b) noexcept {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    diff = static_cast<unsigned char>(diff | (static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i])));
+  return diff == 0;
 }
 
 }  // namespace wsld
