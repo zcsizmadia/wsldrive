@@ -1,4 +1,5 @@
 add_executable(core_tests
+  auth_token_test.cpp
   coalescer_test.cpp
   flat_map_test.cpp
   hash_test.cpp

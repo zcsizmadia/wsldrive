@@ -1080,16 +1080,35 @@ TEST_F(AgentTest, APeerThatStopsReadingDoesNotStallInvalidationsForTheOthers) {
   stuck_sock->set_receive_buffer(2048);
   net::FrameChannel stuck(std::move(*stuck_sock));
   {
+    // The full mutual handshake by hand: nonce out, check nothing (this peer is
+    // only pretending to be well behaved), prove ourselves, then stop reading.
+    const std::string nonce = "client-nonce-for-the-stuck-peer";
     std::vector<std::byte> pl;
     proto::Writer w(pl);
     proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
                                        .capabilities = 0,
                                        .agent = "stuck/1",
-                                       .token = "s3cret-token"});
+                                       .nonce = nonce,
+                                       .proof = {}});
     ASSERT_TRUE(stuck.send(proto::MsgType::Hello, 1, pl).has_value());
-    auto ack = stuck.receive(5s);  // reads the HelloAck, then never reads again
+    auto ack = stuck.receive(5s);
     ASSERT_TRUE(ack.has_value());
     ASSERT_EQ(ack->header.type, proto::MsgType::HelloAck);
+    proto::Reader ar(ack->payload);
+    auto server_hello = proto::read_hello(ar);
+    ASSERT_TRUE(server_hello.has_value());
+
+    std::vector<std::byte> ap;
+    proto::Writer aw(ap);
+    proto::write_hello(aw, proto::Hello{.protocol_version = proto::kVersion,
+                                        .capabilities = 0,
+                                        .agent = {},
+                                        .nonce = {},
+                                        .proof = auth_proof("s3cret-token", nonce, server_hello->nonce, false)});
+    ASSERT_TRUE(stuck.send(proto::MsgType::Auth, 2, ap).has_value());
+    auto ok = stuck.receive(5s);  // reads the Ok, then never reads again
+    ASSERT_TRUE(ok.has_value());
+    ASSERT_EQ(ok->header.type, proto::MsgType::Ok);
   }
 
   // A healthy peer, draining normally.
@@ -1142,6 +1161,89 @@ TEST_F(AgentTest, AbsurdOffsetsAndSizesAreRefusedRatherThanActedOn) {
   auto edited = c->read("README.md", 0, 100);
   ASSERT_TRUE(edited.has_value());
   EXPECT_EQ(std::string(reinterpret_cast<const char*>(edited->data()), edited->size()), "# XXadme\n");
+}
+
+TEST_F(AgentTest, ClientRefusesAnAgentThatCannotProveTheSharedSecret) {
+  // The impostor case. Anything that binds the endpoint first used to be handed
+  // the shared secret by the client, and could then serve a tree of its own
+  // choosing into a drive the user trusts. The client must check the agent
+  // before it says anything, and walk away when the proof does not hold up.
+  LoopbackServer impostor(root_, /*watch=*/false, 4u << 20, "not-the-real-secret");
+  auto c = connect_client(impostor.endpoint());
+  ASSERT_NE(c, nullptr);
+  c->set_auth_token("the-real-secret");
+
+  auto hello = c->connect();
+  ASSERT_FALSE(hello.has_value()) << "an agent that cannot prove the secret must be refused";
+  EXPECT_EQ(hello.error(), Errc::Unauthorized);
+
+  // And nothing is served over that session.
+  EXPECT_FALSE(c->fetch_snapshot().has_value());
+}
+
+TEST_F(AgentTest, ClientProvesNothingToAnAgentThatFailedItsOwnProof) {
+  // The ordering is the security property, not just the refusal. The client has
+  // to conclude from the HelloAck alone that this is not our agent, and send
+  // nothing further - the previous handshake handed over the shared secret in
+  // the opening frame, before it knew anything at all about the peer.
+  auto listener = net::Listener::bind(*net::Endpoint::parse("tcp://127.0.0.1:0"));
+  ASSERT_TRUE(listener.has_value());
+  const auto ep = listener->local();
+
+  std::atomic<bool> saw_auth{false};
+  std::thread impostor([&] {
+    auto sock = listener->accept(std::chrono::seconds(5));
+    if (!sock) return;
+    net::FrameChannel ch(std::move(*sock));
+    auto hello = ch.receive(std::chrono::seconds(5));
+    if (!hello) return;
+    // A proof we could not possibly compute without the secret.
+    std::vector<std::byte> pl;
+    proto::Writer w(pl);
+    proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                       .capabilities = 0,
+                                       .agent = "impostor/1",
+                                       .nonce = "impostor-nonce",
+                                       .proof = std::string(64, '0')});
+    (void)ch.send(proto::MsgType::HelloAck, hello->header.request_id, pl);
+    // Anything arriving now would be the client proving itself to an impostor.
+    if (auto f = ch.receive(std::chrono::seconds(2)); f && f->header.type == proto::MsgType::Auth)
+      saw_auth.store(true);
+  });
+
+  auto c = connect_client(ep);
+  ASSERT_NE(c, nullptr);
+  c->set_auth_token("the-real-secret");
+  auto hello = c->connect();
+  EXPECT_FALSE(hello.has_value());
+  EXPECT_EQ(hello.error(), Errc::Unauthorized);
+  impostor.join();
+  EXPECT_FALSE(saw_auth.load()) << "the client must not prove itself to an agent it has not verified";
+}
+
+TEST_F(AgentTest, MatchingSecretsAuthenticateBothWays) {
+  LoopbackServer srv(root_, /*watch=*/false, 4u << 20, "shared-secret");
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  c->set_auth_token("shared-secret");
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  EXPECT_TRUE(c->with_tree([](const MetadataTree& t) { return t.lookup("README.md").has_value(); }));
+}
+
+TEST_F(AgentTest, TheSharedSecretIsNeverPutOnTheWire) {
+  // The opening Hello used to carry the secret itself, which is how an impostor
+  // collected it. What goes out now is a nonce and a derived proof.
+  const std::string secret = "an-unmistakable-secret-value";
+  std::vector<std::byte> pl;
+  proto::Writer w(pl);
+  proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                     .capabilities = 0,
+                                     .agent = "wsldrive",
+                                     .nonce = "client-nonce",
+                                     .proof = auth_proof(secret, "client-nonce", "server-nonce", false)});
+  const std::string bytes(reinterpret_cast<const char*>(pl.data()), pl.size());
+  EXPECT_EQ(bytes.find(secret), std::string::npos);
 }
 
 TEST_F(AgentTest, ReadCacheHitsOnADifferentlyCasedSpelling) {

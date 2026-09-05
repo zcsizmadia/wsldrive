@@ -1,6 +1,7 @@
 #include "agent/server.hpp"
 
 #include "agent/scanner.hpp"
+#include "core/auth_token.hpp"
 #include "core/path.hpp"
 #include "core/version.hpp"
 #ifdef _WIN32
@@ -30,15 +31,6 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 namespace {
-// Compares without an early exit, so a peer cannot learn the token a byte at a
-// time from response timing.
-bool constant_time_equal(std::string_view a, std::string_view b) noexcept {
-  if (a.size() != b.size()) return false;
-  unsigned char diff = 0;
-  for (std::size_t i = 0; i < a.size(); ++i)
-    diff = static_cast<unsigned char>(diff | (static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i])));
-  return diff == 0;
-}
 }  // namespace
 
 RootServer::RootServer(Options opts) : opts_(std::move(opts)), coalescer_(opts_.coalescer) {
@@ -274,6 +266,7 @@ void RootServer::serve(net::FrameChannel& ch) {
   // them. Register only once the session is authenticated (immediately, when the
   // operator opted out of authentication entirely).
   bool registered = false;
+  Handshake hs;
   {
     std::lock_guard lock(peers_mu_);
     if (stopping_) return;
@@ -306,7 +299,7 @@ void RootServer::serve(net::FrameChannel& ch) {
       break;  // peer disconnected, oversized pre-auth frame, or I/O error
     }
     const bool was_authed = authed;
-    if (auto r = handle(*f, ch, authed); !r) break;
+    if (auto r = handle(*f, ch, authed, hs); !r) break;
     // A successful Hello promotes the session: full-size frames from here on,
     // and only then does it start receiving invalidations.
     if (authed && !was_authed) ch.set_receive_limits(proto::kMaxPayload, std::chrono::milliseconds(0));
@@ -322,12 +315,12 @@ void RootServer::serve(net::FrameChannel& ch) {
   }
 }
 
-Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch, bool& authed) {
+Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch, bool& authed, Handshake& hs) {
   // Nothing is served before the peer has authenticated. Checking the token only
   // inside the Hello handler is not enough on its own: a peer that never sends a
   // Hello would otherwise reach the read and mutation handlers with its first
   // frame, which defeats the token entirely.
-  if (f.header.type != proto::MsgType::Hello && !authed) {
+  if (f.header.type != proto::MsgType::Hello && f.header.type != proto::MsgType::Auth && !authed) {
     (void)send_error(f.header.request_id, Errc::Unauthorized, "authenticate first", ch);
     return fail(Errc::Unauthorized);  // drops the session
   }
@@ -340,20 +333,59 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch, bool
         (void)send_error(f.header.request_id, Errc::UnsupportedVersion, "protocol version mismatch", ch);
         return fail(Errc::UnsupportedVersion);
       }
-      // The agent serves reads AND write-through mutations, so an unauthenticated
-      // peer could read or destroy the whole tree. Require the shared secret the
-      // launcher gave both ends; an empty configured token means the operator
-      // opted out explicitly (--insecure-no-auth).
-      if (!opts_.token.empty() && !constant_time_equal(hello->token, opts_.token)) {
+      // Answer with our own nonce and a proof the client can check BEFORE it
+      // sends anything of its own. That is the half that was missing: the client
+      // used to hand the shared secret to whoever accepted on the endpoint, so
+      // anything that bound the port first got the secret and could serve a
+      // tree of its own choosing.
+      //
+      // An empty configured token means the operator opted out explicitly
+      // (--insecure-no-auth); the session is open from here and the proof is
+      // empty, which a client holding a real token will correctly refuse.
+      hs.client_nonce = std::string(hello->nonce);
+      if (opts_.token.empty()) {
+        authed = true;
+        return ch.send_with(proto::MsgType::HelloAck, f.header.request_id, [&](proto::Writer& w) {
+          proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                             .capabilities = watching() ? 1u : 0u,
+                                             .agent = agent_string("wsldrived"), .nonce = {}, .proof = {}});
+        });
+      }
+      if (hs.client_nonce.empty()) {  // a peer that skipped its nonce cannot be authenticated
+        (void)send_error(f.header.request_id, Errc::Unauthorized, "authentication failed", ch);
+        return fail(Errc::Unauthorized);
+      }
+      hs.server_nonce = generate_auth_nonce();
+      if (hs.server_nonce.empty()) {  // no entropy source: refuse rather than authenticate weakly
+        (void)send_error(f.header.request_id, Errc::IoError, "no entropy source for the handshake", ch);
+        return fail(Errc::IoError);
+      }
+      const std::string server_proof = auth_proof(opts_.token, hs.client_nonce, hs.server_nonce, true);
+      hs.greeted = true;
+      return ch.send_with(proto::MsgType::HelloAck, f.header.request_id, [&](proto::Writer& w) {
+        proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
+                                           .capabilities = watching() ? 1u : 0u,
+                                           .agent = agent_string("wsldrived"),
+                                           .nonce = hs.server_nonce, .proof = server_proof});
+      });
+    }
+    case proto::MsgType::Auth: {
+      // The client has checked our proof and is now proving itself. Nothing is
+      // served until this succeeds.
+      if (!hs.greeted) {
+        (void)send_error(f.header.request_id, Errc::Unauthorized, "Auth before Hello", ch);
+        return fail(Errc::Unauthorized);
+      }
+      proto::Reader r(f.payload);
+      auto msg = proto::read_hello(r);
+      if (!msg) return fail(msg.error());
+      const std::string expected = auth_proof(opts_.token, hs.client_nonce, hs.server_nonce, false);
+      if (!constant_time_equal(msg->proof, expected)) {
         (void)send_error(f.header.request_id, Errc::Unauthorized, "authentication failed", ch);
         return fail(Errc::Unauthorized);  // drops the session
       }
       authed = true;  // only now may this session issue anything else
-      return ch.send_with(proto::MsgType::HelloAck, f.header.request_id, [&](proto::Writer& w) {
-        proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
-                                           .capabilities = watching() ? 1u : 0u,
-                                           .agent = agent_string("wsldrived"), .token = {}});
-      });
+      return ch.send(proto::MsgType::Ok, f.header.request_id, {});
     }
     case proto::MsgType::Ping: return ch.send(proto::MsgType::Pong, f.header.request_id, {});
     case proto::MsgType::SnapshotRequest: return send_snapshot(f.header.request_id, ch);

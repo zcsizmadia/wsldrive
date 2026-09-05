@@ -22,7 +22,7 @@
 namespace wsld::proto {
 
 inline constexpr std::uint32_t kMagic = 0x444C5357;  // "WSLD" when read as little-endian bytes
-inline constexpr std::uint16_t kVersion = 2;  // 2: Hello carries an auth token
+inline constexpr std::uint16_t kVersion = 3;  // 3: mutual handshake (nonces + proofs, no token on the wire)
 inline constexpr std::size_t kHeaderSize = 24;
 inline constexpr std::uint32_t kMaxPayload = 64u << 20;  // 64 MiB per frame
 
@@ -70,6 +70,9 @@ enum class MsgType : std::uint16_t {
   // side. Request payload is a PathRequest.
   ReadlinkRequest = 23,
   ReadlinkResponse = 24,
+  // Third leg of the mutual handshake: the client's proof, sent only after it
+  // has checked the server's. Payload is a Hello (agent and nonce empty).
+  Auth = 25,
 };
 
 struct FrameHeader {
@@ -143,9 +146,14 @@ struct Hello {
   std::uint32_t protocol_version = kVersion;
   std::uint64_t capabilities = 0;
   std::string_view agent;  // free-form "name/version" for diagnostics
-  // Shared secret proving the peer was started by the same launcher. Empty when
-  // the agent runs with --insecure-no-auth.
-  std::string_view token;
+  // Per-session random value from the sender. Both sides mix both nonces into
+  // every proof, so a captured proof is worthless in another session.
+  std::string_view nonce;
+  // Proof of knowledge of the shared secret (see auth_proof). Empty in the
+  // client's opening Hello - it cannot compute one until it has the server's
+  // nonce - then carried by the server's HelloAck and the client's Auth. The
+  // secret itself is never sent.
+  std::string_view proof;
 };
 
 struct InvalidationOp {

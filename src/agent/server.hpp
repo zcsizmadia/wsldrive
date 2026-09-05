@@ -80,7 +80,14 @@ class RootServer {
   // `authed` is this session's authentication state, owned by serve(). Every
   // request type other than Hello is refused until it is true, so presenting the
   // token cannot be skipped by simply not sending a Hello.
-  Result<void> handle(const net::Frame& f, net::FrameChannel& ch, bool& authed);
+  /// Per-session state for the mutual handshake. Lives for one session: the
+  /// nonces bind a proof to this connection and nothing else.
+  struct Handshake {
+    bool greeted = false;  // our HelloAck, carrying our proof, has gone out
+    std::string client_nonce;
+    std::string server_nonce;
+  };
+  Result<void> handle(const net::Frame& f, net::FrameChannel& ch, bool& authed, Handshake& hs);
   Result<void> send_snapshot(std::uint64_t request_id, net::FrameChannel& ch);
   Result<void> send_read(const net::Frame& f, net::FrameChannel& ch);
   Result<void> send_read_many(const net::Frame& f, net::FrameChannel& ch);

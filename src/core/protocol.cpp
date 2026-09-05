@@ -198,7 +198,8 @@ void write_hello(Writer& w, const Hello& h) {
   w.u32(h.protocol_version);
   w.u64(h.capabilities);
   w.string(h.agent);
-  w.string(h.token);
+  w.string(h.nonce);
+  w.string(h.proof);
 }
 
 Result<Hello> read_hello(Reader& r) noexcept {
@@ -212,9 +213,12 @@ Result<Hello> read_hello(Reader& r) noexcept {
   auto agent = r.string();
   if (!agent) return fail(agent.error());
   h.agent = *agent;
-  auto token = r.string();
-  if (!token) return fail(token.error());
-  h.token = *token;
+  auto nonce = r.string();
+  if (!nonce) return fail(nonce.error());
+  h.nonce = *nonce;
+  auto proof = r.string();
+  if (!proof) return fail(proof.error());
+  h.proof = *proof;
   return h;
 }
 
