@@ -784,7 +784,22 @@ Result<void> RemoteRoot::rename(std::string_view from, std::string_view to, std:
   // it until the next remount.
   const auto [parent, leaf] = split_parent(nto);
   const auto new_parent = parent.empty() ? Result<NodeId>(tree_.root()) : tree_.ensure_directory_path(parent);
-  if (!new_parent || !tree_.rename(*id, *new_parent, leaf)) (void)tree_.remove_path(nfrom);  // best effort
+  if (!new_parent) return {};  // nowhere to put it; the watcher's event reconciles
+  if (!tree_.rename(*id, *new_parent, leaf)) {
+    // Something occupies the destination again. An invalidation describing this
+    // very rename can be applied between the checks above and here, and it may
+    // create the destination before the agent has expanded its children.
+    //
+    // The old fallback removed the source instead, which is the wrong trade in
+    // both directions: the source node is the one actually holding the subtree
+    // that was renamed, so dropping it loses every child until the next rescan,
+    // while the destination it left behind may still be empty. Clear the
+    // blocker and move the source over it.
+    if (const auto blocker = tree_.lookup(nto, mode()); blocker && *blocker != *id) (void)tree_.remove(*blocker);
+    // If even that does not take, leave the source alone: showing the tree
+    // under its old name until the watcher corrects us beats deleting it.
+    (void)tree_.rename(*id, *new_parent, leaf);
+  }
   return {};
 }
 

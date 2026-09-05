@@ -55,11 +55,32 @@ ok()   { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 # On failure, show what the command said and what the mount and the backing
 # store hold - a bare FAIL is impossible to diagnose from a CI log.
+# Side-by-side listing of one mount-relative path, as the mount sees it and as
+# the backing store does. A bare failure does not say which of the two views was
+# wrong, which is the first thing worth knowing.
+dump_path(){
+  local rel="$1" label="${1:-<root>}" m b
+  # Report absence as a value rather than letting ls' error text through: the
+  # two messages embed different temp roots and would read as a disagreement
+  # when both sides simply agree the path is gone.
+  if [ -e "$MNT/$rel" ]; then m=$(ls -A "$MNT/$rel" 2>/dev/null | sort | tr '\n' ' '); else m='<absent>'; fi
+  if [ -e "$WORK/$rel" ]; then b=$(ls -A "$WORK/$rel" 2>/dev/null | sort | tr '\n' ' '); else b='<absent>'; fi
+  echo "        mount   [$label]: $m"
+  echo "        backing [$label]: $b"
+  [ "$m" != "$b" ] && echo "        ^^ mount and backing store disagree here"
+  return 0
+}
+
+# $3.. are mount-relative paths to list from both sides when the check fails:
+# the parent of whatever the check touched, plus the path itself when it is a
+# directory whose contents are the point.
 check(){
   local out
   if out=$(eval "$2" 2>&1); then ok "$1"; else
     bad "$1"
     printf '%s\n' "$out" | sed 's/^/        | /' | head -20
+    local p
+    for p in "${@:3}"; do dump_path "$p"; done
     [ -d "$MNT/repo" ] && { echo "        mount .git : $(ls "$MNT/repo/.git" 2>&1 | tr '\n' ' ')"; echo "        backing .git: $(ls "$WORK/repo/.git" 2>&1 | tr '\n' ' ')"; }
   fi
 }
@@ -73,10 +94,10 @@ check "stat reports size"      "[ \$(stat -c%s '$MNT/a.txt') -gt 0 ]"
 check "truncate"               "truncate -s 3 '$MNT/a.txt' && [ \$(stat -c%s '$MNT/a.txt') -eq 3 ]"
 check "mkdir -p (nested)"      "mkdir -p '$MNT/d/sub/deeper'"
 check "readdir sees entries"   "ls '$MNT/d/sub' >/dev/null && ls '$MNT' | grep -q a.txt"
-check "rename file"            "mv '$MNT/a.txt' '$MNT/d/b.txt' && [ -f '$MNT/d/b.txt' ]"
-check "rename directory keeps contents" "mv '$MNT/d/sub' '$MNT/d/sub2' && [ -d '$MNT/d/sub2/deeper' ]"
-check "unlink"                 "cp '$MNT/d/b.txt' '$MNT/gone.txt' && rm '$MNT/gone.txt' && [ ! -e '$MNT/gone.txt' ]"
-check "rmdir"                  "rmdir '$MNT/d/sub2/deeper' && [ ! -d '$MNT/d/sub2/deeper' ]"
+check "rename file"            "mv '$MNT/a.txt' '$MNT/d/b.txt' && [ -f '$MNT/d/b.txt' ]" "" d
+check "rename directory keeps contents" "mv '$MNT/d/sub' '$MNT/d/sub2' && [ -d '$MNT/d/sub2/deeper' ]" d d/sub2 d/sub
+check "unlink"                 "cp '$MNT/d/b.txt' '$MNT/gone.txt' && rm '$MNT/gone.txt' && [ ! -e '$MNT/gone.txt' ]" ""
+check "rmdir"                  "rmdir '$MNT/d/sub2/deeper' && [ ! -d '$MNT/d/sub2/deeper' ]" d/sub2
 check "missing file is ENOENT" "! cat '$MNT/nope.txt'"
 
 echo "== metadata operations =="

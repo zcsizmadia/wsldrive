@@ -1196,6 +1196,35 @@ TEST_F(AgentTest, ACaseOnlyRenameKeepsTheDirectoryAndItsSubtree) {
   EXPECT_FALSE(has("src/include/a.hpp"));
 }
 
+// POSIX lets a directory be renamed onto an existing empty one; Windows does
+// not, so the agent would fail the operation before the mirror is reached.
+#ifndef _WIN32
+TEST_F(AgentTest, RenamingADirectoryOntoAnExistingOneKeepsTheSubtree) {
+  // The destination can already be present in the mirror - an invalidation
+  // describing this very rename can be applied between the agent's reply and
+  // the client's own update, and it may create the destination before the agent
+  // has expanded its children. The mirror update has to move the source node
+  // over it: the source is what actually holds the subtree, so dropping it (the
+  // old fallback) lost every child until the next rescan.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+  const auto has = [&](std::string_view p) {
+    return c->with_tree([&](const MetadataTree& t) { return t.lookup(p).has_value(); });
+  };
+  ASSERT_TRUE(has("src/include/a.hpp"));
+
+  ASSERT_TRUE(c->mkdir("dst").has_value());  // destination exists, and is empty
+  ASSERT_TRUE(has("dst"));
+
+  ASSERT_TRUE(c->rename("src", "dst").has_value());
+  EXPECT_TRUE(has("dst/include/a.hpp")) << "the subtree must survive landing on an existing destination";
+  EXPECT_FALSE(has("src/include/a.hpp"));
+}
+#endif
+
 TEST_F(AgentTest, RenamingADirectoryEvictsItsSubtreeFromTheReadCache) {
   // The content cache is keyed by path, so moving a directory leaves every
   // entry below the old prefix cached but unreachable: dead weight against the
