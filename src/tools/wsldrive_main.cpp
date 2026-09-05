@@ -27,6 +27,8 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include "core/version.hpp"
+
 #include <random>
 #include <string>
 #include <thread>
@@ -34,7 +36,10 @@
 
 namespace {
 
+void print_version(const char* who) { std::printf("%s %s\n", who, std::string(wsld::kVersionString).c_str()); }
+
 void usage() {
+  std::fprintf(stderr, "wsldrive %s\n", std::string(wsld::kVersionString).c_str());
   std::fputs(
       "usage:\n"
       "  wsldrive fetch (--connect <endpoint> | --listen <endpoint>) [--watch] [--read <path>] [--lookups N]\n"
@@ -53,6 +58,7 @@ void usage() {
       "                                                       (auto-launch the agent in the distro)\n"
       "     add --hvsocket [--vm-guid <guid>]                 (use the Hyper-V socket transport)\n"
 #endif
+      "  wsldrive --version\n"
       ,
       stderr);
 }
@@ -85,6 +91,16 @@ void install_mount_signal_handler() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Answered before anything else, so it still works on a machine where the
+  // rest of the environment (WinFsp, a distro, a reachable agent) is not set
+  // up - which is exactly when someone needs to know which build they have.
+  if (argc >= 2) {
+    const std::string_view first = argv[1];
+    if (first == "--version" || first == "-V" || first == "version") {
+      print_version("wsldrive");
+      return 0;
+    }
+  }
   const std::string_view command = argc >= 2 ? std::string_view(argv[1]) : std::string_view{};
 
 #ifdef _WIN32

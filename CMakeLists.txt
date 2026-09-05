@@ -14,6 +14,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
+# One source of truth for the version: PROJECT_VERSION above. Everything that
+# needs it reads the generated header rather than repeating the number.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/core/version.hpp.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/core/version.hpp" @ONLY)
+
 option(WSLDRIVE_BUILD_TESTS "Build unit tests" ON)
 option(WSLDRIVE_BUILD_BENCHMARKS "Build micro-benchmarks" ON)
 option(WSLDRIVE_WARNINGS_AS_ERRORS "Treat compiler and linker warnings as errors" ON)

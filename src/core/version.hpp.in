@@ -1,0 +1,30 @@
+#pragma once
+
+#include <string>
+#include <string_view>
+
+// Generated from src/core/version.hpp.in by CMake. The project version has one
+// source of truth - PROJECT_VERSION in the top-level CMakeLists.txt - and this
+// is how the rest of the build reads it: `--version` and the usage banners, the
+// handshake agent strings, the Windows VERSIONINFO resource, and the default
+// version stamped into the installer.
+
+namespace wsld {
+
+/// Project version, e.g. "0.9.0".
+inline constexpr std::string_view kVersionString = "@PROJECT_VERSION@";
+
+inline constexpr int kVersionMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr int kVersionMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr int kVersionPatch = @PROJECT_VERSION_PATCH@;
+
+/// "<name>/<version>", for the free-form agent field of the Hello handshake.
+/// Returns a reference to a function-local static, so the string_view a caller
+/// stores in a message stays valid for the life of the process.
+inline const std::string& agent_string(std::string_view name) {
+  static const std::string wsldrive_agent = "wsldrive/" + std::string(kVersionString);
+  static const std::string wsldrived_agent = "wsldrived/" + std::string(kVersionString);
+  return name == "wsldrived" ? wsldrived_agent : wsldrive_agent;
+}
+
+}  // namespace wsld

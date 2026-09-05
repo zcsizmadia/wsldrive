@@ -8,6 +8,7 @@ add_executable(core_tests
   protocol_test.cpp
   string_pool_test.cpp
   unicode_test.cpp
+  version_test.cpp
   win_names_test.cpp)
 
 target_link_libraries(core_tests PRIVATE wsldrive::core GTest::gtest_main)

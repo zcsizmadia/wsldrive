@@ -2,6 +2,7 @@
 
 #include "agent/scanner.hpp"
 #include "core/path.hpp"
+#include "core/version.hpp"
 #ifdef _WIN32
 #include "platform/win/wide.hpp"
 #endif
@@ -350,7 +351,7 @@ Result<void> RootServer::handle(const net::Frame& f, net::FrameChannel& ch, bool
       return ch.send_with(proto::MsgType::HelloAck, f.header.request_id, [&](proto::Writer& w) {
         proto::write_hello(w, proto::Hello{.protocol_version = proto::kVersion,
                                            .capabilities = watching() ? 1u : 0u,
-                                           .agent = "wsldrived/0.1", .token = {}});
+                                           .agent = agent_string("wsldrived"), .token = {}});
       });
     }
     case proto::MsgType::Ping: return ch.send(proto::MsgType::Pong, f.header.request_id, {});

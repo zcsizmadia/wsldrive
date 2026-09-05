@@ -1,6 +1,7 @@
 #include "agent/client.hpp"
 
 #include "core/path.hpp"
+#include "core/version.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -62,7 +63,10 @@ Result<proto::Hello> RemoteRoot::connect(std::chrono::milliseconds timeout) {
   proto::Writer w(payload);
   proto::write_hello(
       w, proto::Hello{
-             .protocol_version = proto::kVersion, .capabilities = 0, .agent = "wsldrive/0.1", .token = token_});
+             .protocol_version = proto::kVersion,
+             .capabilities = 0,
+             .agent = agent_string("wsldrive"),
+             .token = token_});
   auto p = request(proto::MsgType::Hello, payload, timeout);
   if (!p) return fail(p.error());
   // An Error reply (e.g. a rejected token) is already decoded by request().
