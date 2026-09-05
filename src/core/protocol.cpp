@@ -467,6 +467,7 @@ Result<ReadManyRequest> read_read_many_request(Reader& r) {
   auto count = r.varint();
   if (!count) return fail(count.error());
   if (*count > r.remaining()) return fail(Errc::Corrupt);  // each path is >= 1 byte
+  if (*count > kMaxReadManyPaths) return fail(Errc::InvalidArgument);
   ReadManyRequest q;
   reserve_bounded(q.paths, *count);
   for (std::uint64_t i = 0; i < *count; ++i) {

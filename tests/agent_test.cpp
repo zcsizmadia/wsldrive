@@ -15,6 +15,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1112,6 +1114,34 @@ TEST_F(AgentTest, APeerThatStopsReadingDoesNotStallInvalidationsForTheOthers) {
   EXPECT_TRUE(progressed) << "a peer that stopped reading must not stop delivery to everyone else";
   // LoopbackServer's destructor calls stop(), which hung here before the fix -
   // reaching the end of this test is the other half of what is being asserted.
+}
+
+TEST_F(AgentTest, AbsurdOffsetsAndSizesAreRefusedRatherThanActedOn) {
+  // The seek calls take a signed offset, so anything past the signed range
+  // wraps negative and the seek fails - and an unchecked failure leaves the
+  // stream at position 0, so a write meant for a huge offset silently lands at
+  // the start of the file instead. A truncate has the matching problem in the
+  // other direction: nothing stopped it asking for an 8 EiB sparse file.
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto c = connect_client(srv.endpoint());
+  ASSERT_NE(c, nullptr);
+  ASSERT_TRUE(c->connect().has_value());
+  ASSERT_TRUE(c->fetch_snapshot().has_value());
+
+  const std::uint64_t absurd = std::numeric_limits<std::uint64_t>::max() - 4096;
+  EXPECT_FALSE(c->write("README.md", absurd, as_bytes("boom")).has_value());
+  EXPECT_FALSE(c->truncate("README.md", absurd).has_value());
+
+  // The file is untouched: the rejected write must not have landed at offset 0.
+  auto after = c->read("README.md", 0, 100);
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(after->data()), after->size()), "# readme\n");
+
+  // Ordinary offsets still work.
+  ASSERT_TRUE(c->write("README.md", 2, as_bytes("XX")).has_value());
+  auto edited = c->read("README.md", 0, 100);
+  ASSERT_TRUE(edited.has_value());
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(edited->data()), edited->size()), "# XXadme\n");
 }
 
 TEST_F(AgentTest, ReadCacheHitsOnADifferentlyCasedSpelling) {

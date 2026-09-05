@@ -26,6 +26,18 @@ inline constexpr std::uint16_t kVersion = 2;  // 2: Hello carries an auth token
 inline constexpr std::size_t kHeaderSize = 24;
 inline constexpr std::uint32_t kMaxPayload = 64u << 20;  // 64 MiB per frame
 
+/// Most paths one ReadManyRequest may carry. Bounded by the frame size alone,
+/// a 64 MiB frame of one-byte paths decodes to ~64M entries - gigabytes of
+/// vectors and as many stat() calls, from a single authenticated request. The
+/// client's own read-ahead never sends more than 512.
+inline constexpr std::size_t kMaxReadManyPaths = 4096;
+
+/// Ceiling on a file offset or length the agent will act on. Matches the size
+/// the mount advertises in statfs, and keeps a truncate from being asked for an
+/// 8 EiB sparse file; anything past it is a bad or hostile request, not a real
+/// one. Also keeps every offset inside the signed range the seek calls take.
+inline constexpr std::uint64_t kMaxFileOffset = std::uint64_t{1} << 44;  // 16 TiB
+
 // FrameHeader::flags bits.
 inline constexpr std::uint32_t kFlagMore = 0x1;  // more frames follow for this response (streamed reply)
 
